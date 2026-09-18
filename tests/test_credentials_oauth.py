@@ -452,13 +452,34 @@ class Antigravity:
 
 
 @pytest.fixture(autouse=True)
-def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
-    """O polling do `onboardUser` espera 1s por volta; nos testes não espera nada."""
+def relogio_virtual(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Espera nenhuma, mas tempo que passa.
 
-    async def instantaneo(seconds: float) -> None:
-        return None
+    O polling do ``onboardUser`` espera 1s por volta e o prazo é absoluto. Substituir a
+    espera por um no-op sem mexer no relógio tornaria o prazo inalcançável: o teste do
+    desistir ficaria a girar para sempre. Aqui cada espera adianta o relógio monotónico
+    exactamente o que teria esperado — o prazo é medido, a suite não espera.
+    """
+    decorrido = 0.0
 
-    monkeypatch.setattr(oauth, "_sleep", instantaneo)
+    async def dormir(seconds: float) -> None:
+        nonlocal decorrido
+        decorrido += seconds
+
+    class Relogio:
+        """Shim em vez de `monkeypatch` no módulo `time`: mexer no `time` global afecta
+        o pytest e qualquer teste a correr ao lado."""
+
+        @staticmethod
+        def monotonic() -> float:
+            return time.monotonic() + decorrido
+
+        @staticmethod
+        def time() -> float:
+            return time.time()
+
+    monkeypatch.setattr(oauth, "_sleep", dormir)
+    monkeypatch.setattr(oauth, "time", Relogio)
 
 
 class TestProjectDiscovery:
@@ -649,3 +670,102 @@ class TestAntigravityRefresh:
                 client=client,
             )
         assert seen[0]["client_secret"].startswith("GOCSPX-")
+
+
+class TestSurvivorsClosed:
+    """Casos que uma primeira volta de mutação mostrou estarem por defender."""
+
+    async def test_paid_tier_is_probed_with_the_project_in_the_body(self) -> None:
+        """Sem o `cloudaicompanionProject` no corpo o backend responde só com o tier
+        corrente, e a conta paga passa por gratuita. A segunda chamada não é redundante."""
+        conta = {
+            "cloudaicompanionProject": "projecto-1",
+            "currentTier": {"id": "free-tier"},
+            "allowedTiers": [{"id": "free-tier"}],
+        }
+        completa = {**conta, "paidTier": {"id": "pago"}}
+        backend = Antigravity(conta, completa, conta, completa)
+        async with client_of(backend) as client:
+            await complete("google-antigravity", request_for(), "abc", client=client)
+
+        com_projecto = [b for b in backend.bodies if "cloudaicompanionProject" in b]
+        assert com_projecto, "a segunda chamada tem de reenviar o projecto descoberto"
+        assert com_projecto[0]["cloudaicompanionProject"] == "projecto-1"
+
+    async def test_onboard_that_never_finishes_gives_up(self) -> None:
+        """`done: false` para sempre tem de falhar; prender a ligação seria pior que um
+        erro, porque nada indicaria ao utilizador que parou."""
+        pendente = {"name": "operations/1", "done": False}
+        backend = Antigravity(
+            {"allowedTiers": [{"id": "free-tier"}], "paidTier": {"id": "pago"}},
+            *[dict(pendente) for _ in range(200)],
+        )
+        async with client_of(backend) as client:
+            with pytest.raises(OAuthError) as excinfo:
+                await complete("google-antigravity", request_for(), "abc", client=client)
+        assert "onboardUser" in str(excinfo.value)
+
+    async def test_onboard_done_without_response_is_a_failure(self) -> None:
+        """`done: true` sem `response` é o que o backend devolve quando o provisionamento
+        não se concretizou; tratá-lo como sucesso deixaria a conta sem projecto."""
+        backend = Antigravity(
+            {"allowedTiers": [{"id": "free-tier"}], "paidTier": {"id": "pago"}},
+            {"done": True},
+        )
+        async with client_of(backend) as client:
+            with pytest.raises(OAuthError) as excinfo:
+                await complete("google-antigravity", request_for(), "abc", client=client)
+        assert "sem resposta" in str(excinfo.value)
+
+    async def test_google_error_object_is_not_flattened_to_raw_json(self) -> None:
+        """O Google embrulha a explicação em `error.message`. Devolver o JSON cru é
+        tecnicamente honesto e praticamente inútil: o utilizador não a encontra."""
+        resposta = httpx.Response(
+            400,
+            json={"error": {"status": "INVALID_ARGUMENT", "message": "redirect_uri inválido"}},
+        )
+        async with client_of(lambda _: resposta) as client:
+            with pytest.raises(OAuthError) as excinfo:
+                await complete("google-antigravity", request_for(), "abc", client=client)
+        assert "INVALID_ARGUMENT: redirect_uri inválido" in str(excinfo.value)
+
+    async def test_eligible_account_ignores_a_stale_ineligibility(self) -> None:
+        """`allowedTiers` com free-tier ganha: uma entrada residual em `ineligibleTiers`
+        não pode bloquear uma conta que o backend já autoriza."""
+        conta = {
+            "cloudaicompanionProject": "projecto-1",
+            "currentTier": {"id": "free-tier"},
+            "allowedTiers": [{"id": "free-tier"}],
+            "paidTier": {"id": "pago"},
+            "ineligibleTiers": [{"tierId": "free-tier", "reasonMessage": "residual"}],
+        }
+        backend = Antigravity(conta, conta)
+        async with client_of(backend) as client:
+            credencial = await complete(
+                "google-antigravity", request_for(), "abc", client=client
+            )
+        assert credencial.project_id == "projecto-1"
+
+    async def test_paste_of_only_whitespace_never_reaches_the_network(self) -> None:
+        """Um paste vazio como código produziria um 400 opaco do provedor em vez de dizer
+        ao utilizador que não colou nada."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("não devia haver pedido")
+
+        async with client_of(handler) as client:
+            with pytest.raises(OAuthError) as excinfo:
+                await complete("anthropic", request_for(), "\n\t ", client=client)
+        assert "nada colado" in str(excinfo.value)
+
+    async def test_fragment_without_a_code_is_rejected(self) -> None:
+        """`#ST4TE` sozinho passa a verificação do `state` mas não tem código. Deixá-lo
+        seguir mandaria `code=""` ao provedor."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("não devia haver pedido")
+
+        async with client_of(handler) as client:
+            with pytest.raises(OAuthError) as excinfo:
+                await complete("anthropic", request_for(), "#ST4TE", client=client)
+        assert "código" in str(excinfo.value)
