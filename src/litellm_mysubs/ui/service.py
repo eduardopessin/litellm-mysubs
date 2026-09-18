@@ -15,6 +15,7 @@ import httpx
 
 from ..catalog.deployments import to_deployments
 from ..catalog.discovery import DiscoveredModel, discover
+from ..catalog.usage import UsageSnapshot, from_headers
 from ..credentials import oauth
 from ..credentials.store import PROVIDER_IDS, Credential, CredentialStore, ProviderId
 from ..registry import ModelRegistry, RouterLike
@@ -49,6 +50,8 @@ class ProviderCard:
     stale: bool
     project_id: str = ""
     applied: int = 0
+    #: Vazio quando o provedor não publica uso — `known` a `False`. Ver `catalog/usage.py`.
+    usage: UsageSnapshot = field(default_factory=UsageSnapshot)
 
 
 @dataclass(slots=True)
@@ -73,6 +76,8 @@ class MySubsService:
     client_factory: Any = httpx.AsyncClient
     pending: dict[ProviderId, PendingAuth] = field(default_factory=dict)
     discovered: dict[ProviderId, list[DiscoveredModel]] = field(default_factory=dict)
+    #: Último uso conhecido por provedor, actualizado a cada resposta que traga cabeçalhos.
+    usage: dict[ProviderId, UsageSnapshot] = field(default_factory=dict)
     #: Escolha do utilizador por provedor, retida entre aplicações: o `apply` do registry
     #: substitui **todas** as entradas do plugin, por isso aplicar um provedor tem de
     #: reinjectar o que já estava escolhido nos outros.
@@ -104,6 +109,7 @@ class MySubsService:
                     stale=credential is not None and credential.is_expired(now=moment),
                     project_id="" if credential is None else credential.project_id,
                     applied=applied.get(provider, 0),
+                    usage=self.usage.get(provider) or UsageSnapshot(),
                 )
             )
         return cards
@@ -142,6 +148,19 @@ class MySubsService:
         if credential is None:
             raise LookupError(f"{PROVIDER_LABELS[provider]} não está ligado")
         return credential
+
+    def observe(self, provider: ProviderId, headers: Any) -> UsageSnapshot:
+        """Absorve os cabeçalhos de uma resposta do upstream.
+
+        Uma subscrição não tem endpoint de quota: o estado só viaja nos cabeçalhos das
+        respostas. Um instantâneo vazio **não** substitui o anterior — uma resposta sem
+        cabeçalhos não é prova de que o uso mudou, e apagar deixaria o card a piscar entre
+        "sem dados" e o valor real conforme o tipo de pedido.
+        """
+        snapshot = from_headers(provider, headers)
+        if snapshot.known:
+            self.usage[provider] = snapshot
+        return self.usage.get(provider) or UsageSnapshot()
 
     # -- ligação ---------------------------------------------------------------
 

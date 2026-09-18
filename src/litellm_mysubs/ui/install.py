@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..credentials.file_store import FileCredentialStore
+from ..credentials.secret_store import SecretManagerCredentialStore, is_available
 from ..credentials.store import CredentialStore
 from .app import MOUNT_PATH, mount
 from .service import MySubsService
@@ -22,11 +23,28 @@ def _live_router() -> Any:
     return getattr(proxy_server, "llm_router", None)
 
 
+def default_store() -> CredentialStore:
+    """Onde guardar as credenciais, por ordem de preferência.
+
+    O cofre do LiteLLM primeiro: quem configurou `key_management_system` já decidiu onde os
+    segredos da instalação vivem, e escrever os das subscrições noutro sítio deixaria
+    tokens em disco fora da política dele.
+
+    Sem cofre, o ficheiro em `~/.litellm/mysubs/` com permissões `0600` — que é o que
+    funciona numa instalação qualquer, sem infraestrutura.
+
+    A escolha é feita no arranque e não muda: um store que trocasse de sítio a meio
+    espalharia metade das credenciais em cada um.
+    """
+    if is_available():
+        return SecretManagerCredentialStore()
+    return FileCredentialStore()
+
+
 def install(app: Any | None = None, *, store: CredentialStore | None = None) -> str:
     """Monta `/mysubs`. Devolve o caminho montado.
 
-    Sem `app`, usa o do proxy. O store por omissão é o de ficheiro, que é o que funciona
-    numa instalação qualquer — o do Kubernetes exige um ServiceAccount montado.
+    Sem `app`, usa o do proxy. Sem `store`, escolhe-se o melhor disponível.
     """
     if app is None:
         from litellm.proxy import proxy_server
@@ -34,7 +52,7 @@ def install(app: Any | None = None, *, store: CredentialStore | None = None) -> 
         app = proxy_server.app
 
     service = MySubsService(
-        store=store or FileCredentialStore(),
+        store=store or default_store(),
         router_source=_live_router,
     )
     mount(app, service)

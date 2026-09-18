@@ -28,6 +28,12 @@ class DemoStore:
                 refresh_token="RT",
                 expires_at=time.time() + 5400,
             ),
+            "openai-codex": Credential(
+                provider="openai-codex",
+                access_token="AT",
+                refresh_token="RT",
+                expires_at=time.time() + 7200,
+            ),
             "google-antigravity": Credential(
                 provider="google-antigravity",
                 access_token="AT",
@@ -76,6 +82,21 @@ service.discovered["anthropic"] = [
         note="a sonda não chegou ao upstream (ConnectError: rede em baixo)",
     ),
 ]
+
+# uso real, medido contra o proxy
+service.observe("anthropic", {
+    "llm_provider-anthropic-ratelimit-unified-5h-utilization": "0.03",
+    "llm_provider-anthropic-ratelimit-unified-5h-reset": str(time.time() + 4200),
+    "llm_provider-anthropic-ratelimit-unified-7d-utilization": "0.24",
+    "llm_provider-anthropic-ratelimit-unified-7d-reset": str(time.time() + 415000),
+})
+service.observe("openai-codex", {
+    "x-codex-primary-used-percent": "78", "x-codex-primary-window-minutes": "300",
+    "x-codex-primary-reset-at": str(time.time() + 9000),
+    "x-codex-secondary-used-percent": "93", "x-codex-secondary-window-minutes": "10080",
+    "x-codex-secondary-reset-at": str(time.time() + 220000),
+    "x-codex-plan-type": "plus", "x-codex-credits-balance": "0",
+})
 
 app = FastAPI()
 mount(app, service)

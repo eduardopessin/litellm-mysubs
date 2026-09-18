@@ -31,8 +31,21 @@ def _provider_or_404(raw: str) -> ProviderId:
     return raw
 
 
+def _duration(seconds: float) -> str:
+    """Só a duração: ``3 min``, ``2 h``, ``4 dias``.
+
+    Separada da frase de propósito. A versão anterior embutia "expira em" e era reutilizada
+    para as reposições de quota, o que produzia "repõe expira em 1 h" no ecrã.
+    """
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} h"
+    return f"{int(seconds // 86400)} dias"
+
+
 def _age(seconds: float | None) -> str:
-    """Validade em texto.
+    """Validade do token, em texto.
 
     Um instantâneo sem idade mente por omissão: quem vê "ligado" assume "a funcionar". Por
     isso a validade aparece sempre que é conhecida, e a ausência dela é dita, não escondida.
@@ -41,11 +54,7 @@ def _age(seconds: float | None) -> str:
         return "validade desconhecida"
     if seconds <= 0:
         return "expirado"
-    if seconds < 3600:
-        return f"expira em {int(seconds // 60)} min"
-    if seconds < 86400:
-        return f"expira em {int(seconds // 3600)} h"
-    return f"expira em {int(seconds // 86400)} dias"
+    return f"expira em {_duration(seconds)}"
 
 
 def build_app(service: MySubsService) -> FastAPI:
@@ -160,53 +169,93 @@ def _page(cards: list[ProviderCard], service: MySubsService) -> str:
     return _SHELL.format(body="\n".join(_card(card, service) for card in cards))
 
 
+def _usage(card: ProviderCard) -> str:
+    """As barras de uso, ou uma frase honesta quando o provedor não publica nada.
+
+    Uma barra a zero num provedor sem dados seria lida como "por usar" — o oposto do que se
+    sabe, que é nada.
+    """
+    if not card.usage.known:
+        return '<p class="nodata">Este provedor não publica uso.</p>'
+
+    bars = []
+    for window in card.usage.windows:
+        pct = max(0.0, min(100.0, window.used_percent))
+        tone = "hot" if pct >= 90 else "warm" if pct >= 70 else "cool"
+        resets = window.resets_in_s()
+        bars.append(
+            _BAR.format(
+                label=html.escape(window.label),
+                pct=f"{pct:.0f}",
+                tone=tone,
+                resets=html.escape(f"repõe em {_duration(resets)}") if resets else "",
+            )
+        )
+    meta = []
+    if card.usage.plan:
+        meta.append(f"plano {html.escape(card.usage.plan)}")
+    if card.usage.credits_balance:
+        meta.append(f"{html.escape(card.usage.credits_balance)} créditos")
+    age = card.usage.age_s()
+    meta.append("agora" if age < 60 else f"há {int(age // 60)} min")
+    return _USAGE.format(bars="".join(bars), meta=html.escape(" · ".join(meta)))
+
+
 def _card(card: ProviderCard, service: MySubsService) -> str:
     if not card.connected:
         return _CARD.format(
             label=html.escape(card.label),
-            badge='<span class="off">por ligar</span>',
+            badge='<span class="chip off">por ligar</span>',
+            usage="",
             body=_CONNECT.format(provider=card.provider),
         )
 
-    state = (
-        '<span class="warn">token expirado</span>'
+    badge = (
+        '<span class="chip warn">token expirado</span>'
         if card.stale
-        else '<span class="on">ligado</span>'
+        else '<span class="chip on">ligado</span>'
     )
     detail = _age(card.expires_in_s)
     if card.project_id:
-        detail += f" · projecto {html.escape(card.project_id)}"
+        detail += f" · projecto {card.project_id}"
     if card.applied:
-        detail += f" · {card.applied} modelo(s) no Router"
+        detail += f" · {card.applied} no Router"
 
     models = service.discovered.get(card.provider)
     if models is None:
         body = _DISCOVER.format(provider=card.provider, detail=html.escape(detail))
     else:
         chosen = set(service.selected.get(card.provider) or [])
-        rows = "\n".join(
+        rows = "".join(
             _ROW.format(
                 name=html.escape(model.suggested_name),
                 wire=html.escape(model.wire_name),
                 checked=" checked" if not chosen or model.suggested_name in chosen else "",
                 mark=(
-                    '<span class="ok">verificado</span>'
+                    '<span class="chip on">verificado</span>'
                     if model.verified
-                    else f'<span class="unk" title="{html.escape(model.note)}">por verificar</span>'
+                    else f'<span class="chip unk" title="{html.escape(model.note)}">'
+                    "por verificar</span>"
                 ),
             )
             for model in models
         )
         body = _APPLY.format(provider=card.provider, detail=html.escape(detail), rows=rows)
 
-    return _CARD.format(label=html.escape(card.label), badge=state, body=body)
+    return _CARD.format(label=html.escape(card.label), badge=badge, usage=_usage(card), body=body)
 
+
+_BAR = """<div class="bar">
+  <div class="bar-head"><span>{label}</span><span class="pct">{pct}%</span></div>
+  <div class="track"><div class="fill {tone}" style="width:{pct}%"></div></div>
+  <div class="resets">{resets}</div>
+</div>"""
+
+_USAGE = """<div class="usage">{bars}</div><p class="stamp">{meta}</p>"""
 
 _CONNECT = """
 <p class="muted">Liga a tua subscrição. O provedor devolve um código — cola-o abaixo.</p>
-<form method="post" action="connect/{provider}">
-  <button class="primary">Conectar</button>
-</form>
+<form method="post" action="connect/{provider}"><button class="primary">Conectar</button></form>
 <form method="post" action="paste/{provider}" class="paste">
   <input name="pasted" placeholder="cola aqui a URL de retorno ou o código" autocomplete="off">
   <button>Concluir</button>
@@ -215,9 +264,7 @@ _CONNECT = """
 
 _DISCOVER = """
 <p class="muted">{detail}</p>
-<form method="post" action="discover/{provider}">
-  <button class="primary">Ver modelos</button>
-</form>
+<form method="post" action="discover/{provider}"><button class="primary">Ver modelos</button></form>
 <form method="post" action="refresh/{provider}"><button>Renovar token</button></form>
 """
 
@@ -231,48 +278,102 @@ _APPLY = """
 """
 
 _ROW = """<tr>
-  <td><label><input type="checkbox" name="chosen" value="{name}"{checked}> {name}</label></td>
-  <td class="wire">{wire}</td><td>{mark}</td>
+  <td><label><input type="checkbox" name="chosen" value="{name}"{checked}>
+    <span>{name}</span></label></td>
+  <td class="wire">{wire}</td><td class="mark">{mark}</td>
 </tr>"""
 
 _CARD = """<section class="card">
-  <h2>{label} {badge}</h2>
+  <header><h2>{label}</h2>{badge}</header>
+  {usage}
   {body}
 </section>"""
 
+#: Paleta extraída do bundle da UI do LiteLLM (`_experimental/out/_next/static/chunks/*.css`):
+#: os mesmos tokens `--background`/`--foreground`/`--border`/`--primary`, a fonte Inter e o
+#: par claro/escuro que ele define. Copiar os valores em vez de importar a folha de estilo é
+#: deliberado: o nome do ficheiro é um hash de build e muda a cada versão, e uma página que
+#: depende dele fica em branco depois de um `pip install -U litellm`.
 _SHELL = """<!doctype html>
 <html lang="pt"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MySubs</title>
 <style>
- body{{font:14px/1.5 system-ui,sans-serif;margin:0;padding:2rem;background:#f6f7f9;color:#1a1a1a}}
- h1{{font-size:1.4rem;margin:0 0 .25rem}}
- .lead{{color:#666;margin:0 0 1.5rem}}
- .card{{background:#fff;border:1px solid #e3e5e8;border-radius:10px;
-        padding:1.25rem;margin-bottom:1rem;max-width:760px}}
- h2{{font-size:1.05rem;margin:0 0 .75rem;display:flex;gap:.5rem;align-items:center}}
- .on,.off,.warn,.ok,.unk{{font-size:.72rem;font-weight:600;padding:.1rem .5rem;border-radius:99px}}
- .on{{background:#e6f4ea;color:#137333}} .off{{background:#eceff1;color:#5f6368}}
- .warn{{background:#fce8e6;color:#c5221f}} .ok{{background:#e6f4ea;color:#137333}}
- .unk{{background:#fef7e0;color:#b06000;cursor:help}}
- .muted{{color:#666;margin:.25rem 0 .75rem}}
+ :root{{
+   --background:#fff; --foreground:#030712; --card:#fff; --border:#e5e7eb;
+   --muted:#6a7282; --primary:#101828; --primary-foreground:#f9fafb;
+   --accent:#f3f4f6; --ring:#99a1af; --radius:.5rem;
+   --on-bg:#e6f4ea; --on-fg:#137333; --warn-bg:#fce8e6; --warn-fg:#c5221f;
+   --unk-bg:#fffbeb; --unk-fg:#b75000; --cool:#155dfc; --warm:#f99c00; --hot:#c5221f;
+ }}
+ @media (prefers-color-scheme: dark){{
+   :root{{
+     --background:#181818; --foreground:#f3f3f3; --card:#212121; --border:#303030;
+     --muted:#afafaf; --primary:#e7e7e7; --primary-foreground:#181818;
+     --accent:#303030; --ring:#777;
+     --on-bg:#12261a; --on-fg:#6ee7a0; --warn-bg:#2a1512; --warn-fg:#ff9e94;
+     --unk-bg:#2a2010; --unk-fg:#fcbb00;
+   }}
+ }}
+ *{{box-sizing:border-box}}
+ body{{margin:0;padding:2rem 1.5rem;background:var(--background);color:var(--foreground);
+   font:14px/1.5 Inter,"Inter Fallback",system-ui,sans-serif;
+   -webkit-font-smoothing:antialiased}}
+ .wrap{{max-width:780px;margin:0 auto}}
+ h1{{font-size:1.5rem;font-weight:600;letter-spacing:-.02em;margin:0 0 .25rem}}
+ .lead{{color:var(--muted);margin:0 0 1.75rem}}
+ .card{{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+   padding:1.25rem 1.5rem;margin-bottom:1rem}}
+ .card header{{display:flex;align-items:center;gap:.6rem;margin-bottom:.9rem}}
+ h2{{font-size:1rem;font-weight:600;margin:0}}
+ .chip{{font-size:.7rem;font-weight:500;padding:.15rem .5rem;border-radius:9999px;
+   border:1px solid transparent;white-space:nowrap}}
+ .chip.on{{background:var(--on-bg);color:var(--on-fg)}}
+ .chip.off{{background:var(--accent);color:var(--muted)}}
+ .chip.warn{{background:var(--warn-bg);color:var(--warn-fg)}}
+ .chip.unk{{background:var(--unk-bg);color:var(--unk-fg);cursor:help}}
+ .muted{{color:var(--muted);margin:0 0 .9rem}}
+ .usage{{display:flex;gap:1.25rem;margin-bottom:.5rem;flex-wrap:wrap}}
+ .bar{{flex:1;min-width:160px}}
+ .bar-head{{display:flex;justify-content:space-between;font-size:.75rem;
+   color:var(--muted);margin-bottom:.3rem}}
+ .pct{{font-variant-numeric:tabular-nums;font-weight:600;color:var(--foreground)}}
+ .track{{height:6px;background:var(--accent);border-radius:9999px;overflow:hidden}}
+ .fill{{height:100%;border-radius:9999px;transition:width .3s}}
+ .fill.cool{{background:var(--cool)}} .fill.warm{{background:var(--warm)}}
+ .fill.hot{{background:var(--hot)}}
+ .resets{{font-size:.7rem;color:var(--muted);margin-top:.25rem}}
+ .stamp{{font-size:.72rem;color:var(--muted);margin:0 0 1rem}}
+ .nodata{{font-size:.78rem;color:var(--muted);margin:0 0 1rem;font-style:italic}}
  form{{display:inline-block;margin:0 .5rem .5rem 0}}
- .paste{{display:block}}
- .paste input{{width:min(460px,70%);padding:.45rem .6rem;
-               border:1px solid #d0d4d9;border-radius:6px}}
- button{{padding:.45rem .9rem;border:1px solid #d0d4d9;background:#fff;
-         border-radius:6px;cursor:pointer}}
- button.primary{{background:#1a73e8;border-color:#1a73e8;color:#fff}}
- table{{border-collapse:collapse;margin:.5rem 0 .75rem;width:100%}}
- td{{padding:.25rem .5rem .25rem 0;border-bottom:1px solid #f0f1f3}}
- .wire{{color:#777;font-family:ui-monospace,monospace;font-size:.8rem}}
- .erro{{background:#fce8e6;color:#c5221f;padding:.75rem 1rem;border-radius:8px;
-        max-width:760px;margin-bottom:1rem}}
+ .paste{{display:block;margin-top:.25rem}}
+ .paste input{{width:min(430px,68%);padding:.45rem .7rem;border:1px solid var(--border);
+   border-radius:var(--radius);background:var(--background);color:var(--foreground);
+   font:inherit}}
+ .paste input:focus{{outline:2px solid var(--ring);outline-offset:-1px}}
+ button{{padding:.45rem .9rem;border:1px solid var(--border);background:var(--card);
+   color:var(--foreground);border-radius:var(--radius);cursor:pointer;font:inherit;
+   font-weight:500}}
+ button:hover{{background:var(--accent)}}
+ button.primary{{background:var(--primary);color:var(--primary-foreground);
+   border-color:var(--primary)}}
+ button.primary:hover{{opacity:.9}}
+ table{{border-collapse:collapse;width:100%;margin:.25rem 0 .9rem}}
+ td{{padding:.4rem .5rem .4rem 0;border-bottom:1px solid var(--border)}}
+ tr:last-child td{{border-bottom:0}}
+ label{{display:flex;align-items:center;gap:.5rem;cursor:pointer}}
+ .wire{{color:var(--muted);font-family:ui-monospace,SFMono-Regular,monospace;
+   font-size:.76rem}}
+ .mark{{text-align:right}}
+ .erro{{background:var(--warn-bg);color:var(--warn-fg);padding:.75rem 1rem;
+   border-radius:var(--radius);margin-bottom:1rem}}
 </style></head>
-<body>
+<body><div class="wrap">
 <h1>MySubs</h1>
 <p class="lead">Liga as tuas subscrições e serve-as como modelos do LiteLLM.</p>
 <div id="erro"></div>
 {body}
+</div>
 <script>
  const e = new URLSearchParams(location.search).get("erro");
  const esc = {{"<": "&lt;", ">": "&gt;", "&": "&amp;"}};

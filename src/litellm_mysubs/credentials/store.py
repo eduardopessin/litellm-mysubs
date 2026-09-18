@@ -86,3 +86,30 @@ class CredentialStore(ABC):
 
 class ReadOnlyStoreError(RuntimeError):
     """Escrita tentada num store de leitura (tipicamente o de variáveis de ambiente)."""
+
+
+def to_payload(credential: Credential) -> dict[str, object]:
+    """Credencial em dados simples, para quem a tiver de serializar."""
+    return {
+        "access_token": credential.access_token,
+        "refresh_token": credential.refresh_token,
+        "expires_at": credential.expires_at,
+        "project_id": credential.project_id,
+    }
+
+
+def from_payload(provider: ProviderId, raw: object) -> Credential | None:
+    """Credencial a partir de dados simples, ou ``None`` se não houver nada de útil.
+
+    Uma entrada sem `access_token` não é uma credencial degradada — é ausência dela. Devolver
+    um objecto vazio faria o resto do código tratar "não ligado" como "ligado e partido".
+    """
+    if not isinstance(raw, dict) or not raw.get("access_token"):
+        return None
+    return Credential(
+        provider=provider,
+        access_token=str(raw.get("access_token", "")),
+        refresh_token=str(raw.get("refresh_token", "")),
+        expires_at=float(raw.get("expires_at", 0) or 0),
+        project_id=str(raw.get("project_id", "")),
+    )
