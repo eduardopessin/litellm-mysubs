@@ -25,10 +25,15 @@ from typing import Final, NamedTuple
 #: Versão do OMP contra a qual as âncoras foram escritas.
 OMP_VERSION = "18.2.6"
 
-#: O wiring está repartido por dois pacotes: `pi-ai` tem a lógica, `pi-catalog` tem as
-#: constantes de fio (valores de headers, versões de cliente fixadas). Uma âncora pode
+#: O wiring está repartido por **três** pacotes: `pi-ai` tem a lógica, `pi-catalog` tem as
+#: constantes de fio (valores de headers, versões de cliente fixadas), e `pi-utils` tem o
+#: que é transversal a todos os provedores — o `USER_AGENT`, entre outros. Uma âncora pode
 #: apontar para qualquer um deles.
-PACKAGES: Final = ("@oh-my-pi/pi-ai", "@oh-my-pi/pi-catalog")
+#:
+#: Cada pacote em falta é uma âncora que não se pode verificar. Foi assim que o
+#: `User-Agent` do Codex passou despercebido e acabou inventado: procurei-o nos dois que
+#: tinha, não o encontrei, e escrevi um por analogia em vez de ir buscar o terceiro.
+PACKAGES: Final = ("@oh-my-pi/pi-ai", "@oh-my-pi/pi-catalog", "@oh-my-pi/pi-utils")
 REGISTRY = "https://registry.npmjs.org"
 
 #: `# omp: providers/anthropic.ts :: symbolA, symbolB`

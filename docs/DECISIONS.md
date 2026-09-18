@@ -134,3 +134,51 @@ configuração correcta em instalações que servem agentes A2A, onde a lista er
 
 O plugin injecta via `Router.set_model_list()` e persiste por sua conta. Um "aplicar" que
 devolve 200 e não faz nada é o pior modo de falha possível.
+
+## D4 — Divergências intencionais do `sitecustomize.py`
+
+**Data:** 2026-09-18 · **Estado:** decidido
+
+`tools/check_equivalence.py` nasceu para provar que a extracção não mudou nada do que vai
+para o fio. Cumpriu: enquanto foi só refactor, as 20 amostras coincidiam byte a byte.
+
+Deixou de ser verdade quando o porte passou a corrigir o original contra a fonte do OMP.
+Um verificador que falha em 19 de 20 casos não distingue regressão de correcção, e nesse
+estado é ruído com autoridade. As divergências abaixo são as esperadas; qualquer outra é
+regressão.
+
+### O prompt de sistema (19 casos)
+
+O original mandava `You are a Claude agent, built on Anthropic's Claude Agent SDK.`; o
+porte manda `You are Claude Code, Anthropic's official CLI for Claude.` — o do CLI real,
+que é o que o `User-Agent` e a lista de betas dizem ser. Duas identidades no mesmo pedido
+é o que faz a Anthropic tratá-lo como tráfego não-CLI.
+
+A âncora de cache no bloco de sistema vem do mesmo sítio: o OMP fixa o prefixo
+`tools`+`system`, que não muda entre turnos, em vez de reescrever a âncora de cauda a cada
+pedido.
+
+### `max_tokens` (6 casos)
+
+O original fixava 16384 sempre. O porte deriva `budget + OUTPUT_FALLBACK_BUFFER`, limitado
+por `MAX_OUTPUT_TOKENS`, que é a regra da fonte (`providers/anthropic.ts:3868`). Fixar o
+valor dava 16384 a um pedido `minimal` — 12 mil tokens de output reservados sem uso — e
+o mesmo 16384 a um `xhigh`, que fica sem espaço para responder depois de pensar.
+
+### `budget_tokens` (2 casos)
+
+Escala do OMP (`low` = 4096) em vez da tabela do original (`low` = 2048), com o tecto de
+`THINKING_CEILING` aplicado **depois** do degrau, para preservar a ordem relativa.
+
+### `output_config.effort` (1 caso)
+
+Com `tool_choice` forçada num modelo adaptativo, o porte fixa `effort: "low"`. Omitir o
+`thinking` não desliga o raciocínio nestes modelos — a API volta a ligá-lo por default — e
+fixar o degrau mais baixo é a única forma de o reduzir sem o 400 de
+`tool_choice` + `thinking`.
+
+### `thinking.display`
+
+Reposto depois de o verificador o apanhar em falta. O gate é geracional — opus ≥ 4.7,
+sonnet/fable/mythos ≥ 5 (`compat/resolve.ts :: defaultSupportsDisplay`) — e não coincide
+com `is_adaptive`: opus-4-6 e sonnet-4-6 são adaptativos e recusam o campo com 400.

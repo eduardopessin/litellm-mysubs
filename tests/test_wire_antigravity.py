@@ -501,21 +501,50 @@ class TestToolCalls:
 
 
 class TestTools:
-    def test_modern_schema_field(self) -> None:
-        """parametersJsonSchema aceita OpenAPI 3.0 completo."""
+    def test_schema_always_travels_as_parameters(self) -> None:
+        """`parametersJsonSchema` nunca chega ao fio deste backend.
+
+        O OMP converte **todas** as declarações no caminho Antigravity; o campo do JSON
+        Schema completo era uma leitura errada da API pública do Gemini.
+        """
         tools, _ = ag.tools_to_declarations(
             "gemini-3-pro",
             [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
         )
         assert tools is not None
-        assert "parametersJsonSchema" in tools[0]["functionDeclarations"][0]
+        declaration = tools[0]["functionDeclarations"][0]
+        assert "parameters" in declaration
+        assert "parametersJsonSchema" not in declaration
 
-    def test_claude_uses_legacy_parameters(self) -> None:
+    def test_unsupported_constructs_are_sanitised(self) -> None:
+        """`anyOf`/`$ref`/`not` dão 400 no CCA; mandá-los crus fazia o pedido falhar."""
         tools, _ = ag.tools_to_declarations(
-            "claude-sonnet-4-6", [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+            "gemini-3-pro",
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "f",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"x": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+                        },
+                    },
+                }
+            ],
         )
         assert tools is not None
-        assert "parameters" in tools[0]["functionDeclarations"][0]
+        serialised = json.dumps(tools[0]["functionDeclarations"][0]["parameters"])
+        assert "anyOf" not in serialised
+
+    def test_every_model_uses_the_same_field(self) -> None:
+        """A escolha por família era invenção local: o OMP não distingue aqui."""
+        for model in ("gemini-3-pro", "claude-sonnet-4-6", "gemini-2.5-flash"):
+            tools, _ = ag.tools_to_declarations(
+                model, [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+            )
+            assert tools is not None
+            assert "parameters" in tools[0]["functionDeclarations"][0], model
 
     def test_validated_is_the_default_mode(self) -> None:
         assert ag.tool_config(None, []) == {"functionCallingConfig": {"mode": "VALIDATED"}}

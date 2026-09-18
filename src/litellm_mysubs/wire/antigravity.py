@@ -20,6 +20,7 @@ from collections.abc import Callable, Mapping
 from typing import Any, Final, NamedTuple
 
 from .antigravity_models import ModelCatalog, base_family, map_model, supports_function_ids
+from .schema import normalize_for_cca
 
 # Limite de bytes para inlinar media. O backend aceita bem além disto, mas um pedido que
 # arraste dezenas de MB por turno é um problema de latência e de janela, não de capacidade.
@@ -281,19 +282,22 @@ def content_parts(
 # -- tools ---------------------------------------------------------------------
 
 
+# omp: providers/google-gemini-cli.ts :: normalizeAntigravityTools
 def tools_to_declarations(
     model: str, tools: list[Any] | None
 ) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]]]:
     """Declarações de função no dialecto do Antigravity.
 
-    ``parametersJsonSchema`` aceita OpenAPI 3.0 completo; o campo antigo ``parameters`` é
-    o dialecto reduzido, e só a família Claude servida por esta API o exige.
+    Todas as declarações vão em ``parameters`` com o schema saneado — ``model`` fica só
+    para contexto de erro. O ``parametersJsonSchema`` nunca chega ao fio deste backend:
+    o Cloud Code Assist recusa com 400 os construtos que o JSON Schema completo permite
+    (``anyOf``, ``oneOf``, ``not``, ``$ref``, ``type: ["string", "null"]``, ``const``), e
+    mandá-los crus fazia o pedido falhar em vez de o schema ser normalizado.
     """
     if not tools:
         return None, []
 
     declarations: list[dict[str, Any]] = []
-    legacy = model.split("/")[-1].lower().startswith("claude-")
     for tool in tools:
         if not isinstance(tool, dict):
             continue
@@ -303,12 +307,13 @@ def tools_to_declarations(
         if not isinstance(name, str) or not name:
             continue
         schema = function.get("parameters") or {"type": "object", "properties": {}}
-        declaration: dict[str, Any] = {
-            "name": name,
-            "description": str(function.get("description") or ""),
-        }
-        declaration["parameters" if legacy else "parametersJsonSchema"] = schema
-        declarations.append(declaration)
+        declarations.append(
+            {
+                "name": name,
+                "description": str(function.get("description") or ""),
+                "parameters": normalize_for_cca(schema),
+            }
+        )
 
     return ([{"functionDeclarations": declarations}] if declarations else None), declarations
 

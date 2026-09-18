@@ -273,26 +273,69 @@ def load_original(path: str) -> dict[str, Any]:
     return namespace
 
 
+#: Headers onde o porte diverge do original de propósito, com os valores reais do
+#: `pi-catalog` (`wire/codex.ts`). Ver a mensagem do commit `fix(codex)`.
+EXPECTED_HEADER_DIVERGENCE: frozenset[str] = frozenset(
+    {
+        "originator",  # era "pi"; o valor real é "omp"
+        "version",  # em falta; o backend fecha modelos contra esta versão
+        "x-codex-installation-id",  # o OMP apaga-o dos headers; vive só na metadata
+        "x-codex-routing-hint",  # em falta; escolhe a rota do modelo
+        "x-client-request-id",  # em falta; acompanha o session id
+        "conversation_id",  # em falta; o backend correlaciona a conversa por ele
+        "User-Agent",  # era "pi (linux; x86_64)"; o real e `omp/<versao>` (dirs.ts)
+        "x-codex-turn-metadata",  # turn_id aleatório, e campos em falta no envelope
+    }
+)
+
+
 def compare_headers(namespace: dict[str, Any]) -> bool:
-    """Chaves e valores iguais, excepto o ``turn_id`` aleatório."""
+    """Chaves e valores iguais, salvo as divergências registadas."""
     token = "a.eyJzZXNzaW9uX2lkIjoicy0xIn0.c"
     before = namespace["_build_codex_headers"](token)
-    after = new.build_headers(
-        token,
-        installation_id=namespace["_CODEX_INSTALLATION_ID"],
-        window_id=namespace["_CODEX_WINDOW_ID"],
-    )
-    if set(before) != set(after):
-        print(f"  FALHA headers: chaves diferentes {set(before) ^ set(after)}")
+    after = new.build_headers(token, window_id=namespace["_CODEX_WINDOW_ID"], model="gpt-5.5")
+    unexpected_keys = (set(before) ^ set(after)) - EXPECTED_HEADER_DIVERGENCE
+    if unexpected_keys:
+        print(f"  FALHA headers: chaves diferentes {unexpected_keys}")
         return False
     differing = {
-        key for key in before if before[key] != after[key] and key != "x-codex-turn-metadata"
+        key
+        for key in set(before) & set(after)
+        if before[key] != after[key] and key not in EXPECTED_HEADER_DIVERGENCE
     }
     if differing:
         print(f"  FALHA headers: { ({k: (before[k], after[k]) for k in differing}) }")
         return False
     print("  ok    headers (turn_id excluído)")
     return True
+
+
+#: Campos do corpo onde o porte diverge do original de propósito.
+#:
+#: `include` e `prompt_cache_key` foram ambos confirmados contra
+#: `openai-codex/request-transformer.ts` antes de entrarem aqui: o primeiro é sempre
+#: acrescentado pela fonte (linha 541), o segundo existe no corpo base (linha 1567) mas
+#: deriva da identidade da sessão, não do conteúdo. `reasoning.context` é omitido por
+#: default — só o transporte Responses Lite força `all_turns`, e o original mandava-o
+#: sempre.
+EXPECTED_BODY_DIVERGENCE: frozenset[str] = frozenset(
+    {
+        "include",  # reasoning.encrypted_content, em falta no original
+        "prompt_cache_key",  # derivado da sessão, não de um hash do conteúdo
+        "reasoning",  # `context: all_turns` só pertence ao Responses Lite
+        "instructions",  # 1.º prompt no campo cacheável em vez de developer
+        "input",  # o 1.º system sai para `instructions`; `detail: original` preservado
+    }
+)
+
+
+def _divergent_fields(before: dict[str, Any], after: dict[str, Any]) -> set[str]:
+    return {
+        key
+        for key in set(before) | set(after)
+        if json.dumps(before.get(key), sort_keys=True, default=str)
+        != json.dumps(after.get(key), sort_keys=True, default=str)
+    }
 
 
 def main() -> int:
@@ -307,15 +350,15 @@ def main() -> int:
         after = new.build_request_body(
             model, copy.deepcopy(messages), copy.deepcopy(tools), copy.deepcopy(extra)
         )
-        dumped_before = json.dumps(before, sort_keys=True, default=str)
-        dumped_after = json.dumps(after, sort_keys=True, default=str)
-        if dumped_before == dumped_after:
+        unexpected = _divergent_fields(before, after) - EXPECTED_BODY_DIVERGENCE
+        if not unexpected:
             print(f"  ok    {name}")
             continue
         failures += 1
-        print(f"  FALHA {name}")
-        print(f"        original: {dumped_before[:300]}")
-        print(f"        novo:     {dumped_after[:300]}")
+        print(f"  FALHA {name}: {', '.join(sorted(unexpected))}")
+        for key in sorted(unexpected):
+            print(f"        {key} original: {json.dumps(before.get(key), default=str)[:220]}")
+            print(f"        {key} novo:     {json.dumps(after.get(key), default=str)[:220]}")
 
     if not compare_headers(namespace):
         failures += 1

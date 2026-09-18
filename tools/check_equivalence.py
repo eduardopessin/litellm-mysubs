@@ -1,13 +1,16 @@
 """Equivalência entre ``wire/anthropic.py`` e o ``sitecustomize.py`` de onde foi extraído.
 
 Não é um teste do pytest: precisa do ficheiro original, que vive noutro repositório e não
-é dependência deste. Corre-se à mão durante uma extracção, para provar que o refactor não
-mudou uma vírgula do que vai para o fio::
+é dependência deste. Corre-se à mão durante uma extracção::
 
     python tools/check_equivalence.py /caminho/para/sitecustomize.py
 
-Quando a extracção estiver completa e o original deixar de existir, este ficheiro deixa de
-ter função e deve ser apagado — a garantia passa então a ser dos testes de contrato.
+Enquanto foi só refactor, provava que nada mudava. Agora o porte corrige o original contra
+a fonte do OMP, e um verificador que falhe em toda a parte não distingue regressão de
+correcção. Por isso compara-se contra ``EXPECTED_DIVERGENCE``: os campos listados **têm**
+de divergir, os restantes **não** podem. As razões estão em ``docs/DECISIONS.md`` (D4).
+
+Quando o original deixar de existir, este ficheiro deixa de ter função e deve ser apagado.
 """
 
 from __future__ import annotations
@@ -265,6 +268,30 @@ def load_original(path: str) -> Any:
     return namespace["_inject_claude_prompt"]
 
 
+#: Campos onde o porte diverge do original de propósito. Ver ``docs/DECISIONS.md`` (D4).
+#:
+#: Entrar aqui exige uma razão escrita: é a diferença entre corrigir o original e
+#: regredir sem dar por isso.
+EXPECTED_DIVERGENCE: frozenset[str] = frozenset(
+    {
+        "extra_headers",  # User-Agent e betas do CLI real
+        "messages",  # prompt de sistema do CLI e âncora de cache no prefixo estável
+        "max_tokens",  # derivado de budget + margem, em vez de fixo
+        "thinking",  # escala de budget do OMP e `display` por geração
+        "output_config",  # effort fixado quando tool_choice força ferramenta
+    }
+)
+
+
+def _divergent_fields(before: dict[str, Any], after: dict[str, Any]) -> set[str]:
+    return {
+        key
+        for key in set(before) | set(after)
+        if json.dumps(before.get(key), sort_keys=True, default=str)
+        != json.dumps(after.get(key), sort_keys=True, default=str)
+    }
+
+
 def main() -> int:
     original_path = sys.argv[1] if len(sys.argv) > 1 else "sitecustomize.py"
     original = load_original(original_path)
@@ -273,17 +300,17 @@ def main() -> int:
     for name, payload in CASES:
         before = original(copy.deepcopy(payload))
         after = new.build_request(copy.deepcopy(payload), str(payload["model"]))
-        dumped_before = json.dumps(before, sort_keys=True, default=str)
-        dumped_after = json.dumps(after, sort_keys=True, default=str)
-        if dumped_before == dumped_after:
+        unexpected = _divergent_fields(before, after) - EXPECTED_DIVERGENCE
+        if not unexpected:
             print(f"  ok    {name}")
             continue
         failures += 1
-        print(f"  FALHA {name}")
-        print(f"        original: {dumped_before[:300]}")
-        print(f"        novo:     {dumped_after[:300]}")
+        print(f"  FALHA {name}: {', '.join(sorted(unexpected))}")
+        for key in sorted(unexpected):
+            print(f"        {key} original: {json.dumps(before.get(key), default=str)[:220]}")
+            print(f"        {key} novo:     {json.dumps(after.get(key), default=str)[:220]}")
 
-    print(f"\ndivergências: {failures} de {len(CASES)}")
+    print(f"\ndivergências inesperadas: {failures} de {len(CASES)}")
     return 1 if failures else 0
 
 

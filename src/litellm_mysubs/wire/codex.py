@@ -139,8 +139,14 @@ CLIENT_VERSION: Final = "0.153.0"
 # omp: wire/codex.ts :: OPENAI_HEADER_VALUES
 BETA_RESPONSES: Final = "responses=experimental"
 
-#: User-Agent do cliente. Mantido alinhado com a versão fixada acima.
-USER_AGENT: Final = f"codex/{CLIENT_VERSION} (external, cli)"
+# omp: dirs.ts :: USER_AGENT
+#: `omp/<versão>`, e não `codex/<versão>`: é o agente do próprio OMP, partilhado por
+#: todos os provedores, não um valor do dialecto do Codex. Escrevi-o errado por analogia
+#: com `claude-cli/…` do caminho Anthropic, onde o CLI *é* o cliente; aqui não é. A
+#: constante vive num terceiro pacote (`@oh-my-pi/pi-utils`), que nem o `pi-ai` nem o
+#: `pi-catalog` continham.
+OMP_VERSION: Final = "18.2.6"
+USER_AGENT: Final = f"omp/{OMP_VERSION}"
 
 # omp: providers/openai-codex-responses.ts :: OpenAICodexRequestKind
 #: Vocabulário fechado: "turn" | "prewarm" | "compaction". O port emitia "chat", que não

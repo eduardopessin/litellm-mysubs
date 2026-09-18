@@ -32,13 +32,12 @@ class TestMalformedInput:
         assert codex.token_claims(f"a.{body}.c") == {}
 
     def test_account_header_absent_without_claim(self) -> None:
-        headers = codex.build_headers(jwt({}), installation_id="i", window_id="w")
+        headers = codex.build_headers(jwt({}), window_id="w")
         assert "chatgpt-account-id" not in headers
 
     def test_account_header_present_with_claim(self) -> None:
         headers = codex.build_headers(
             jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-9"}}),
-            installation_id="i",
             window_id="w",
         )
         assert headers["chatgpt-account-id"] == "acct-9"

@@ -11,6 +11,7 @@ ir buscá-lo a estado global.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Final
 
 # omp: providers/claude-code-fingerprint.ts :: claudeCodeSystemInstruction
@@ -188,6 +189,41 @@ def is_adaptive(model: str) -> bool:
     """Se o modelo usa ``thinking: adaptive`` em vez de ``budget_tokens``."""
     lowered = str(model).lower()
     return not any(marker in lowered for marker in BUDGET_ONLY_MODELS)
+
+
+#: Modelos que aceitam ``thinking.display``, por ordem de especificidade.
+#:
+#: A regra da fonte é geracional, não uma lista: opus a partir de 4.7, e
+#: sonnet/fable/mythos a partir de 5. Não coincide com ``is_adaptive`` — opus-4-6 e
+#: sonnet-4-6 são adaptativos mas **não** aceitam ``display``, e mandá-lo dá 400.
+_DISPLAY_FLOORS: Final[tuple[tuple[str, float], ...]] = (
+    ("opus", 4.7),
+    ("sonnet", 5.0),
+    ("fable", 5.0),
+    ("mythos", 5.0),
+)
+
+
+# omp: compat/resolve.ts :: defaultSupportsDisplay
+def supports_display(model: str) -> bool:
+    """Se o modelo aceita ``thinking.display``.
+
+    ``display: "summarized"`` é o que faz o raciocínio voltar em texto legível: a partir
+    do Opus 4.7 o conteúdo é omitido da resposta por default. O campo é estritamente
+    fechado por modelo — quem não o suporta responde 400 — por isso não basta ser
+    adaptativo.
+    """
+    lowered = str(model).lower()
+    for family, floor in _DISPLAY_FLOORS:
+        if family not in lowered:
+            continue
+        match = re.search(rf"{family}[^0-9]*(\d+)(?:[.-](\d+))?", lowered)
+        if not match:
+            return False
+        major = int(match.group(1))
+        minor = int(match.group(2) or 0)
+        return major + minor / 10 >= floor
+    return False
 
 
 def normalize_effort(value: object) -> tuple[str | None, str | None]:
@@ -573,6 +609,13 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
     if not thinking_active:
         return kwargs
 
+    # `display: "summarized"` é o que faz o raciocínio voltar em texto legível: a partir
+    # do Opus 4.7 o conteúdo é omitido por default, e sem o campo os deltas de thinking
+    # chegam vazios. Respeita-se o que o cliente mandou; o gate é por modelo porque quem
+    # não o suporta responde 400.
+    display = thinking.get("display") if isinstance(thinking, dict) else None
+    show = str(display or "summarized")
+
     if isinstance(thinking, dict):
         budget = min(thinking.get("budget_tokens") or EFFORT_BUDGET["medium"], THINKING_CEILING)
         if thinking.get("type") != "adaptive":
@@ -585,9 +628,14 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
     if is_adaptive(model):
         # budget_tokens é rejeitado/ignorado nestes modelos; o par adaptive +
         # output_config.effort é a única forma suportada.
-        kwargs["thinking"] = {"type": "adaptive"}
+        adaptive: dict[str, Any] = {"type": "adaptive"}
+        if supports_display(model):
+            adaptive["display"] = show
+        kwargs["thinking"] = adaptive
         effort = "low" if forced_adaptive else ADAPTIVE_EFFORT.get(reasoning or "", "medium")
         kwargs["output_config"] = {"effort": effort}
+    elif isinstance(kwargs.get("thinking"), dict) and supports_display(model):
+        kwargs["thinking"]["display"] = show
 
     # Mexe-se só na chave que o cliente mandou: preencher as duas fazia a cópia de baixo
     # sobrepor o valor do cliente com o default.

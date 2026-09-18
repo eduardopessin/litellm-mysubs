@@ -280,26 +280,39 @@ class TestCacheRetention:
     def test_adaptive_model_gets_output_config(self) -> None:
         """budget_tokens é ignorado nestes modelos; adaptive + effort é a única forma."""
         out = ant.apply_thinking_params({"reasoning_effort": "high"}, "claude-opus-5")
-        assert out["thinking"] == {"type": "adaptive"}
+        assert out["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert out["output_config"] == {"effort": "high"}
         assert "reasoning_effort" not in out
 
-    def test_display_is_not_forced(self) -> None:
-        """O OMP fecha `display` por suporte do modelo: 4.6+ rejeitam-no com 400.
+    def test_display_is_gated_by_generation_not_by_adaptive(self) -> None:
+        """Ser adaptativo não basta: o campo é fechado por geração.
 
-        Medido contra esta subscrição: não dá 400, mas também não muda o raciocínio
-        devolvido (opus-4-6 e sonnet-4-6 dão os mesmos chars com e sem). Não havendo
-        ganho, segue-se a fonte em vez de arriscar o 400 que ela documenta.
+        O gate da fonte é opus >= 4.7 e sonnet/fable/mythos >= 5. Opus 4.6 e Sonnet 4.6
+        são adaptativos e mesmo assim recusam `display` com 400, por isso a condição não
+        pode ser `is_adaptive`.
         """
-        out = ant.apply_thinking_params({"reasoning_effort": "high"}, "claude-opus-5")
-        assert "display" not in out["thinking"]
+        for model in ("claude-opus-5", "claude-opus-4-7", "claude-sonnet-5", "claude-fable-5"):
+            out = ant.apply_thinking_params({"reasoning_effort": "high"}, model)
+            assert out["thinking"]["display"] == "summarized", model
+
+        for model in ("claude-opus-4-6", "claude-sonnet-4-6"):
+            out = ant.apply_thinking_params({"reasoning_effort": "high"}, model)
+            assert ant.is_adaptive(model), model
+            assert "display" not in out["thinking"], model
+
+    def test_client_display_choice_is_respected(self) -> None:
+        """`omitted` é uma escolha legítima de quem não quer o texto do raciocínio."""
+        out = ant.apply_thinking_params(
+            {"thinking": {"type": "adaptive", "display": "omitted"}}, "claude-opus-5"
+        )
+        assert out["thinking"]["display"] == "omitted"
 
     def test_forced_tool_choice_pins_effort_on_adaptive(self) -> None:
         """Omitir thinking num modelo adaptive não o desliga: a API volta a ligá-lo."""
         out = ant.apply_thinking_params(
             {"reasoning_effort": "high", "tool_choice": {"type": "any"}}, "claude-opus-5"
         )
-        assert out["thinking"] == {"type": "adaptive"}
+        assert out["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert out["output_config"] == {"effort": "low"}
 
     def test_budget_model_gets_budget_tokens(self) -> None:
