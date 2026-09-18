@@ -7,6 +7,7 @@ campo omitido é um comportamento que desaparece em silêncio.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -198,6 +199,65 @@ class TestMultimodal:
     def test_pdf_mime_from_filename(self) -> None:
         part = ag.media_part({"type": "file", "file": {"file_data": PNG, "filename": "doc.pdf"}})
         assert part is not None
+
+    def test_image_replaced_by_placeholder_without_vision(self) -> None:
+        """Um modelo sem vision devolve 400 à imagem; descartá-la calada fazia o modelo
+        responder sobre conteúdo que não recebeu."""
+        parts = ag.content_parts(
+            [{"type": "text", "text": "cor?"}, {"type": "image_url", "image_url": {"url": PNG}}],
+            supports_images=False,
+        )
+        assert parts == [{"text": "cor?"}, {"text": ag.NON_VISION_IMAGE_PLACEHOLDER}]
+
+    def test_non_image_media_survives_without_vision(self) -> None:
+        """A guarda é de vision, não de anexos: um PDF não passa pelo caminho de imagem."""
+        parts = ag.content_parts(
+            [{"type": "file", "file": {"file_data": PNG, "filename": "doc.pdf"}}],
+            supports_images=False,
+        )
+        assert len(parts) == 1 and "inlineData" in parts[0]
+
+    def test_blank_text_block_produces_no_part(self) -> None:
+        """Um `{"text": "   "}` não transporta informação e parte alguns modelos servidos
+        por esta API (o Claude, entre eles)."""
+        assert ag.content_parts([{"type": "text", "text": "   "}]) == []
+        assert ag.content_parts("   ") == []
+
+    def test_lone_surrogate_never_reaches_the_wire(self) -> None:
+        """Um surrogate órfão não codifica em UTF-8: o payload rebentava a serialização
+        em vez de ser enviado."""
+        parts = ag.content_parts([{"type": "text", "text": "a\ud800b"}])
+        json.dumps(parts)
+        assert parts == [{"text": "a\ufffdb"}]
+
+    def test_real_emoji_survives(self) -> None:
+        """Substituir por posição destruía emoji legítimo vindo do cliente.
+
+        Um emoji num `str` de Python é **um** code point, não um par de surrogates.
+        """
+        assert ag.well_formed("olá 😀") == "olá 😀"
+
+    def test_surrogate_pair_is_also_replaced(self) -> None:
+        """Onde o OMP preserva o par, aqui ele tem de sair.
+
+        Em JavaScript `\\ud83d\\ude00` é um caractere e o `toWellFormed()` mantém-no. Em
+        Python são dois code points que não codificam: preservá-los rebenta
+        `str.encode("utf-8")` e o `json.dumps(..., ensure_ascii=False)` que muitos
+        clientes HTTP usam para montar o corpo.
+        """
+        cleaned = ag.well_formed("par \ud83d\ude00 aqui")
+        cleaned.encode("utf-8")
+        assert "\ud83d" not in cleaned
+
+    def test_every_text_on_the_wire_is_encodable(self) -> None:
+        """A garantia que interessa não é "sem órfãos", é "serializa"."""
+        payload = ag.build_payload(
+            "gemini-3-pro",
+            [{"role": "user", "content": "a\ud800b \ud83d\ude00 c"}],
+            "proj",
+            REQUEST_ID,
+        )
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 class TestToolCalls:
@@ -413,6 +473,31 @@ class TestToolCalls:
     def test_error_result_uses_error_key(self) -> None:
         value, _ = ag.tool_result_value({"content": "falhou", "is_error": True})
         assert value == {"error": "falhou"}
+
+    def test_tool_result_image_replaced_by_placeholder_without_vision(self) -> None:
+        """A imagem que a tool devolveu não pode sair do resultado sem deixar rasto: o
+        modelo lia um texto que a calava."""
+        value, media = ag.tool_result_value(
+            {
+                "content": [
+                    {"type": "text", "text": "captura"},
+                    {"type": "image_url", "image_url": {"url": PNG}},
+                ]
+            },
+            supports_images=False,
+        )
+        assert media == []
+        assert value == {"output": f"captura\n{ag.NON_VISION_IMAGE_PLACEHOLDER}"}
+
+    def test_payload_carries_the_placeholder_not_the_image(self) -> None:
+        """A capacidade tem de atravessar o envelope: filtrar só em `content_parts` não
+        salvava o pedido que o proxy envia."""
+        body = payload(
+            [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": PNG}}]}],
+            supports_images=False,
+        )
+        parts = body["request"]["contents"][0]["parts"]
+        assert parts == [{"text": ag.NON_VISION_IMAGE_PLACEHOLDER}]
 
 
 class TestTools:

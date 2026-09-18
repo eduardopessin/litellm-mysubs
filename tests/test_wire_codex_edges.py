@@ -203,3 +203,41 @@ class TestBodyOptionalFields:
         """Uma mensagem sem conteúdo nem tool calls não tem nada para enviar."""
         body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": ""}])
         assert body["input"] == []
+
+    def test_no_instructions_key_without_a_system_prompt(self) -> None:
+        """Um `instructions: ""` é um prompt base vazio a ocupar a entrada de cache."""
+        body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
+        assert "instructions" not in body
+
+    def test_blank_system_prompt_is_not_promoted_to_instructions(self) -> None:
+        body = codex.build_request_body(
+            "gpt-5.5",
+            [{"role": "system", "content": "   "}, {"role": "user", "content": "x"}],
+        )
+        assert "instructions" not in body
+
+    def test_system_prompt_leaves_the_input(self) -> None:
+        """Duplicá-lo no input gastava contexto e desalinhava-o do prompt cacheado."""
+        body = codex.build_request_body(
+            "gpt-5.5",
+            [{"role": "system", "content": "regra"}, {"role": "user", "content": "x"}],
+        )
+        assert body["instructions"] == "regra"
+        assert [i["content"][0]["text"] for i in body["input"]] == ["x"]
+
+    def test_unsupported_detail_original_degrades_in_the_body(self) -> None:
+        """A capacidade tem de atravessar o corpo todo: degradar só em `image_part` não
+        salvava o pedido que o proxy realmente envia."""
+        body = codex.build_request_body(
+            "gpt-5.5",
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "u", "detail": "original"}}
+                    ],
+                }
+            ],
+            supports_detail_original=False,
+        )
+        assert body["input"][0]["content"][0]["detail"] == "auto"

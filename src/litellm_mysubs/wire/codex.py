@@ -16,8 +16,7 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import Callable
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
 # A conta ChatGPT rejeita a família 5.4 com "The 'gpt-5.4' model is not supported when
 # using Codex with a ChatGPT account".
@@ -50,8 +49,10 @@ JUICE: Final[dict[str, int]] = {
 #: A partir desta geração o item de juice é necessário para desligar mesmo o reasoning.
 JUICE_MIN_GENERATION: Final = 5.6
 
-#: O Codex recusa ``detail: "original"``; reescreve-se para "auto".
-IMAGE_DETAILS: Final[tuple[str, ...]] = ("auto", "low", "high")
+#: ``original`` é um valor válido da API; alguns backends de Responses (o GitHub Copilot,
+#: por exemplo) recusam-no com 400, e aí degrada-se para "auto" — a fidelidade mais próxima
+#: que passa. Forçar sempre "auto" perdia detalhe em screenshots contra hosts que o servem.
+IMAGE_DETAILS: Final[tuple[str, ...]] = ("auto", "low", "high", "original")
 
 # Tools hospedadas pelo backend (web search, geração de imagem, shell…) não têm `function`:
 # viajam com o spec próprio e eram descartadas antes de isto existir.
@@ -210,16 +211,37 @@ def prompt_cache_key(session_id: str | None, *, cache_retention: str | None = No
     return f"pc_{_stable_hash(session_id)}"
 
 
-def image_part(part: dict[str, Any]) -> dict[str, str] | None:
-    """``image_url`` do chat completions -> ``input_image`` do Responses."""
+# omp: providers/openai-shared.ts :: clampResponsesImageDetail
+def clamp_image_detail(detail: object, *, supports_detail_original: bool = True) -> str:
+    """Normaliza ``detail``, degradando ``original`` só onde o host o recusa."""
+    resolved = str(detail or "auto").lower()
+    if resolved not in IMAGE_DETAILS:
+        return "auto"
+    if resolved == "original" and not supports_detail_original:
+        return "auto"
+    return resolved
+
+
+# omp: providers/openai-shared.ts :: convertResponsesInputImage
+def image_part(
+    part: dict[str, Any], *, supports_detail_original: bool = True
+) -> dict[str, str] | None:
+    """``image_url`` do chat completions -> ``input_image`` do Responses.
+
+    Uma imagem já carregada para o backend viaja por ``file_id`` e não tem ``url``: sem
+    este ramo devolvia-se ``None`` e a imagem era descartada em silêncio.
+    """
     image = part.get("image_url")
+    spec: dict[str, Any] = image if isinstance(image, dict) else part
+    detail = clamp_image_detail(
+        spec.get("detail") or part.get("detail"),
+        supports_detail_original=supports_detail_original,
+    )
+    if file_id := spec.get("file_id"):
+        return {"type": "input_image", "detail": detail, "file_id": str(file_id)}
     url = image.get("url") if isinstance(image, dict) else image
     if not url:
         return None
-    detail = (image.get("detail") if isinstance(image, dict) else None) or part.get("detail")
-    detail = str(detail or "auto").lower()
-    if detail not in IMAGE_DETAILS:
-        detail = "auto"
     return {"type": "input_image", "image_url": str(url), "detail": detail}
 
 
@@ -241,17 +263,15 @@ def file_part(part: dict[str, Any]) -> dict[str, str] | None:
     return item
 
 
-#: Tipo de bloco -> construtor. Uma imagem ou ficheiro que não converta é descartado,
-#: mas nunca leva o resto do turno com ele.
-_PART_BUILDERS: Final[dict[str, Callable[[dict[str, Any]], dict[str, str] | None]]] = {
-    "image_url": image_part,
-    "input_image": image_part,
-    "file": file_part,
-    "input_file": file_part,
-}
+#: Uma imagem ou ficheiro que não converta é descartado, mas nunca leva o resto do turno
+#: com ele.
+IMAGE_PART_TYPES: Final[tuple[str, ...]] = ("image_url", "input_image")
+FILE_PART_TYPES: Final[tuple[str, ...]] = ("file", "input_file")
 
 
-def content_to_parts(content: object, *, assistant: bool = False) -> list[dict[str, str]]:
+def content_to_parts(
+    content: object, *, assistant: bool = False, supports_detail_original: bool = True
+) -> list[dict[str, str]]:
     """Preserva imagens e ficheiros em vez de os deixar cair.
 
     Antes disto, qualquer pedido multimodal chegava ao modelo só com o texto — e a
@@ -266,15 +286,17 @@ def content_to_parts(content: object, *, assistant: bool = False) -> list[dict[s
     for part in content:
         if not isinstance(part, dict):
             continue
-        kind = part.get("type")
+        kind = str(part.get("type"))
         if kind in TEXT_PART_TYPES:
             if part.get("text"):
                 parts.append({"type": text_type, "text": str(part["text"])})
             continue
-        builder = _PART_BUILDERS.get(str(kind))
-        if builder is None:
-            continue
-        if built := builder(part):
+        built: dict[str, str] | None = None
+        if kind in IMAGE_PART_TYPES:
+            built = image_part(part, supports_detail_original=supports_detail_original)
+        elif kind in FILE_PART_TYPES:
+            built = file_part(part)
+        if built:
             parts.append(built)
     return parts
 
@@ -369,29 +391,60 @@ def _orphan_output_text(item: dict[str, Any]) -> str:
     return text
 
 
+#: Texto literal da fonte (lá está inline no ramo `computer` de `repairToolCallPairs`, sem
+#: nome próprio). Uma `computer_call` não tem output sintetizável: a screenshot que faltou
+#: não se inventa, logo a chamada passa a nota que o modelo lê.
+INTERRUPTED_COMPUTER_CALL: Final = (
+    "[Computer call interrupted before a screenshot was recorded; call_id={call_id}]"
+)
+
+#: Item de chamada -> tipo da tool. O par só fecha entre itens do **mesmo** tipo: o
+#: Responses recusa um ``custom_tool_call_output`` a fechar um ``function_call``.
+_CALL_KINDS: Final[dict[str, str]] = {
+    "function_call": "function",
+    "custom_tool_call": "custom",
+    "computer_call": "computer",
+}
+_OUTPUT_KINDS: Final[dict[str, str]] = {
+    "function_call_output": "function",
+    "custom_tool_call_output": "custom",
+    "computer_call_output": "computer",
+}
+
+
+# omp: providers/openai-codex/request-transformer.ts :: repairToolCallPairs, toolCallKind
+# omp: providers/openai-codex/request-transformer.ts :: toolOutputKind
 # omp: providers/openai-codex/request-transformer.ts :: orphanFunctionOutputToMessage
 def repair_tool_pairs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Fecha pares ``function_call`` / ``function_call_output`` incompletos.
+    """Fecha metades soltas de uma troca com tool, indexadas por **tipo** de tool.
 
-    O Responses rejeita um output sem a chamada correspondente e uma chamada sem output.
-    Um histórico truncado pelo cliente traz exactamente isso, e a alternativa a reparar
-    seria devolver 400 por algo que o modelo consegue interpretar.
+    O Responses rejeita com 400 um output sem a chamada e uma chamada sem output. Um
+    histórico truncado pelo cliente (ou um turno abortado depois de a chamada ter sido
+    emitida) traz exactamente isso, e reparar é preferível a 400 por algo que o modelo
+    interpreta. Indexar só por ``call_id`` emparelhava tipos diferentes — um
+    ``custom_tool_call_output`` a "fechar" um ``function_call`` volta a dar 400.
     """
-    calls = {
-        item.get("call_id")
-        for item in items
-        if item.get("type") == "function_call" and item.get("call_id")
-    }
-    outputs = {
-        item.get("call_id")
-        for item in items
-        if item.get("type") == "function_call_output" and item.get("call_id")
-    }
+    call_kinds: dict[str, str] = {}
+    output_kinds: dict[str, str] = {}
+    for item in items:
+        call_id = item.get("call_id")
+        if not isinstance(call_id, str):
+            continue
+        item_type = str(item.get("type"))
+        if kind := _CALL_KINDS.get(item_type):
+            call_kinds[call_id] = kind
+        if kind := _OUTPUT_KINDS.get(item_type):
+            output_kinds[call_id] = kind
 
     repaired: list[dict[str, Any]] = []
     for item in items:
         call_id = item.get("call_id")
-        if item.get("type") == "function_call_output" and call_id not in calls:
+        call_id = call_id if isinstance(call_id, str) else None
+        item_type = str(item.get("type"))
+        call_kind = _CALL_KINDS.get(item_type)
+        output_kind = _OUTPUT_KINDS.get(item_type)
+
+        if output_kind and call_id is not None and call_kinds.get(call_id) != output_kind:
             # O nome da tool vem do próprio item: sem ele o modelo não sabe o que produziu
             # o resultado órfão.
             tool_name = item.get("name") if isinstance(item.get("name"), str) else "tool"
@@ -405,22 +458,73 @@ def repair_tool_pairs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     ),
                 }
             )
-        else:
+            continue
+        if call_kind and call_id is not None and output_kinds.get(call_id) != call_kind:
+            if call_kind == "computer":
+                repaired.append(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": INTERRUPTED_COMPUTER_CALL.format(call_id=call_id),
+                    }
+                )
+                continue
             repaired.append(item)
-        if item.get("type") == "function_call" and call_id not in outputs:
             repaired.append(
                 {
-                    "type": "function_call_output",
+                    "type": (
+                        "custom_tool_call_output"
+                        if call_kind == "custom"
+                        else "function_call_output"
+                    ),
                     "call_id": call_id,
                     "output": INTERRUPTED_TOOL_OUTPUT,
                 }
             )
+            continue
+        repaired.append(item)
     return repaired
 
 
-def messages_to_input(messages: list[Any]) -> list[dict[str, Any]]:
-    """Traduz mensagens do chat completions para ``input`` items do Responses."""
+class CodexInput(NamedTuple):
+    """``instructions`` e ``input`` são campos distintos do pedido, não um só."""
+
+    instructions: str | None
+    items: list[dict[str, Any]]
+
+
+def _last_developer_text(items: list[dict[str, Any]]) -> str | None:
+    """Último texto developer do input, do fim para o princípio."""
+    for item in reversed(items):
+        if item.get("role") != "developer":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in reversed(content):
+            if not isinstance(part, dict) or part.get("type") != "input_text":
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                return text
+    return None
+
+
+# omp: providers/openai-codex-responses.ts :: buildTransformedCodexRequestBody
+# omp: providers/openai-codex/request-transformer.ts :: transformRequestBody
+# omp: utils.ts :: normalizeSystemPrompts
+def messages_to_input(messages: list[Any], *, supports_detail_original: bool = True) -> CodexInput:
+    """Traduz mensagens do chat completions para ``instructions`` + ``input`` items.
+
+    O **primeiro** system prompt vai para ``instructions``, que o backend trata como prompt
+    base cacheável; mandá-lo como item developer perdia esse tratamento. Os restantes não
+    cabem lá (o campo é uma string) e viajam como itens developer no topo do input, antes
+    da conversa.
+    """
+    instructions: str | None = None
+    developer_items: list[dict[str, Any]] = []
     items: list[dict[str, Any]] = []
+
     for message in messages:
         role = message.get("role", "user")
         content = message.get("content")
@@ -435,10 +539,28 @@ def messages_to_input(messages: list[Any]) -> list[dict[str, Any]]:
             )
             continue
 
-        codex_role = "developer" if role == "system" else role
-        if codex_role not in ("user", "assistant", "developer"):
-            codex_role = "user"
-        parts = content_to_parts(content, assistant=codex_role == "assistant")
+        if role == "system":
+            text = content_to_text(content)
+            if not text.strip():
+                continue
+            if instructions is None:
+                instructions = text
+            else:
+                developer_items.append(
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": text}],
+                    }
+                )
+            continue
+
+        codex_role = role if role in ("user", "assistant", "developer") else "user"
+        parts = content_to_parts(
+            content,
+            assistant=codex_role == "assistant",
+            supports_detail_original=supports_detail_original,
+        )
         if parts:
             items.append({"type": "message", "role": codex_role, "content": parts})
 
@@ -455,7 +577,24 @@ def messages_to_input(messages: list[Any]) -> list[dict[str, Any]]:
                     else arguments,
                 }
             )
-    return repair_tool_pairs(items)
+
+    repaired = repair_tool_pairs([*developer_items, *items])
+
+    # Um input só com itens developer (prompt de sistema sem turno de utilizador) faz o
+    # backend devolver resposta vazia: promove-se a última instrução a turno `user` para
+    # haver algo a que responder.
+    if not any(item.get("role") != "developer" for item in repaired):
+        final = _last_developer_text(developer_items) or _last_developer_text(repaired)
+        final = final or (instructions if instructions and instructions.strip() else None)
+        if final is not None:
+            repaired.append(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": final}],
+                }
+            )
+    return CodexInput(instructions, repaired)
 
 
 def tools_to_codex_tools(tools: list[Any] | None) -> list[dict[str, Any]] | None:
@@ -528,19 +667,25 @@ def build_request_body(
     extra: dict[str, Any] | None = None,
     unsupported: dict[str, str] | None = None,
     session_id: str | None = None,
+    supports_detail_original: bool = True,
 ) -> dict[str, Any]:
     """Corpo de um pedido à Responses API."""
     req_model = resolve_model(model, unsupported)
     extra = extra or {}
+    instructions, items = messages_to_input(
+        messages, supports_detail_original=supports_detail_original
+    )
     body: dict[str, Any] = {
         "model": req_model,
         "store": False,
         "stream": True,
-        "input": messages_to_input(messages),
+        "input": items,
         # Sem isto o backend não devolve o raciocínio encriptado, e num histórico
         # stateless (`store: false`) o modelo recomeça a raciocinar a cada turno.
         "include": ["reasoning.encrypted_content"],
     }
+    if instructions is not None:
+        body["instructions"] = instructions
 
     cache_key = prompt_cache_key(session_id, cache_retention=extra.get("cache_retention"))
     if cache_key:

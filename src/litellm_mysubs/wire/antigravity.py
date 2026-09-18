@@ -77,6 +77,31 @@ def is_valid_signature(signature: object) -> bool:
 
 TEXT_PART_TYPES: Final[tuple[str, ...]] = ("text", "input_text", "output_text")
 
+# omp: providers/vision-guard.ts :: NON_VISION_IMAGE_PLACEHOLDER
+#: Mandar uma imagem a um modelo sem vision dá 400. Descartá-la em silêncio era pior: o
+#: modelo respondia sobre conteúdo que não recebeu. O placeholder di-lo em texto.
+NON_VISION_IMAGE_PLACEHOLDER: Final = "[image omitted: model does not support vision]"
+
+#: Um surrogate não codifica em UTF-8 e rebenta o payload.
+#:
+#: Diferença de linguagem que importa: em JavaScript um par `\ud83d\ude00` **é** um
+#: caractere (😀) e o `toWellFormed()` preserva-o, substituindo só os órfãos. Em Python
+#: são dois code points separados e nenhum deles codifica — um par "válido" continua a
+#: rebentar `str.encode("utf-8")` e o `json.dumps(..., ensure_ascii=False)` que muitos
+#: clientes HTTP usam. Aqui substituem-se **todos**, não apenas os órfãos.
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
+
+
+# omp: providers/google-shared.ts :: convertMessages
+def well_formed(text: object) -> str:
+    """Texto codificável em UTF-8, pronto para o fio.
+
+    Equivalente ao ``toWellFormed()`` do OMP, adaptado à semântica do Python: lá o par
+    sobrevive porque forma um caractere, aqui não forma nenhum e teria de rebentar na
+    serialização.
+    """
+    return _SURROGATE.sub("\ufffd", str(text))
+
 
 class MediaTooLargeError(Exception):
     """Media acima do limite de inline."""
@@ -174,7 +199,15 @@ def media_from_url(
     return None
 
 
-def media_part(part: dict[str, Any], fetch: UrlFetcher | None = None) -> dict[str, Any] | None:
+#: Tipos de bloco que carregam uma imagem — os únicos que a guarda de vision filtra. Um
+#: PDF ou áudio não passa pelo caminho de vision do backend.
+IMAGE_PART_TYPES: Final[tuple[str, ...]] = ("image_url", "input_image")
+
+
+# omp: providers/google-shared.ts :: convertGoogleImagePart
+def media_part(
+    part: dict[str, Any], fetch: UrlFetcher | None = None, *, supports_images: bool = True
+) -> dict[str, Any] | None:
     """Converte uma parte multimodal do shape OpenAI.
 
     Sem isto, um pedido com imagem chegava ao modelo apenas com o texto e a resposta falava
@@ -183,7 +216,9 @@ def media_part(part: dict[str, Any], fetch: UrlFetcher | None = None) -> dict[st
     """
     kind = part.get("type")
 
-    if kind in ("image_url", "input_image"):
+    if kind in IMAGE_PART_TYPES:
+        if not supports_images:
+            return None
         image = part.get("image_url") or part.get("image") or part.get("url")
         if isinstance(image, dict):
             return media_from_url(image.get("url"), image.get("mime_type"), fetch)
@@ -210,21 +245,36 @@ def media_part(part: dict[str, Any], fetch: UrlFetcher | None = None) -> dict[st
     return None
 
 
-def content_parts(content: object, fetch: UrlFetcher | None = None) -> list[dict[str, Any]]:
-    """Partes de um turno, com texto e media preservados pela ordem de entrada."""
+# omp: providers/google-shared.ts :: convertMessages
+def content_parts(
+    content: object, fetch: UrlFetcher | None = None, *, supports_images: bool = True
+) -> list[dict[str, Any]]:
+    """Partes de um turno, com texto e media preservados pela ordem de entrada.
+
+    Um bloco de texto vazio ou só com espaços não gera ``part``: a fonte diz que "can cause
+    issues with some models (e.g. Claude via Antigravity)", e um ``{"text": " "}`` não
+    transporta informação nenhuma para pagar esse risco.
+    """
     if not isinstance(content, list):
-        return [{"text": str(content)}] if content is not None and str(content) else []
+        text = well_formed(content) if content is not None else ""
+        return [{"text": text}] if text.strip() else []
 
     parts: list[dict[str, Any]] = []
+    omitted_image = False
     for part in content:
         if not isinstance(part, dict):
             continue
         if part.get("type") in TEXT_PART_TYPES:
-            if part.get("text"):
-                parts.append({"text": str(part["text"])})
+            text = well_formed(part.get("text") or "")
+            if text.strip():
+                parts.append({"text": text})
             continue
-        if media := media_part(part, fetch):
+        if media := media_part(part, fetch, supports_images=supports_images):
             parts.append(media)
+        elif not supports_images and part.get("type") in IMAGE_PART_TYPES:
+            omitted_image = True
+    if omitted_image:
+        parts.append({"text": NON_VISION_IMAGE_PLACEHOLDER})
     return parts
 
 
@@ -283,7 +333,7 @@ def tool_config(choice: object, declarations: list[dict[str, Any]]) -> dict[str,
 
 # omp: providers/google-shared.ts :: pendingToolImageParts
 def tool_result_value(
-    message: dict[str, Any], fetch: UrlFetcher | None = None
+    message: dict[str, Any], fetch: UrlFetcher | None = None, *, supports_images: bool = True
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
     """Texto do resultado e a media que vai à parte, em ``functionResponse.parts``.
 
@@ -295,26 +345,38 @@ def tool_result_value(
     preciso, e é um turno sintético a menos no histórico.
     """
     content = message.get("content")
+    omitted_image = False
     if isinstance(content, list):
         # Separador entre partes: sem ele a última palavra de uma cola-se à primeira da
         # seguinte e o modelo lê duas frases como uma.
         text = "\n".join(
-            str(part.get("text", ""))
+            well_formed(part.get("text", ""))
             for part in content
             if isinstance(part, dict) and part.get("type") in (None, *TEXT_PART_TYPES)
         )
         media = [
             built
-            for built in (media_part(x, fetch) for x in content if isinstance(x, dict))
+            for built in (
+                media_part(x, fetch, supports_images=supports_images)
+                for x in content
+                if isinstance(x, dict)
+            )
             if built
         ]
+        omitted_image = not supports_images and any(
+            isinstance(x, dict) and x.get("type") in IMAGE_PART_TYPES for x in content
+        )
     else:
-        text = str(content or "")
+        text = well_formed(content) if content else ""
         media = []
 
-    # Um resultado só com imagem tem de dizer alguma coisa: `output: ""` é lido como tool
-    # sem resultado, e o modelo tende a repetir a chamada.
-    if not text and media:
+    if omitted_image:
+        # Sem a nota o modelo lê um resultado que cala a imagem que a tool devolveu, e
+        # responde como se ela não existisse.
+        text = "\n".join(x for x in (text, NON_VISION_IMAGE_PLACEHOLDER) if x)
+    elif not text and media:
+        # Um resultado só com imagem tem de dizer alguma coisa: `output: ""` é lido como
+        # tool sem resultado, e o modelo tende a repetir a chamada.
         text = IMAGE_ONLY_RESULT
     value = {"error" if message.get("is_error") else "output": text}
     return value, media
@@ -363,6 +425,7 @@ def build_payload(
     catalog: ModelCatalog | None = None,
     fetch: UrlFetcher | None = None,
     thought_signatures: Mapping[str, str] | None = None,
+    supports_images: bool = True,
 ) -> dict[str, Any]:
     """Envelope de ``:streamGenerateContent``.
 
@@ -404,7 +467,7 @@ def build_payload(
 
         if role == "tool":
             call_id = str(message.get("tool_call_id") or "").split("|", 1)[0]
-            value, media = tool_result_value(message, fetch)
+            value, media = tool_result_value(message, fetch, supports_images=supports_images)
             function_response: dict[str, Any] = {
                 "name": message.get("name") or tool_names.get(call_id) or "tool",
                 "response": value,
@@ -416,7 +479,7 @@ def build_payload(
             pending_tool_responses.append({"functionResponse": function_response})
             continue
 
-        parts = content_parts(content, fetch)
+        parts = content_parts(content, fetch, supports_images=supports_images)
 
         if role == "system":
             system_parts.extend(parts)
@@ -511,6 +574,7 @@ def build_payload(
 __all__ = [
     "DEFAULT_MAX_OUTPUT_TOKENS",
     "INLINE_MAX_BYTES",
+    "NON_VISION_IMAGE_PLACEHOLDER",
     "SIGNATURE_SENTINEL",
     "FetchedMedia",
     "MediaFetchError",
@@ -525,4 +589,5 @@ __all__ = [
     "tool_config",
     "tool_result_value",
     "tools_to_declarations",
+    "well_formed",
 ]

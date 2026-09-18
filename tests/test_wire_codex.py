@@ -132,10 +132,29 @@ class TestMultimodal:
             "detail": "auto",
         }
 
-    def test_detail_original_rewritten(self) -> None:
-        """O Codex recusa detail: "original"."""
+    def test_detail_original_survives_when_host_supports_it(self) -> None:
+        """`original` é o único nível que preserva a resolução nativa de uma screenshot;
+        forçá-lo sempre a "auto" degradava-a contra hosts que o servem."""
         part = codex.image_part({"image_url": {"url": "u", "detail": "original"}})
+        assert part is not None and part["detail"] == "original"
+
+    def test_detail_original_degrades_when_host_rejects_it(self) -> None:
+        """Hosts como o GitHub Copilot devolvem 400 a `original`; degradar salva o pedido
+        em vez de o perder."""
+        part = codex.image_part(
+            {"image_url": {"url": "u", "detail": "original"}}, supports_detail_original=False
+        )
         assert part is not None and part["detail"] == "auto"
+
+    def test_unknown_detail_falls_back_to_auto(self) -> None:
+        part = codex.image_part({"image_url": {"url": "u", "detail": "ultra"}})
+        assert part is not None and part["detail"] == "auto"
+
+    def test_image_by_file_id_is_not_discarded(self) -> None:
+        """Uma imagem já carregada no backend não tem url; sem este ramo desaparecia em
+        silêncio e o modelo respondia sobre algo que nunca viu."""
+        part = codex.image_part({"type": "input_image", "image_url": {"file_id": "file-7"}})
+        assert part == {"type": "input_image", "detail": "auto", "file_id": "file-7"}
 
     def test_valid_detail_preserved(self) -> None:
         part = codex.image_part({"image_url": {"url": "u", "detail": "high"}})
@@ -216,18 +235,117 @@ class TestToolPairRepair:
         ]
         assert codex.repair_tool_pairs(pair) == pair
 
+    def test_orphan_custom_tool_call_gets_custom_output(self) -> None:
+        """Um `custom_tool_call` órfão dava 400 por não ser indexado; e o output que o
+        fecha tem de ser do mesmo tipo, senão o 400 volta."""
+        items = codex.repair_tool_pairs(
+            [{"type": "custom_tool_call", "call_id": "c2", "name": "f", "input": "x"}]
+        )
+        assert [i["type"] for i in items] == ["custom_tool_call", "custom_tool_call_output"]
+
+    def test_orphan_computer_call_becomes_note(self) -> None:
+        """A screenshot que faltou não se sintetiza: a chamada passa a nota, com o texto
+        exacto que o OMP usa."""
+        items = codex.repair_tool_pairs([{"type": "computer_call", "call_id": "c3"}])
+        assert items == [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": (
+                    "[Computer call interrupted before a screenshot was recorded; call_id=c3]"
+                ),
+            }
+        ]
+
+    def test_mismatched_kinds_do_not_pair(self) -> None:
+        """Emparelhar por `call_id` só fazia um `custom` output "fechar" um `function`
+        call; o backend recusa a troca e ambas as metades precisam de reparação."""
+        items = codex.repair_tool_pairs(
+            [
+                {"type": "function_call", "call_id": "c4", "name": "f", "arguments": "{}"},
+                {"type": "custom_tool_call_output", "call_id": "c4", "output": "ok"},
+            ]
+        )
+        assert [i["type"] for i in items] == [
+            "function_call",
+            "function_call_output",
+            "message",
+        ]
+
+    def test_complete_custom_pair_untouched(self) -> None:
+        pair: list[dict[str, Any]] = [
+            {"type": "custom_tool_call", "call_id": "c5", "name": "f", "input": "x"},
+            {"type": "custom_tool_call_output", "call_id": "c5", "output": "ok"},
+        ]
+        assert codex.repair_tool_pairs(pair) == pair
+
 
 class TestMessagesToInput:
-    def test_system_becomes_developer(self) -> None:
-        items = codex.messages_to_input([{"role": "system", "content": "regra"}])
-        assert items[0]["role"] == "developer"
+    def test_first_system_prompt_goes_to_instructions(self) -> None:
+        """`instructions` é o prompt base que o backend cacheia; mandá-lo como item
+        developer perde o tratamento e o hit de cache."""
+        instructions, items = codex.messages_to_input([{"role": "system", "content": "regra"}])
+        assert instructions == "regra"
+        assert not any(i.get("role") == "developer" for i in items)
+
+    def test_extra_system_prompts_become_developer_items(self) -> None:
+        """`instructions` é uma string: o segundo prompt não cabe lá e perdia-se."""
+        instructions, items = codex.messages_to_input(
+            [
+                {"role": "system", "content": "base"},
+                {"role": "system", "content": "extra"},
+                {"role": "user", "content": "olá"},
+            ]
+        )
+        assert instructions == "base"
+        assert items[0] == {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "extra"}],
+        }
+        assert items[1]["role"] == "user"
+
+    def test_developer_only_input_promotes_last_instruction_to_user(self) -> None:
+        """Sem um turno visível o backend devolve resposta vazia; promover a última
+        instrução dá-lhe algo a que responder."""
+        _, items = codex.messages_to_input(
+            [
+                {"role": "system", "content": "base"},
+                {"role": "system", "content": "faz isto"},
+            ]
+        )
+        assert items[-1] == {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "faz isto"}],
+        }
+
+    def test_single_system_prompt_promotes_instructions_to_user(self) -> None:
+        """Só um system prompt: `instructions` é o único texto que existe, e o input
+        ficaria vazio."""
+        instructions, items = codex.messages_to_input([{"role": "system", "content": "regra"}])
+        assert instructions == "regra"
+        assert items == [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "regra"}],
+            }
+        ]
+
+    def test_user_turn_suppresses_promotion(self) -> None:
+        """Com turno de utilizador não se duplica a instrução no input."""
+        _, items = codex.messages_to_input(
+            [{"role": "system", "content": "base"}, {"role": "user", "content": "olá"}]
+        )
+        assert [i["content"][0]["text"] for i in items] == ["olá"]
 
     def test_unknown_role_falls_back_to_user(self) -> None:
-        items = codex.messages_to_input([{"role": "bizarro", "content": "x"}])
+        _, items = codex.messages_to_input([{"role": "bizarro", "content": "x"}])
         assert items[0]["role"] == "user"
 
     def test_tool_message_becomes_function_call_output(self) -> None:
-        items = codex.messages_to_input(
+        _, items = codex.messages_to_input(
             [
                 {
                     "role": "assistant",
@@ -246,7 +364,7 @@ class TestMessagesToInput:
 
     def test_dict_arguments_are_serialised(self) -> None:
         """O Responses exige arguments como string JSON."""
-        items = codex.messages_to_input(
+        _, items = codex.messages_to_input(
             [
                 {
                     "role": "assistant",
