@@ -4,16 +4,27 @@ O wiring é do [`@oh-my-pi/pi-ai`](https://www.npmjs.com/package/@oh-my-pi/pi-ai
 (`can1357/oh-my-pi`). Este pacote é uma porta para Python do que o OMP faz no fio, e o OMP
 é a fonte de verdade: quando um provedor muda, a correcção aparece lá primeiro.
 
-Está repartido por dois pacotes, e as âncoras podem apontar para qualquer um:
+Está repartido por **três** pacotes, e as âncoras podem apontar para qualquer um:
 
 | Pacote | O que tem |
 |---|---|
 | `@oh-my-pi/pi-ai` | a lógica — `providers/`, `utils/`, `stream.ts` |
 | `@oh-my-pi/pi-catalog` | as constantes de fio — valores de headers, versões de cliente fixadas |
+| `@oh-my-pi/pi-utils` | o que é transversal a todos os provedores — `USER_AGENT`, `VERSION`, caminhos |
 
-O segundo é fácil de esquecer: `providers/openai-codex-responses.ts` importa dele
-`OPENAI_HEADERS`, `OPENAI_HEADER_VALUES` e `CODEX_CLIENT_VERSION`, e sem ele os valores
-literais dos headers não são verificáveis. O `check_omp_drift.py` descarrega os dois.
+Os dois últimos são fáceis de esquecer, e esquecê-los custou duas vezes:
+
+- `providers/openai-codex-responses.ts` importa do `pi-catalog` o `OPENAI_HEADERS`,
+  `OPENAI_HEADER_VALUES` e `CODEX_CLIENT_VERSION`. Sem ele, o `originator` ficou `"pi"` em
+  vez de `"omp"` e o header `version` nem existia — e a auditoria deu-os por
+  "inverificáveis" em vez de os ir buscar.
+- O mesmo ficheiro importa do `pi-utils` o `USER_AGENT`. Sem ele, o valor foi **inventado**
+  por analogia (`codex/0.153.0 (external, cli)`) quando o real é `omp/18.2.6`.
+
+O padrão é o mesmo nos dois casos: procurar nos pacotes que se tem, não encontrar, e
+escrever um valor plausível em vez de procurar no que falta. Um pacote em falta não produz
+uma âncora falhada — produz uma âncora que **nunca chega a ser escrita**, e portanto nada
+acusa. O `check_omp_drift.py` descarrega os três.
 
 Isto só é útil se, ao ver uma mudança no OMP, se souber em dez segundos o que actualizar
 aqui. Daí uma convenção única.

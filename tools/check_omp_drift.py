@@ -70,11 +70,12 @@ def collect_anchors() -> list[Anchor]:
 def fetch_sources(version: str) -> dict[str, str]:
     """Ficheiros ``src/`` dos tarballs, indexados por caminho relativo.
 
-    Os dois pacotes **partilham caminhos** — `index.ts`, `types.ts` e `utils.ts` existem
-    nos dois. Juntá-los sem cuidado faz o segundo tapar o primeiro, e uma âncora para um
-    símbolo do ficheiro tapado falha como se ele não existisse. Concatena-se o conteúdo em
-    vez de o substituir: a pergunta que se faz é "este símbolo existe neste caminho", e a
-    resposta certa é sim quando existe em qualquer um dos pacotes.
+    Os três pacotes **partilham caminhos** — `index.ts` existe nos três, `stream.ts` no
+    `pi-ai` e no `pi-utils`, `types.ts` e `utils.ts` no `pi-ai` e no `pi-catalog`. Juntá-los
+    sem cuidado faz o último tapar os anteriores, e uma âncora para um símbolo do ficheiro
+    tapado falha como se ele não existisse. Concatena-se o conteúdo em vez de o substituir:
+    a pergunta que se faz é "este símbolo existe neste caminho", e a resposta certa é sim
+    quando existe em qualquer um dos pacotes.
     """
     sources: dict[str, str] = {}
     for package in PACKAGES:

@@ -3,8 +3,8 @@
 Liga as tuas subscrições ao [LiteLLM](https://github.com/BerriAI/litellm) e serve-as como
 modelos: **Claude Max**, **ChatGPT Plus (Codex)** e **Google Antigravity**.
 
-> **Estado: alpha.** As fundações estão montadas e testadas (credenciais e registry).
-> OAuth, bridges de wire protocol e UI estão em construção — ver [ROADMAP](#roadmap).
+> **Estado: alpha.** Fundações e bridges de wire protocol estão montadas e testadas.
+> Descoberta de modelos, OAuth e UI estão em construção — ver [ROADMAP](#roadmap).
 
 ## Porquê
 
@@ -74,13 +74,20 @@ produção.
 
 ## Roadmap
 
-| | Fatia | Estado |
-|---|---|---|
-| 0 | Fundações: credenciais, registry, CI | ✅ |
-| 1 | Bridges de wire protocol (Anthropic, Codex, Antigravity) | — |
-| 2 | Descoberta de modelos e aplicação | — |
-| 3 | OAuth com paste do código | — |
-| 4 | UI `/mysubs` montada no proxy | — |
+O destino é um plugin instalável: ligar a subscrição pela UI do próprio LiteLLM, escolher
+os modelos, aplicar. As fatias abaixo são os passos desse fluxo, não módulos.
+
+| | Fatia | Entrega | Estado |
+|---|---|---|---|
+| 0 | Fundações: credenciais, registry, CI | — | ✅ |
+| 1 | Bridges de wire protocol (Anthropic, Codex, Antigravity) | — | ✅ |
+| 2 | `pip install` + patch automático | um token manual já serve modelos | em curso |
+| 3 | Descoberta de modelos e aplicação | escolher o que a subscrição serve | — |
+| 4 | OAuth com paste do código de retorno | ligar sem copiar tokens à mão | — |
+| 5 | UI `/mysubs` montada no proxy | o produto: botão, cards, aplicar | — |
+
+O objectivo completo, com o estado de cada passo e as decisões já medidas que o
+condicionam, está em [`local/GOAL.md`](local/GOAL.md).
 
 ## Licença
 
