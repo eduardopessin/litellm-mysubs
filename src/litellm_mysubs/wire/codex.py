@@ -122,39 +122,79 @@ def account_id(token: str) -> str | None:
     return auth.get("chatgpt_account_id")
 
 
+# As constantes de fio do Codex vivem no `pi-catalog`, não no `pi-ai`. A auditoria inicial
+# deu-as por inverificáveis por só ter o segundo à mão — estão no npm, e é de lá que estes
+# valores vêm.
+
+# omp: wire/codex.ts :: ORIGINATOR_CODEX
+#: O port emitia "pi". O backend usa este valor para identificar o cliente.
+ORIGINATOR: Final = "omp"
+
+# omp: wire/codex.ts :: CODEX_CLIENT_VERSION
+#: O backend fecha a disponibilidade de modelos contra esta versão, em `/models` e em
+#: `/responses` — `gpt-6-astra` exige >= 0.153.0. Uma versão antiga esconde SKUs novos da
+#: descoberta, em silêncio.
+CLIENT_VERSION: Final = "0.153.0"
+
+# omp: wire/codex.ts :: OPENAI_HEADER_VALUES
+BETA_RESPONSES: Final = "responses=experimental"
+
+#: User-Agent do cliente. Mantido alinhado com a versão fixada acima.
+USER_AGENT: Final = f"codex/{CLIENT_VERSION} (external, cli)"
+
+# omp: providers/openai-codex-responses.ts :: OpenAICodexRequestKind
+#: Vocabulário fechado: "turn" | "prewarm" | "compaction". O port emitia "chat", que não
+#: pertence ao conjunto.
+REQUEST_KIND_TURN: Final = "turn"
+
+
+# omp: wire/codex.ts :: codexRoutingHint
+def routing_hint(model: str, service_tier: str | None = None) -> str:
+    """Valor de ``x-codex-routing-hint``: o modelo pedido e, quando há, o tier."""
+    return f"model={model};tier={service_tier}" if service_tier else f"model={model}"
+
+
 def build_headers(
     token: str,
     *,
-    installation_id: str,
     window_id: str,
+    session_id: str | None = None,
     turn_id: str | None = None,
     turn_state: str | None = None,
+    model: str | None = None,
+    service_tier: str | None = None,
 ) -> dict[str, str]:
     """Cabeçalhos de um pedido ao backend do Codex.
 
-    Os ids de transporte entram por argumento em vez de virem de estado global do módulo:
-    são por processo, e injectá-los é o que permite testar a forma sem os adivinhar.
+    Os ids de transporte entram por argumento em vez de virem de estado global: são por
+    processo, e injectá-los é o que permite afirmar a forma sem os adivinhar.
     """
     claims = token_claims(token)
     auth = claims.get("https://api.openai.com/auth") or {}
-    session_id = str(claims.get("session_id") or window_id)
+    resolved_session = session_id or str(claims.get("session_id") or window_id)
 
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "accept": "text/event-stream",
-        "originator": "pi",
-        "OpenAI-Beta": "responses=experimental",
-        "User-Agent": "pi (linux; x86_64)",
-        "session_id": session_id,
-        "session-id": session_id,
-        "x-codex-installation-id": installation_id,
+        "originator": ORIGINATOR,
+        "OpenAI-Beta": BETA_RESPONSES,
+        "version": CLIENT_VERSION,
+        "User-Agent": USER_AGENT,
+        "conversation_id": resolved_session,
+        "session_id": resolved_session,
+        "session-id": resolved_session,
+        "x-client-request-id": resolved_session,
         "x-codex-window-id": window_id,
+        # O `installation_id` viaja só no envelope de metadata; o OMP apaga-o
+        # explicitamente dos cabeçalhos antes de enviar.
         "x-codex-turn-metadata": json.dumps(
             {
+                "session_id": resolved_session,
+                "thread_id": resolved_session,
                 "turn_id": turn_id or str(uuid.uuid4()),
-                "installation_id": installation_id,
-                "request_kind": "chat",
+                "window_id": window_id,
+                "request_kind": REQUEST_KIND_TURN,
             }
         ),
     }
@@ -162,6 +202,11 @@ def build_headers(
     account = auth.get("chatgpt_account_id")
     if account:
         headers["chatgpt-account-id"] = account
+
+    # Pista de encaminhamento: o backend usa-a para escolher a rota do modelo. Viaja em
+    # todos os pedidos ChatGPT-OAuth; tráfego de API key nunca a leva.
+    if model:
+        headers["x-codex-routing-hint"] = routing_hint(model, service_tier)
 
     # O backend devolve x-codex-turn-state e espera-o de volta no turno seguinte: é o
     # estado de transporte da sessão.

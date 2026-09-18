@@ -76,27 +76,43 @@ class TestTokenClaims:
 
 class TestHeaders:
     def test_transport_identity(self) -> None:
-        headers = codex.build_headers(jwt({}), installation_id="i-1", window_id="w-1")
-        assert headers["originator"] == "pi"
+        headers = codex.build_headers(jwt({}), window_id="w-1")
+        assert headers["originator"] == "omp"
         assert headers["OpenAI-Beta"] == "responses=experimental"
-        assert headers["x-codex-installation-id"] == "i-1"
+        assert headers["version"] == codex.CLIENT_VERSION
         assert headers["session_id"] == "w-1"
 
-    def test_session_id_from_token_wins(self) -> None:
+    def test_installation_id_is_not_sent(self) -> None:
+        """O OMP apaga-o explicitamente dos cabeçalhos; viaja só no envelope."""
+        assert "x-codex-installation-id" not in codex.build_headers(jwt({}), window_id="w")
+
+    def test_request_kind_is_from_the_vocabulary(self) -> None:
+        """ "chat" não pertence ao conjunto "turn" | "prewarm" | "compaction"."""
+        headers = codex.build_headers(jwt({}), window_id="w")
+        assert json.loads(headers["x-codex-turn-metadata"])["request_kind"] == "turn"
+
+    def test_routing_hint_carries_the_model(self) -> None:
+        """O backend usa-a para escolher a rota; sem ela o encaminhamento é o default."""
+        headers = codex.build_headers(jwt({}), window_id="w", model="gpt-5.5")
+        assert headers["x-codex-routing-hint"] == "model=gpt-5.5"
+
+    def test_routing_hint_includes_the_tier(self) -> None:
         headers = codex.build_headers(
-            jwt({"session_id": "s-token"}), installation_id="i", window_id="w"
+            jwt({}), window_id="w", model="gpt-5.5", service_tier="priority"
         )
+        assert headers["x-codex-routing-hint"] == "model=gpt-5.5;tier=priority"
+
+    def test_session_id_from_token_wins(self) -> None:
+        headers = codex.build_headers(jwt({"session_id": "s-token"}), window_id="w")
         assert headers["session_id"] == "s-token"
 
     def test_turn_state_echoed_when_present(self) -> None:
         """O backend devolve-o e espera-o de volta no turno seguinte."""
-        headers = codex.build_headers(
-            jwt({}), installation_id="i", window_id="w", turn_state="st-1"
-        )
+        headers = codex.build_headers(jwt({}), window_id="w", turn_state="st-1")
         assert headers["x-codex-turn-state"] == "st-1"
 
     def test_turn_state_absent_on_first_turn(self) -> None:
-        headers = codex.build_headers(jwt({}), installation_id="i", window_id="w")
+        headers = codex.build_headers(jwt({}), window_id="w")
         assert "x-codex-turn-state" not in headers
 
     def test_residency_header_only_for_constrained_workspaces(self) -> None:
@@ -104,18 +120,16 @@ class TestHeaders:
         pessoais não têm a claim e o header não deve viajar."""
         constrained = codex.build_headers(
             jwt({"https://api.openai.com/auth": {"chatgpt_data_residency": "eu"}}),
-            installation_id="i",
             window_id="w",
         )
         assert constrained["x-openai-internal-codex-residency"] == "eu"
 
-        personal = codex.build_headers(jwt({}), installation_id="i", window_id="w")
+        personal = codex.build_headers(jwt({}), window_id="w")
         assert "x-openai-internal-codex-residency" not in personal
 
     def test_no_constraint_is_not_sent(self) -> None:
         headers = codex.build_headers(
             jwt({"https://api.openai.com/auth": {"chatgpt_data_residency": "no_constraint"}}),
-            installation_id="i",
             window_id="w",
         )
         assert "x-openai-internal-codex-residency" not in headers
