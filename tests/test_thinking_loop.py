@@ -82,10 +82,34 @@ class TestStallDetection:
     """
 
     POOL: ClassVar[tuple[str, ...]] = (
-        "alfa", "beta", "gama", "delta", "epsilon", "zeta", "eta", "teta",
-        "iota", "kappa", "lambda", "miu", "niu", "xi", "omicron", "pi",
-        "rho", "sigma", "tau", "upsilon", "fi", "chi", "psi", "omega",
-        "aleph", "bet", "gimel", "dalet",
+        "alfa",
+        "beta",
+        "gama",
+        "delta",
+        "epsilon",
+        "zeta",
+        "eta",
+        "teta",
+        "iota",
+        "kappa",
+        "lambda",
+        "miu",
+        "niu",
+        "xi",
+        "omicron",
+        "pi",
+        "rho",
+        "sigma",
+        "tau",
+        "upsilon",
+        "fi",
+        "chi",
+        "psi",
+        "omega",
+        "aleph",
+        "bet",
+        "gimel",
+        "dalet",
     )
 
     def segment(self, pool_index: int, anchor: int | None = None) -> str:
