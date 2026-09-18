@@ -1,4 +1,15 @@
-"""Demo da UI com duplos: serve /mysubs sem tocar em nenhum provedor real."""
+"""Demo da UI: serve `/mysubs` sem tocar em nenhum provedor real.
+
+**Nada aqui é inventado.** Uma versão anterior deste ficheiro fabricava uma credencial do
+Google e percentagens de uso do Codex escolhidas para as barras saírem âmbar e vermelha na
+captura de ecrã. Ficava bonito e era mentira — exactamente o que o princípio "nunca
+inventar números" existe para impedir, e pior por estar a ser apresentado como verificação.
+
+O que resta é o único estado honesto de uma demo: três provedores por ligar. Os cabeçalhos
+de uso abaixo, quando activados por `--com-uso`, são os **medidos** contra o proxy real e
+estão fixados em `tests/test_catalog_usage.py` — e mesmo esses aparecem com a credencial
+marcada como demonstração no título da página.
+"""
 
 from __future__ import annotations
 
@@ -11,53 +22,47 @@ sys.path.insert(0, "src")
 import uvicorn
 from fastapi import FastAPI
 
-from litellm_mysubs.catalog.discovery import DiscoveredModel
 from litellm_mysubs.credentials.store import Credential, ProviderId
 from litellm_mysubs.ui import mount
 from litellm_mysubs.ui.service import MySubsService
+
+#: Cabeçalhos reais, capturados de uma resposta do proxy em 2026-09-18. Os mesmos valores
+#: estão nos testes; não são estimativas.
+MEDIDO_ANTHROPIC = {
+    "llm_provider-anthropic-ratelimit-unified-5h-utilization": "0.03",
+    "llm_provider-anthropic-ratelimit-unified-5h-reset": str(time.time() + 4200),
+    "llm_provider-anthropic-ratelimit-unified-7d-utilization": "0.24",
+    "llm_provider-anthropic-ratelimit-unified-7d-reset": str(time.time() + 415000),
+}
+MEDIDO_CODEX = {
+    "x-codex-primary-used-percent": "0",
+    "x-codex-primary-window-minutes": "300",
+    "x-codex-primary-reset-at": str(time.time() + 18000),
+    "x-codex-secondary-used-percent": "19",
+    "x-codex-secondary-window-minutes": "10080",
+    "x-codex-secondary-reset-at": str(time.time() + 227452),
+    "x-codex-plan-type": "plus",
+    "x-codex-credits-balance": "0",
+}
 
 
 class DemoStore:
     owns_refresh = True
 
-    def __init__(self) -> None:
-        self._creds: dict[str, Credential] = {
-            "anthropic": Credential(
-                provider="anthropic",
-                access_token="AT",
-                refresh_token="RT",
-                expires_at=time.time() + 5400,
-            ),
-            "openai-codex": Credential(
-                provider="openai-codex",
-                access_token="AT",
-                refresh_token="RT",
-                expires_at=time.time() + 7200,
-            ),
-            "google-antigravity": Credential(
-                provider="google-antigravity",
-                access_token="AT",
-                refresh_token="RT",
-                expires_at=time.time() - 60,
-                project_id="meu-projecto-123",
-            ),
-        }
+    def __init__(self, creds: dict[str, Credential] | None = None) -> None:
+        self._creds = dict(creds or {})
 
-    def get(self, provider: ProviderId) -> Credential:
-        if provider not in self._creds:
-            raise KeyError(provider)
-        return self._creds[provider]
+    def get(self, provider: ProviderId) -> Credential | None:
+        return self._creds.get(provider)
 
-    def set(self, credential: Credential) -> None:
-        self._creds[credential.provider] = credential
+    def set(self, provider: ProviderId, credential: Credential) -> None:
+        self._creds[provider] = credential
 
     def delete(self, provider: ProviderId) -> None:
         self._creds.pop(provider, None)
 
-    def reload(self) -> None: ...
-
-    def connected(self) -> list[ProviderId]:
-        return list(self._creds)  # type: ignore[arg-type]
+    def reload(self) -> bool:
+        return False
 
 
 class DemoRouter:
@@ -68,38 +73,32 @@ class DemoRouter:
         self.model_list = model_list
 
 
-router = DemoRouter()
-service = MySubsService(store=DemoStore(), router_source=lambda: router)
+def build() -> FastAPI:
+    com_uso = "--com-uso" in sys.argv
+    creds: dict[str, Credential] = {}
+    if com_uso:
+        # Só para ver as barras desenhadas. As credenciais são falsas e não servem nada;
+        # os cabeçalhos é que são reais.
+        for provider in ("anthropic", "openai-codex"):
+            creds[provider] = Credential(
+                provider=provider,  # type: ignore[arg-type]
+                access_token="demo",
+                refresh_token="demo",
+                expires_at=time.time() + 5400,
+            )
 
-# Um provedor já com modelos descobertos, para a página mostrar os três estados.
-service.discovered["anthropic"] = [
-    DiscoveredModel(wire_name="claude-opus-5", suggested_name="claude-opus-5", verified=True),
-    DiscoveredModel(wire_name="claude-sonnet-5", suggested_name="claude-sonnet-5", verified=True),
-    DiscoveredModel(
-        wire_name="claude-haiku-4-5",
-        suggested_name="claude-haiku-4-5",
-        verified=False,
-        note="a sonda não chegou ao upstream (ConnectError: rede em baixo)",
-    ),
-]
+    router = DemoRouter()
+    service = MySubsService(store=DemoStore(creds), router_source=lambda: router)
+    if com_uso:
+        service.observe("anthropic", MEDIDO_ANTHROPIC)
+        service.observe("openai-codex", MEDIDO_CODEX)
 
-# uso real, medido contra o proxy
-service.observe("anthropic", {
-    "llm_provider-anthropic-ratelimit-unified-5h-utilization": "0.03",
-    "llm_provider-anthropic-ratelimit-unified-5h-reset": str(time.time() + 4200),
-    "llm_provider-anthropic-ratelimit-unified-7d-utilization": "0.24",
-    "llm_provider-anthropic-ratelimit-unified-7d-reset": str(time.time() + 415000),
-})
-service.observe("openai-codex", {
-    "x-codex-primary-used-percent": "78", "x-codex-primary-window-minutes": "300",
-    "x-codex-primary-reset-at": str(time.time() + 9000),
-    "x-codex-secondary-used-percent": "93", "x-codex-secondary-window-minutes": "10080",
-    "x-codex-secondary-reset-at": str(time.time() + 220000),
-    "x-codex-plan-type": "plus", "x-codex-credits-balance": "0",
-})
+    app = FastAPI()
+    # Sem guarda: é uma demo local sem proxy por trás, logo não há `proxy_admin` nenhum
+    # para autenticar. A instalação a sério usa o default, que exige administrador.
+    mount(app, service, guard=None)
+    return app
 
-app = FastAPI()
-mount(app, service)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8137, log_level="warning")
+    uvicorn.run(build(), host="127.0.0.1", port=8137, log_level="warning")

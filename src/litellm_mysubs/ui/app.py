@@ -14,7 +14,17 @@ from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from ..credentials.store import PROVIDER_IDS, ProviderId
+from .auth import admin_dependency
 from .service import MySubsService, ProviderCard
+
+#: Sentinela do `guard`: distingue "não passei nada" de "passei `None` de propósito".
+_UNSET: Any = object()
+
+
+def _resolve_guard(guard: Any) -> Any:
+    """A dependência a aplicar. `_UNSET` significa "usa a do proxy"."""
+    return admin_dependency() if guard is _UNSET else guard
+
 
 #: Prefixo da montagem. O item de menu do LiteLLM aponta para aqui.
 MOUNT_PATH = "/mysubs"
@@ -57,9 +67,21 @@ def _age(seconds: float | None) -> str:
     return f"expira em {_duration(seconds)}"
 
 
-def build_app(service: MySubsService) -> FastAPI:
-    """A sub-app. Recebe o serviço em vez de o construir: é o que a torna testável."""
-    app = FastAPI(title="MySubs", docs_url=None, redoc_url=None)
+def build_app(service: MySubsService, *, guard: Any | None = _UNSET) -> FastAPI:
+    """A sub-app. Recebe o serviço em vez de o construir: é o que a torna testável.
+
+    `guard` é a dependência de autenticação, aplicada a **todas** as rotas. O default não é
+    `None` — é um sentinela que manda perguntar ao `auth`: um default sem guarda tornaria
+    "esqueci-me de passar" indistinguível de "decidi não proteger", e o primeiro é o erro
+    que expõe a página.
+    """
+    dependencies = [] if guard is None else [_resolve_guard(guard)]
+    app = FastAPI(
+        title="MySubs",
+        docs_url=None,
+        redoc_url=None,
+        dependencies=[d for d in dependencies if d is not None],
+    )
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -154,12 +176,14 @@ def _back(message: str) -> RedirectResponse:
     return RedirectResponse(f"{MOUNT_PATH}/?erro={html.escape(message)}", status_code=303)
 
 
-def mount(app: Any, service: MySubsService, *, path: str = MOUNT_PATH) -> None:
+def mount(
+    app: Any, service: MySubsService, *, path: str = MOUNT_PATH, guard: Any | None = _UNSET
+) -> None:
     """Monta a sub-app no proxy.
 
     `app.mount()` é a via que o próprio LiteLLM usa para `/ui` e `/swagger`.
     """
-    app.mount(path, build_app(service))
+    app.mount(path, build_app(service, guard=guard))
 
 
 # -- HTML ----------------------------------------------------------------------

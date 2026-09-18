@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -13,6 +14,8 @@ from fastapi.testclient import TestClient
 from litellm_mysubs.catalog.discovery import DiscoveredModel
 from litellm_mysubs.credentials.store import Credential, ProviderId
 from litellm_mysubs.ui import mount
+from litellm_mysubs.ui.app import _UNSET as _DEFAULT_GUARD
+from litellm_mysubs.ui.auth import auth_disabled, require_admin
 from litellm_mysubs.ui.service import MySubsService
 
 
@@ -51,10 +54,16 @@ class FakeRouter:
 def build(
     store: FakeStore | None = None, router: FakeRouter | None = None
 ) -> tuple[TestClient, MySubsService, FakeRouter]:
+    """Uma sub-app sem guarda, para exercitar o comportamento da página.
+
+    A guarda é testada à parte em `TestAuth`: misturá-la aqui obrigaria cada teste de
+    conteúdo a carregar uma identidade, e o que se afirma nesses é o que a página faz, não
+    quem lá chega.
+    """
     used_router = router or FakeRouter()
     service = MySubsService(store=store or FakeStore(), router_source=lambda: used_router)
     app = FastAPI()
-    mount(app, service)
+    mount(app, service, guard=None)
     return TestClient(app), service, used_router
 
 
@@ -204,3 +213,47 @@ class TestState:
         connected = [p for p in payload["providers"] if p["connected"]]
         assert [p["provider"] for p in connected] == ["anthropic"]
         assert payload["discovered"]["anthropic"][0]["note"] == "rede em baixo"
+
+
+class TestAuth:
+    """A guarda. `/mysubs` liga contas pessoais e altera os modelos servidos."""
+
+    def _app(self, guard: object) -> TestClient:
+        service = MySubsService(store=FakeStore(), router_source=lambda: None)
+        app = FastAPI()
+        mount(app, service, guard=guard)
+        return TestClient(app)
+
+    def test_every_route_is_closed_by_default(self) -> None:
+        """O default tem de proteger. Antes desta guarda, `GET /mysubs/api/state` respondia
+        200 a qualquer um que alcançasse o proxy — e com uma sub ligada expunha validade e
+        projecto."""
+        client = self._app(_DEFAULT_GUARD)
+        assert client.get("/mysubs/").status_code == 403
+        assert client.get("/mysubs/api/state").status_code == 403
+        assert client.post("/mysubs/connect/anthropic").status_code == 403
+
+    def test_only_a_full_admin_passes(self) -> None:
+        """O `allowed_route_check_inside_route` do LiteLLM aceita `proxy_admin_viewer`, o
+        que está certo para ler listas e errado aqui: um papel de leitura não deve iniciar
+        um fluxo OAuth nem mexer no Router."""
+        for role in ("proxy_admin_viewer", "internal_user", "team", None):
+            with pytest.raises(Exception, match="administradores"):
+                require_admin(SimpleNamespace(user_role=role))
+
+        admin = SimpleNamespace(user_role="proxy_admin")
+        assert require_admin(admin) is admin
+
+    def test_an_enum_role_is_read_by_value(self) -> None:
+        """O LiteLLM entrega `LitellmUserRoles`, não uma string; comparar o enum cru
+        recusava um administrador legítimo."""
+        admin = SimpleNamespace(user_role=SimpleNamespace(value="proxy_admin"))
+        assert require_admin(admin) is admin
+
+    def test_the_opt_out_is_explicit(self) -> None:
+        """Quem corre sem base de dados de chaves não tem `proxy_admin` nenhum. Sem escape,
+        acabaria a montar a sub-app à mão — sem guarda e sem o saber."""
+        assert auth_disabled({"MYSUBS_DISABLE_AUTH": "1"}) is True
+        assert auth_disabled({"MYSUBS_DISABLE_AUTH": "true"}) is True
+        assert auth_disabled({}) is False
+        assert auth_disabled({"MYSUBS_DISABLE_AUTH": "0"}) is False
