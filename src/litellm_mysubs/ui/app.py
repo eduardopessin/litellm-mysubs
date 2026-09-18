@@ -11,7 +11,7 @@ import html
 from typing import Any
 
 from fastapi import FastAPI, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from ..credentials.store import PROVIDER_IDS, ProviderId
 from .auth import admin_dependency
@@ -82,6 +82,7 @@ def build_app(service: MySubsService, *, guard: Any | None = _UNSET) -> FastAPI:
         redoc_url=None,
         dependencies=[d for d in dependencies if d is not None],
     )
+    _install_error_pages(app)
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -165,6 +166,55 @@ def build_app(service: MySubsService, *, guard: Any | None = _UNSET) -> FastAPI:
         )
 
     return app
+
+
+def _install_error_pages(app: FastAPI) -> None:
+    """Converte falhas de autenticação numa página legível.
+
+    O `user_api_key_auth` levanta `ProxyException`, que é uma `Exception` simples — o proxy
+    trata-a num handler registado na app dele. Uma sub-app montada **não herda** esse
+    handler, e sem isto a recusa chegava ao browser como::
+
+        HTTP 500  Internal Server Error
+        RuntimeError: Caught handled exception, but response already started.
+
+    O acesso ficava negado, que é o que importa, mas quem via o 500 não tinha como saber
+    que lhe faltava uma chave. Um erro que não ensina é um erro por resolver.
+    """
+    from fastapi import HTTPException
+    from fastapi.requests import Request
+
+    async def as_page(request: Request, error: Exception) -> Response:
+        status = int(getattr(error, "code", 0) or getattr(error, "status_code", 0) or 403)
+        detail = str(getattr(error, "message", "") or getattr(error, "detail", "") or error)
+        if "json" in str(request.headers.get("accept", "")):
+            return JSONResponse({"detail": detail}, status_code=status)
+        return HTMLResponse(_error_page(status, detail), status_code=status)
+
+    app.add_exception_handler(HTTPException, as_page)
+    try:
+        from litellm.proxy._types import ProxyException
+
+        app.add_exception_handler(ProxyException, as_page)
+    except ImportError:  # pragma: no cover - sem LiteLLM não há o que converter
+        pass
+
+
+def _error_page(status: int, detail: str) -> str:
+    hint = (
+        "Entra na UI do LiteLLM com uma chave de administrador e volta a abrir o MySubs."
+        if status in (401, 403)
+        else ""
+    )
+    return _SHELL.format(
+        body=(
+            '<section class="card"><header><h2>Sem acesso</h2>'
+            f'<span class="chip warn">HTTP {status}</span></header>'
+            f'<p class="muted">{html.escape(detail)}</p>'
+            + (f'<p class="muted">{html.escape(hint)}</p>' if hint else "")
+            + "</section>"
+        )
+    )
 
 
 def _back(message: str) -> RedirectResponse:

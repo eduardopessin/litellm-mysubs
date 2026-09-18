@@ -257,3 +257,68 @@ class TestAuth:
         assert auth_disabled({"MYSUBS_DISABLE_AUTH": "true"}) is True
         assert auth_disabled({}) is False
         assert auth_disabled({"MYSUBS_DISABLE_AUTH": "0"}) is False
+
+
+class TestErrorPages:
+    """Uma recusa tem de ser legível. O acesso negado já funcionava; o 500 é que não
+    ensinava nada a quem o via."""
+
+    def _app(self) -> TestClient:
+        service = MySubsService(store=FakeStore(), router_source=lambda: None)
+        app = FastAPI()
+        mount(app, service, guard=_DEFAULT_GUARD)
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_a_refusal_is_not_a_server_error(self) -> None:
+        """Verificado no proxy real: sem este handler a recusa chegava como
+
+            HTTP 500  RuntimeError: Caught handled exception, but response already started
+
+        porque o `user_api_key_auth` levanta `ProxyException` e uma sub-app montada não
+        herda o handler que a converte.
+        """
+        response = self._app().get("/mysubs/")
+        assert response.status_code in (401, 403)
+        assert response.status_code != 500
+
+    def test_the_browser_gets_a_page_not_raw_json(self) -> None:
+        """É a UI: quem abre pelo menu tem de perceber o que fazer."""
+        response = self._app().get("/mysubs/", headers={"accept": "text/html"})
+        assert "text/html" in response.headers["content-type"]
+        assert "Sem acesso" in response.text
+        assert "chave de administrador" in response.text
+
+    def test_a_json_client_still_gets_json(self) -> None:
+        """Quem automatiza não quer HTML."""
+        response = self._app().get("/mysubs/api/state", headers={"accept": "application/json"})
+        assert "application/json" in response.headers["content-type"]
+        assert "detail" in response.json()
+
+    def test_a_proxy_exception_is_converted_too(self) -> None:
+        """`ProxyException` não é uma `HTTPException`: é uma `Exception` simples que o
+        proxy converte num handler da app dele. Registar só o handler das `HTTPException`
+        deixava passar exactamente a excepção que o `user_api_key_auth` levanta — que é a
+        que aparece em produção.
+        """
+        from litellm.proxy._types import ProxyException
+
+        service = MySubsService(store=FakeStore(), router_source=lambda: None)
+        app = FastAPI()
+        mount(app, service, guard=None)
+
+        sub = next(r.app for r in app.routes if getattr(r, "path", "") == "/mysubs")
+
+        @sub.get("/explode")
+        async def explode() -> None:
+            raise ProxyException(
+                message="Authentication Error, No api key passed in.",
+                type="auth_error",
+                param=None,
+                code=401,
+            )
+
+        response = TestClient(app, raise_server_exceptions=False).get(
+            "/mysubs/explode", headers={"accept": "text/html"}
+        )
+        assert response.status_code == 401
+        assert "Sem acesso" in response.text
