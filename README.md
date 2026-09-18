@@ -17,7 +17,36 @@ que um cliente qualquer de OpenAI as veja como modelos normais do LiteLLM.
 
 ```bash
 pip install litellm-mysubs
+mysubs-setup
 ```
+
+O `mysubs-setup` encontra o LiteLLM do ambiente e o `config.yaml` em uso, e acrescenta uma
+linha:
+
+```yaml
+litellm_settings:
+  callbacks: ["litellm_mysubs.proxy_handler_instance"]
+```
+
+Não toca em `model_list`, `router_settings` nem `general_settings` — o roteamento que já
+existe não é negócio do instalador. Deixa uma cópia do original em `config.yaml.mysubs-bak`
+e recusa-se a escrever um ficheiro que já não carregue.
+
+Reinicia o proxy e abre `<url>/mysubs`. A página exige uma chave de administrador
+(`proxy_admin`).
+
+### Enquanto não houver subscrição ligada, o pacote é inerte
+
+O monkey-patch só se aplica quando há pelo menos uma credencial. Instalado e sem
+subscrições, é indistinguível de não estar instalado.
+
+### Desligar
+
+| | |
+|---|---|
+| `MYSUBS_DISABLE=1` | desliga tudo sem editar o `config.yaml` |
+| `MYSUBS_DISABLE_AUTH=1` | dispensa `proxy_admin` (proxies sem base de dados de chaves) |
+| apagar a linha dos `callbacks` | desinstala |
 
 ## Princípios
 

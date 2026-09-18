@@ -21,7 +21,11 @@ classifiers = [
 dependencies = [
   "fastapi>=0.110",
   "httpx>=0.27",
+  "pyyaml>=6",
 ]
+
+[project.scripts]
+mysubs-setup = "litellm_mysubs.setup_cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -73,5 +77,5 @@ strict = true
 files = ["src/litellm_mysubs"]
 # Nem o LiteLLM nem o numpy publicam stubs utilizáveis.
 [[tool.mypy.overrides]]
-module = ["litellm.*", "numpy.*"]
+module = ["litellm.*", "numpy.*", "yaml"]
 ignore_missing_imports = true

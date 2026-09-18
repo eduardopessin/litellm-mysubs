@@ -41,6 +41,17 @@ def default_store() -> CredentialStore:
     return FileCredentialStore()
 
 
+#: O serviço montado, para quem precise de lhe falar depois — o callback usa-o para
+#: entregar os cabeçalhos de uso das respostas. Um único por processo: dois serviços
+#: teriam estados de descoberta diferentes e a página mostraria o de quem montou primeiro.
+_SERVICE: MySubsService | None = None
+
+
+def shared_service() -> MySubsService | None:
+    """O serviço da UI montada, ou `None` se ainda não foi montada."""
+    return _SERVICE
+
+
 def install(app: Any | None = None, *, store: CredentialStore | None = None) -> str:
     """Monta `/mysubs`. Devolve o caminho montado.
 
@@ -51,9 +62,11 @@ def install(app: Any | None = None, *, store: CredentialStore | None = None) -> 
 
         app = proxy_server.app
 
+    global _SERVICE
     service = MySubsService(
         store=store or default_store(),
         router_source=_live_router,
     )
     mount(app, service)
+    _SERVICE = service
     return MOUNT_PATH
