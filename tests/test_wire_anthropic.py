@@ -174,14 +174,38 @@ class TestThinkingParams:
     def test_adaptive_model_gets_output_config(self) -> None:
         """budget_tokens é ignorado nestes modelos; adaptive + effort é a única forma."""
         out = ant.apply_thinking_params({"reasoning_effort": "high"}, "claude-opus-5")
-        assert out["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert out["thinking"] == {"type": "adaptive"}
         assert out["output_config"] == {"effort": "high"}
         assert "reasoning_effort" not in out
 
+    def test_display_is_not_forced(self) -> None:
+        """O OMP fecha `display` por suporte do modelo: 4.6+ rejeitam-no com 400.
+
+        Medido contra esta subscrição: não dá 400, mas também não muda o raciocínio
+        devolvido (opus-4-6 e sonnet-4-6 dão os mesmos chars com e sem). Não havendo
+        ganho, segue-se a fonte em vez de arriscar o 400 que ela documenta.
+        """
+        out = ant.apply_thinking_params({"reasoning_effort": "high"}, "claude-opus-5")
+        assert "display" not in out["thinking"]
+
+    def test_forced_tool_choice_pins_effort_on_adaptive(self) -> None:
+        """Omitir thinking num modelo adaptive não o desliga: a API volta a ligá-lo."""
+        out = ant.apply_thinking_params(
+            {"reasoning_effort": "high", "tool_choice": {"type": "any"}}, "claude-opus-5"
+        )
+        assert out["thinking"] == {"type": "adaptive"}
+        assert out["output_config"] == {"effort": "low"}
+
     def test_budget_model_gets_budget_tokens(self) -> None:
+        """Os degraus são os do OMP (low=4096), não metade deles."""
         out = ant.apply_thinking_params({"reasoning_effort": "low"}, "claude-haiku-4-5")
-        assert out["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+        assert out["thinking"] == {"type": "enabled", "budget_tokens": ant.EFFORT_BUDGET["low"]}
         assert "output_config" not in out
+
+    def test_ceiling_caps_the_top_steps(self) -> None:
+        """A escala do OMP é preservada; só o tecto da subscrição a corta."""
+        out = ant.apply_thinking_params({"reasoning_effort": "max"}, "claude-haiku-4-5")
+        assert out["thinking"]["budget_tokens"] == ant.THINKING_CEILING
 
     def test_xhigh_and_max_are_distinct_steps(self) -> None:
         """Medido: out=164 em high, 273 em xhigh, 275 em max — colapsá-los perde degraus."""
@@ -226,18 +250,28 @@ class TestThinkingParams:
             {"reasoning_effort": "high", "tool_choice": "required"}, "claude-opus-5"
         )
         assert out["thinking"]["type"] == "adaptive"
+        assert out["output_config"]["effort"] == "low"
 
-    def test_max_tokens_raised_above_budget_never_lowered(self) -> None:
-        """max_tokens=64000 é aceite; um tecto fixo truncava o que o cliente pediu."""
+    def test_max_tokens_preserved_up_to_the_claude_code_ceiling(self) -> None:
         out = ant.apply_thinking_params(
             {"reasoning_effort": "high", "max_tokens": 64000}, "claude-haiku-4-5"
         )
-        assert out["max_tokens"] == 64000
+        assert out["max_tokens"] == ant.MAX_OUTPUT_TOKENS
 
-        raised = ant.apply_thinking_params(
+    def test_output_gets_room_beyond_the_thinking_budget(self) -> None:
+        """Sem a margem, a resposta sai truncada depois de o modelo pensar."""
+        out = ant.apply_thinking_params(
             {"reasoning_effort": "high", "max_tokens": 100}, "claude-haiku-4-5"
         )
-        assert raised["max_tokens"] == 8192 + 2048
+        assert out["max_tokens"] == ant.THINKING_CEILING + ant.OUTPUT_FALLBACK_BUFFER
+
+    def test_narrow_margin_is_widened(self) -> None:
+        """budget+500 não é margem: o OMP sobe sempre que falta OUTPUT_FALLBACK_BUFFER."""
+        out = ant.apply_thinking_params(
+            {"reasoning_effort": "high", "max_tokens": ant.THINKING_CEILING + 500},
+            "claude-haiku-4-5",
+        )
+        assert out["max_tokens"] == ant.THINKING_CEILING + ant.OUTPUT_FALLBACK_BUFFER
 
     def test_max_completion_tokens_renamed_not_duplicated(self) -> None:
         """Preencher as duas chaves fazia o default sobrepor o valor do cliente."""
@@ -262,13 +296,27 @@ class TestBuildRequest:
         assert out["extra_headers"]["x-app"] == "cli"
         assert "claude-code-20250219" in out["extra_headers"]["anthropic-beta"]
 
+    def test_oauth_beta_is_present(self) -> None:
+        """Sem ela o servidor classifica o pedido como sendo de API key."""
+        assert "oauth-2025-04-20" in ant.build_betas(thinking=False)
+
     def test_redact_thinking_beta_absent(self) -> None:
         """Com essa beta a Anthropic devolve thinking assinado mas vazio: 74 -> 0 chars."""
-        assert "redact-thinking" not in ant.ANTHROPIC_BETAS
+        assert "redact-thinking" not in ant.build_betas(thinking=True)
 
     def test_context_1m_beta_absent(self) -> None:
         """context-1m-2025-08-07 dá 429 de crédito em tokens de subscrição."""
-        assert "context-1m" not in ant.ANTHROPIC_BETAS
+        assert "context-1m" not in ant.build_betas(thinking=True)
+
+    def test_effort_beta_only_when_thinking(self) -> None:
+        """O OMP só a acrescenta quando o pedido pede raciocínio."""
+        assert ant.EFFORT_BETA in ant.build_betas(thinking=True)
+        assert ant.EFFORT_BETA not in ant.build_betas(thinking=False)
+
+    def test_user_agent_matches_the_x_app_entrypoint(self) -> None:
+        """`claude-desktop` no UA com `x-app: cli` era um fingerprint incoerente."""
+        assert "(external, cli)" in ant.CLIENT_HEADERS["User-Agent"]
+        assert ant.CLIENT_HEADERS["x-app"] == "cli"
 
     def test_token_applied_when_given(self) -> None:
         out = ant.build_request({"messages": []}, "claude-opus-5", access_token="tok-1")

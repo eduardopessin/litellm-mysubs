@@ -169,16 +169,26 @@ class TestCacheDeepCopy:
 
 
 class TestToolChoiceShapes:
-    @pytest.mark.parametrize(
-        "choice",
-        [{"type": "any"}, {"type": "tool"}, {"type": "function"}, "required", "any"],
-    )
+    @pytest.mark.parametrize("choice", [{"type": "any"}, {"type": "tool"}, "required", "any"])
     def test_forced_shapes(self, choice: object) -> None:
         assert ant._forced_tool_choice(choice) is True
 
     @pytest.mark.parametrize("choice", ["auto", "none", {"type": "auto"}, None, 42])
     def test_free_shapes(self, choice: object) -> None:
         assert ant._forced_tool_choice(choice) is False
+
+    def test_openai_function_selection_is_not_forcing(self) -> None:
+        """`{"type": "function"}` selecciona uma ferramenta; não obriga a chamá-la.
+
+        O wire da Anthropic só conhece `any`/`tool`/`auto`/`none`. Tratar a forma OpenAI
+        como forçada desligava o raciocínio sem razão nenhuma do lado do servidor.
+        """
+        assert ant._forced_tool_choice({"type": "function", "function": {"name": "f"}}) is False
+        out = ant.apply_thinking_params(
+            {"reasoning_effort": "high", "tool_choice": {"type": "function"}},
+            "claude-haiku-4-5",
+        )
+        assert out["thinking"]["type"] == "enabled"
 
 
 class TestThinkingEdges:
@@ -209,7 +219,7 @@ class TestThinkingEdges:
 
     def test_default_max_tokens_when_absent(self) -> None:
         out = ant.apply_thinking_params({"reasoning_effort": "low"}, "claude-haiku-4-5")
-        assert out["max_tokens"] == 16384
+        assert out["max_tokens"] == ant.EFFORT_BUDGET["low"] + ant.OUTPUT_FALLBACK_BUFFER
 
     def test_unknown_effort_uses_medium_default(self) -> None:
         out = ant.apply_thinking_params({"reasoning_effort": "turbo"}, "claude-opus-5")

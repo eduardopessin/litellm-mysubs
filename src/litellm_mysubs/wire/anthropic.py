@@ -13,19 +13,37 @@ from __future__ import annotations
 
 from typing import Any, Final
 
-#: A Anthropic valida esta identidade exacta do Agent SDK no primeiro bloco de system.
-CLAUDE_CODE_PROMPT: Final = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+# omp: providers/claude-code-fingerprint.ts :: claudeCodeSystemInstruction
+#: Bloco de identidade que o runtime do Claude Code antepõe. A medição que existia antes
+#: comparava *identidade vs ausência de identidade*, não *esta string vs a do Claude Code*
+#: — e a string herdada do intermediário não era a que o CLI real põe no fio.
+CLAUDE_CODE_PROMPT: Final = "You are Claude Code, Anthropic's official CLI for Claude."
 
-# Efeito -> orçamento de thinking. Tecto de 8192 imposto pela janela TPM curta da
-# subscrição Max (com chaves normais dá para ir até 32768).
+# omp: stream.ts :: ANTHROPIC_THINKING
+# Efeito -> orçamento de thinking. Os degraus são os do OMP; só o topo é que difere, e a
+# razão está em `THINKING_CEILING`.
 EFFORT_BUDGET: Final[dict[str, int]] = {
     "minimal": 1024,
-    "low": 2048,
-    "medium": 4096,
-    "high": 8192,
-    "xhigh": 8192,
-    "max": 8192,
+    "low": 4096,
+    "medium": 8192,
+    "high": 16384,
+    "xhigh": 32768,
+    "max": 32768,
 }
+
+#: A janela TPM curta da subscrição Max não aguenta os 32768 do OMP: pedidos acima disto
+#: devolvem 429. O tecto aplica-se depois de escolher o degrau, para que a escala do OMP
+#: seja preservada em vez de ser achatada na tabela.
+THINKING_CEILING: Final = 8192
+
+# omp: stream.ts :: OUTPUT_FALLBACK_BUFFER
+#: Margem de output reservada para lá do orçamento de raciocínio. Um pedido cujo
+#: `max_tokens` fique abaixo de `budget + isto` não tem espaço para responder depois de
+#: pensar, e a resposta sai truncada.
+OUTPUT_FALLBACK_BUFFER: Final = 4000
+
+# omp: providers/claude-code-fingerprint.ts :: CLAUDE_CODE_MAX_OUTPUT_TOKENS
+MAX_OUTPUT_TOKENS: Final = 64000
 
 # Medido no upstream (max_tokens=2048, display="summarized", pergunta que exige
 # raciocínio): xhigh e max são aceites e rendem mais output que high (out=164 em high,
@@ -90,21 +108,50 @@ UNCACHEABLE_BLOCKS: Final[tuple[str, ...]] = ("thinking", "redacted_thinking", "
 # (factory.py:1971), logo uma chamada destas não serve de âncora.
 SERVER_TOOL_PREFIX: Final = "srvtoolu_"
 
-# Betas do omp (buildCoworkBetas). Duas notas:
-#  - redact-thinking-2026-02-12 faz a Anthropic devolver blocos thinking assinados mas sem
-#    texto: mata o reasoning em toda a família Claude (verificado em sonnet-4-6: 74 chars
-#    sem a beta, 0 chars com ela).
-#  - context-1m-2025-08-07 fica de fora: dá 429 de crédito em tokens de subscrição.
-ANTHROPIC_BETAS: Final = (
-    "claude-code-20250219,interleaved-thinking-2025-05-14,"
-    "thinking-token-count-2026-05-13,context-management-2025-06-27,"
-    "prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,"
-    "advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01"
+# omp: providers/anthropic.ts :: claudeCodeAgentBetaDefaults
+# Ordem e conteúdo da fonte. Notas sobre o que **não** está aqui:
+#  - `context-1m-2025-08-07`: credenciais OAuth não têm saldo de contexto longo, e a
+#    Anthropic devolve 429 duro em qualquer modelo com a beta, independentemente do
+#    tamanho do prompt. O OMP também nunca a anuncia.
+#  - `redact-thinking-2026-02-12`: faz devolver blocos thinking assinados mas sem texto
+#    (medido em sonnet-4-6: 74 chars sem a beta, 0 com ela). O OMP também não a envia na
+#    inferência — só no cabeçalho da rota de usage.
+#  - `structured-outputs-2025-12-15`: é da lista de utilitário, não da de agente.
+AGENT_BETAS: Final[tuple[str, ...]] = (
+    "claude-code-20250219",
+    # A única específica de credencial OAuth. Sem ela o servidor classifica o pedido
+    # como sendo de API key — faltava por ter sido portada do intermediário.
+    "oauth-2025-04-20",
+    "interleaved-thinking-2025-05-14",
+    "thinking-token-count-2026-05-13",
+    "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05",
+    "mid-conversation-system-2026-04-07",
 )
 
+#: Acrescentada só quando o pedido pede raciocínio.
+EFFORT_BETA: Final = "effort-2025-11-24"
+#: Acrescentada a todos os pedidos de agente.
+FALLBACK_CREDIT_BETA: Final = "fallback-credit-2026-06-01"
+
+
+# omp: providers/anthropic.ts :: buildClaudeCodeBetas
+def build_betas(*, thinking: bool) -> str:
+    """Cabeçalho ``anthropic-beta`` para um pedido de agente."""
+    betas = [*AGENT_BETAS]
+    if thinking:
+        betas.append(EFFORT_BETA)
+    betas.append(FALLBACK_CREDIT_BETA)
+    return ",".join(betas)
+
+
+# omp: providers/claude-code-fingerprint.ts :: claudeCodeUserAgent
+CLAUDE_CODE_VERSION: Final = "2.1.257"
+#: O entrypoint tem de ser `cli` para ser coerente com o `x-app` que segue no mesmo pedido.
+CLAUDE_CODE_USER_AGENT: Final = f"claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"
+
 CLIENT_HEADERS: Final[dict[str, str]] = {
-    "anthropic-beta": ANTHROPIC_BETAS,
-    "User-Agent": "claude-cli/2.1.246 (external, claude-desktop)",
+    "User-Agent": CLAUDE_CODE_USER_AGENT,
     "anthropic-dangerous-direct-browser-access": "true",
     "x-app": "cli",
 }
@@ -308,9 +355,16 @@ def apply_conversation_cache(messages: list[Any]) -> int:
 # -- parâmetros de thinking ----------------------------------------------------
 
 
+# omp: providers/anthropic.ts :: disableThinkingIfToolChoiceForced
 def _forced_tool_choice(choice: object) -> bool:
+    """Se a escolha de ferramenta força o modelo a chamar uma.
+
+    Só `any` e `tool` contam: são os dois valores do wire da Anthropic que forçam. A forma
+    OpenAI ``{"type": "function", ...}`` é uma *selecção* de ferramenta, não uma
+    imposição, e tratá-la como forçada desligava o raciocínio sem razão de wire.
+    """
     if isinstance(choice, dict):
-        return choice.get("type") in ("any", "tool", "function")
+        return choice.get("type") in ("any", "tool")
     return isinstance(choice, str) and choice in ("required", "any")
 
 
@@ -352,43 +406,49 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
 
     # Uma tool_choice que força ferramenta é incompatível com budget thinking: medido em
     # claude-sonnet-4-6 -> 400 "Thinking may not be enabled when tool_choice forces tool
-    # use". Nos modelos adaptive o par é aceite (200), logo só se desliga onde colide.
+    # use".
     forced = _forced_tool_choice(kwargs.get("tool_choice"))
-    if thinking_active and forced and not is_adaptive(model):
-        kwargs.pop("thinking", None)
-        kwargs.pop("reasoning_effort", None)
-        thinking = None
-        thinking_active = False
+    forced_adaptive = False
+    if thinking_active and forced:
+        if is_adaptive(model):
+            # Omitir thinking num modelo adaptive não o desliga — a API volta a ligá-lo
+            # por default. A única forma de o baixar é fixar o effort.
+            forced_adaptive = True
+        else:
+            kwargs.pop("thinking", None)
+            kwargs.pop("reasoning_effort", None)
+            thinking = None
+            thinking_active = False
 
     if not thinking_active:
         return kwargs
 
-    # Só se *sobe* max_tokens (ensureMaxTokensForThinking: budget + 1024); nunca se baixa.
-    # Medido: max_tokens=64000 é aceite nesta subscrição (200), logo um tecto fixo
-    # truncava respostas que o cliente pediu. Fica só o piso e um default.
     if isinstance(thinking, dict):
-        budget = min(thinking.get("budget_tokens") or 4096, 8192)
+        budget = min(thinking.get("budget_tokens") or EFFORT_BUDGET["medium"], THINKING_CEILING)
         if thinking.get("type") != "adaptive":
             thinking["budget_tokens"] = budget
     else:
-        budget = EFFORT_BUDGET.get(reasoning or "", 4096)
+        budget = min(EFFORT_BUDGET.get(reasoning or "", EFFORT_BUDGET["medium"]), THINKING_CEILING)
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
     kwargs.pop("reasoning_effort", None)
 
     if is_adaptive(model):
         # budget_tokens é rejeitado/ignorado nestes modelos; o par adaptive +
         # output_config.effort é a única forma suportada.
-        kwargs["thinking"] = {"type": "adaptive", "display": "summarized"}
-        kwargs["output_config"] = {"effort": ADAPTIVE_EFFORT.get(reasoning or "", "medium")}
+        kwargs["thinking"] = {"type": "adaptive"}
+        effort = "low" if forced_adaptive else ADAPTIVE_EFFORT.get(reasoning or "", "medium")
+        kwargs["output_config"] = {"effort": effort}
 
     # Mexe-se só na chave que o cliente mandou: preencher as duas fazia a cópia de baixo
     # sobrepor o valor do cliente com o default.
     token_key = "max_completion_tokens" if "max_completion_tokens" in kwargs else "max_tokens"
     token_value = kwargs.get(token_key)
-    if token_value is None:
-        kwargs[token_key] = 16384
-    elif token_value <= budget:
-        kwargs[token_key] = budget + 2048
+    if token_value is None or int(token_value) < budget + OUTPUT_FALLBACK_BUFFER:
+        # Sobe-se até haver margem de output para lá do raciocínio; nunca se baixa o que o
+        # cliente pediu, a não ser pelo tecto do Claude Code.
+        kwargs[token_key] = min(budget + OUTPUT_FALLBACK_BUFFER, MAX_OUTPUT_TOKENS)
+    else:
+        kwargs[token_key] = min(int(token_value), MAX_OUTPUT_TOKENS)
     if "max_completion_tokens" in kwargs:
         kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
     return kwargs
@@ -440,6 +500,21 @@ def build_system_blocks(client_prompt: str) -> list[dict[str, str]]:
     return blocks
 
 
+def _wants_thinking(kwargs: dict[str, Any]) -> bool:
+    """Se o pedido pede raciocínio, antes de qualquer normalização.
+
+    A beta de effort só viaja quando há raciocínio — enviá-la sempre é ruído de
+    fingerprint face ao que o Claude Code real emite.
+    """
+    effort, _ = normalize_effort(kwargs.get("reasoning_effort"))
+    if effort == "none":
+        return False
+    thinking = kwargs.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+        return False
+    return bool(thinking or effort in EFFORT_BUDGET)
+
+
 def build_request(kwargs: dict[str, Any], model: str, access_token: str = "") -> dict[str, Any]:
     """Prepara os kwargs de um pedido Claude. Muta e devolve ``kwargs``.
 
@@ -455,6 +530,8 @@ def build_request(kwargs: dict[str, Any], model: str, access_token: str = "") ->
     headers = kwargs.setdefault("extra_headers", {})
     if isinstance(headers, dict):
         headers.update(CLIENT_HEADERS)
+        # A beta de effort só viaja quando o pedido pede raciocínio, como no OMP.
+        headers["anthropic-beta"] = build_betas(thinking=_wants_thinking(kwargs))
 
     apply_thinking_params(kwargs, model)
 

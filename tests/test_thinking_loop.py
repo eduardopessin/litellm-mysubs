@@ -134,11 +134,30 @@ class TestLexicalStall:
     """Vocabulário reciclado sem âncoras novas."""
 
     POOL: ClassVar[tuple[str, ...]] = (
-        "portanto", "convem", "rever", "aquilo", "previsto", "momento",
-        "analise", "curso", "ponderar", "alternativas", "disponiveis",
-        "antes", "avancar", "situacao", "presente", "decisao", "tomada",
-        "resultado", "esperado", "processo", "seguinte", "etapa",
-        "consideracao", "relevante",
+        "portanto",
+        "convem",
+        "rever",
+        "aquilo",
+        "previsto",
+        "momento",
+        "analise",
+        "curso",
+        "ponderar",
+        "alternativas",
+        "disponiveis",
+        "antes",
+        "avancar",
+        "situacao",
+        "presente",
+        "decisao",
+        "tomada",
+        "resultado",
+        "esperado",
+        "processo",
+        "seguinte",
+        "etapa",
+        "consideracao",
+        "relevante",
     )
 
     def segment(self, seed: int, anchor: str | None = None) -> str:
