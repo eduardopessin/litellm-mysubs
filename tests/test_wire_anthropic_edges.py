@@ -110,7 +110,7 @@ class TestMarkBreakpointGivesUp:
         message: dict[str, Any] = {"role": "user", "content": "olá"}
         assert ant.mark_breakpoint(message) is True
         assert message["content"] == [
-            {"type": "text", "text": "olá", "cache_control": {"type": "ephemeral"}}
+            {"type": "text", "text": "olá", "cache_control": ant.cache_control()}
         ]
 
     def test_skips_blank_and_thinking_blocks(self) -> None:
@@ -124,7 +124,7 @@ class TestMarkBreakpointGivesUp:
             ],
         }
         assert ant.mark_breakpoint(message) is True
-        assert message["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert message["content"][0]["cache_control"] == ant.cache_control()
 
     def test_only_unmarkable_blocks_fails(self) -> None:
         message: dict[str, Any] = {"role": "user", "content": [{"type": "image"}]}

@@ -170,7 +170,113 @@ class TestCacheAnchors:
         assert ant.apply_conversation_cache(messages) == 0
 
 
-class TestThinkingParams:
+class TestHeadCaching:
+    """Sem âncora no head, o prefixo tools+system só é coberto pela âncora de cauda, que
+    muda de posição a cada turno: o head grande e imutável é reescrito a preço cheio em
+    todos os pedidos."""
+
+    def test_last_non_deferred_tool_is_anchored(self) -> None:
+        tools: list[Any] = [
+            {"type": "function", "function": {"name": "a"}},
+            {"type": "function", "function": {"name": "b"}},
+        ]
+        ant.apply_head_cache(None, tools)
+        assert "cache_control" not in tools[0]
+        assert tools[1]["cache_control"] == ant.cache_control()
+
+    def test_deferred_tool_is_skipped(self) -> None:
+        """Uma tool deferred não entra no prefixo verificado até ser referida, logo ancorar
+        nela deixava de fora tudo o que vem antes."""
+        tools: list[Any] = [
+            {"type": "function", "function": {"name": "a"}},
+            {"type": "function", "function": {"name": "b"}, "defer_loading": True},
+        ]
+        ant.apply_head_cache(None, tools)
+        assert tools[1].get("cache_control") is None
+        assert tools[0]["cache_control"] == ant.cache_control()
+
+    def test_last_stable_system_block_is_anchored(self) -> None:
+        """Com um sufixo volátil, ancorar na cauda do array fazia um refresh de memória
+        re-facturar o head inteiro em vez de só o sufixo."""
+        blocks: list[Any] = [
+            {"type": "text", "text": "identidade"},
+            {"type": "text", "text": "prompt estável"},
+            {"type": "text", "text": "<memories>ontem comeste sopa</memories>"},
+        ]
+        ant.apply_head_cache(blocks, None)
+        assert blocks[1]["cache_control"] == ant.cache_control()
+        assert "cache_control" not in blocks[2]
+
+    def test_all_volatile_system_falls_back_to_tail(self) -> None:
+        blocks: list[Any] = [{"type": "text", "text": "<memories>x</memories>"}]
+        ant.apply_head_cache(blocks, None)
+        assert blocks[-1]["cache_control"] == ant.cache_control()
+
+    def test_head_budget_is_deducted_from_messages(self) -> None:
+        """O tecto de 4 é por pedido: 5 marcadores dão 400 "A maximum of 4 blocks"."""
+        messages: list[Any] = [{"role": "user", "content": f"m{i}"} for i in range(5)]
+        assert ant.apply_conversation_cache(messages, head_breakpoints=4) == 0
+        assert ant.apply_conversation_cache(messages, head_breakpoints=3) == 1
+
+    def test_build_request_never_exceeds_the_ceiling(self) -> None:
+        kwargs: dict[str, Any] = {
+            "messages": [
+                {"role": "system", "content": "regras"},
+                *({"role": "user", "content": f"m{i}"} for i in range(40)),
+            ],
+            "tools": [{"type": "function", "function": {"name": "a"}}],
+        }
+        out = ant.build_request(kwargs, "claude-opus-5")
+        system_blocks = out["messages"][0]["content"]
+        total = ant.count_head_breakpoints(system_blocks, out["tools"]) + ant.count_breakpoints(
+            out["messages"][1:]
+        )
+        assert total == ant.CACHE_BREAKPOINT_CEILING
+
+
+class TestDecimation:
+    """As duas âncoras de cauda movem-se a cada turno; quando a janela de 5 min expira não
+    resta entrada viva a cobrir o prefixo antigo e ele é relido a preço cheio."""
+
+    def test_checkpoints_at_the_fifteenth_and_thirtieth_turn(self) -> None:
+        messages: list[Any] = [{"role": "user", "content": f"m{i}"} for i in range(35)]
+        ant.apply_conversation_cache(messages)
+        marked = {i for i, m in enumerate(messages) if ant.count_breakpoints([m])}
+        # Ordinais 15 e 30 -> índices 14 e 29; as duas da cauda ficam no fim.
+        assert {14, 29} <= marked
+        assert {33, 34} & marked
+
+    def test_short_conversation_has_no_checkpoint(self) -> None:
+        messages: list[Any] = [{"role": "user", "content": f"m{i}"} for i in range(5)]
+        assert ant.apply_conversation_cache(messages) == ant.CACHE_BREAKPOINT_MESSAGES
+
+    def test_checkpoint_outranks_the_second_tail_anchor(self) -> None:
+        """Com orçamento curto é o checkpoint estável que sobrevive: a segunda âncora de
+        cauda é redundante com a primeira, o checkpoint não tem substituto."""
+        messages: list[Any] = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+        assert ant.apply_conversation_cache(messages, head_breakpoints=2) == 2
+        marked = {i for i, m in enumerate(messages) if ant.count_breakpoints([m])}
+        assert marked == {14, 19}
+
+
+class TestCacheRetention:
+    def test_defaults_to_one_hour(self) -> None:
+        """Sem ttl a entrada morre aos 5 min e a pausa entre turnos de agente passa disso,
+        o que faz o prefixo ser reescrito a frio."""
+        assert ant.cache_control() == {"type": "ephemeral", "ttl": "1h"}
+
+    def test_short_retention_omits_ttl(self) -> None:
+        assert ant.cache_control(None) == {"type": "ephemeral"}
+
+    def test_extended_ttl_beta_absent_on_oauth(self) -> None:
+        """No caminho OAuth o `ttl: "1h"` é honrado sem beta nenhuma.
+
+        O OMP só a junta quando `!isOAuth`. O cabeçalho de `usage/claude.ts` traz-na e
+        parece o contra-exemplo, mas é da rota de usage e traz também
+        `redact-thinking-2026-02-12`, que medimos a esvaziar os blocos de raciocínio.
+        """
+        assert ant.EXTENDED_CACHE_TTL_BETA not in ant.build_betas(thinking=True)
+
     def test_adaptive_model_gets_output_config(self) -> None:
         """budget_tokens é ignorado nestes modelos; adaptive + effort é a única forma."""
         out = ant.apply_thinking_params({"reasoning_effort": "high"}, "claude-opus-5")

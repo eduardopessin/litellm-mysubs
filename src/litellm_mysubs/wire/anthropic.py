@@ -89,11 +89,24 @@ BUDGET_ONLY_MODELS: Final[tuple[str, ...]] = (
     "opus-3",
 )
 
-# A Anthropic faz cache de tudo *até* um breakpoint, por isso não se marca `system`: dois
-# marcadores nas últimas mensagens já cobrem tools + system + histórico. Dois marcadores
-# adjacentes (não um) mantêm uma entrada válida para estender à medida que a conversa
-# cresce.
+# A Anthropic faz cache de tudo *até* um breakpoint, e a ordem canónica no fio é
+# tools -> system -> messages. Dois marcadores adjacentes na cauda (não um) mantêm uma
+# entrada válida para estender à medida que a conversa cresce.
 CACHE_BREAKPOINT_MESSAGES: Final = 2
+
+# omp: providers/anthropic.ts :: ANTHROPIC_DECIMATION_INTERVAL
+# Checkpoint histórico estável a cada 15 turnos de utilizador (15.º, 30.º, 45.º...). As
+# duas âncoras de cauda movem-se a cada turno, logo quando a janela de 5 min expira não
+# há nenhuma entrada viva que cubra o prefixo antigo e ele é relido a preço cheio. Um
+# marcador em posição fixa sobrevive ao churn da cauda e apanha esse prefixo.
+DECIMATION_INTERVAL: Final = 15
+
+# omp: providers/anthropic.ts :: VOLATILE_SYSTEM_SEGMENT_MARKERS
+#: Segmentos de system que mudam a cada turno. A âncora de system fica no último bloco
+#: *antes* deles, para que um refresh de memória re-facture só o sufixo em vez do head
+#: inteiro. A detecção é pela nossa própria marcação, e só conta em início de bloco: um
+#: `<memories>` citado a meio de um bloco estável não o torna volátil.
+VOLATILE_SYSTEM_MARKERS: Final[tuple[str, ...]] = ("<memories>",)
 
 # Um cliente que faça o seu próprio caching chega aqui com marcadores postos. Medido com
 # claude-sonnet-4-6: 4 marcadores -> 200, 5 -> 400 "A maximum of 4 blocks with
@@ -133,6 +146,8 @@ AGENT_BETAS: Final[tuple[str, ...]] = (
 EFFORT_BETA: Final = "effort-2025-11-24"
 #: Acrescentada a todos os pedidos de agente.
 FALLBACK_CREDIT_BETA: Final = "fallback-credit-2026-06-01"
+#: Acrescentada quando alguma âncora leva `ttl: "1h"`.
+EXTENDED_CACHE_TTL_BETA: Final = "extended-cache-ttl-2025-04-11"
 
 
 # omp: providers/anthropic.ts :: buildClaudeCodeBetas
@@ -142,6 +157,13 @@ def build_betas(*, thinking: bool) -> str:
     if thinking:
         betas.append(EFFORT_BETA)
     betas.append(FALLBACK_CREDIT_BETA)
+    # A beta NÃO viaja no caminho OAuth. O OMP só a junta quando `!isOAuth`
+    # (`providers/anthropic.ts`), e `getCacheControl` mostra porquê: para OAuth o default
+    # já é `ttl: "1h"` em modelos que o suportam, sem beta nenhuma.
+    #
+    # O cabeçalho de `usage/claude.ts` traz esta beta e podia parecer o contra-exemplo,
+    # mas é da rota de *usage* e traz também `redact-thinking-2026-02-12` — que medimos a
+    # devolver blocos de thinking vazios. Copiá-lo para a inferência partia o raciocínio.
     return ",".join(betas)
 
 
@@ -187,14 +209,25 @@ def normalize_effort(value: object) -> tuple[str | None, str | None]:
     )
 
 
-# omp: providers/anthropic.ts :: getCacheControl
-def cache_control() -> dict[str, str]:
-    """Marcador de cache.
+#: Retenção default. O OMP defaulta a "long" para OAuth em modelo com
+#: `supportsLongCacheRetention`, "matching Claude Code's native policy"; este módulo só
+#: serve o caminho OAuth do Claude Code, logo a condição colapsa no default.
+LONG_CACHE_TTL: Final = "1h"
 
-    A retenção default é "short" (5 min). O TTL de 1 h é opt-in porque uma escrita de 1 h
-    custa 2x base contra 1.25x para 5 min.
+
+# omp: providers/anthropic.ts :: getCacheControl
+def cache_control(ttl: str | None = LONG_CACHE_TTL) -> dict[str, str]:
+    """Marcador de cache, com ``ttl`` de 1 h por default e ``None`` para os 5 min base.
+
+    O trade-off é de custo contra frequência de reescrita: uma escrita de 1 h factura 2x o
+    preço base do token contra 1.25x para os 5 min. Numa sessão de agente o prefixo é
+    relido dezenas de vezes e as pausas entre turnos passam facilmente dos 5 min, logo
+    pagar 2x uma vez sai mais barato do que pagar 1.25x a cada reescrita a frio — que é
+    exactamente a razão pela qual o Claude Code nativo defaulta a 1 h.
     """
-    return {"type": "ephemeral"}
+    if not ttl:
+        return {"type": "ephemeral"}
+    return {"type": "ephemeral", "ttl": ttl}
 
 
 # -- âncoras de cache ----------------------------------------------------------
@@ -315,9 +348,115 @@ def mark_breakpoint(message: dict[str, Any]) -> bool:
     return False
 
 
+# omp: providers/anthropic.ts :: stableSystemSuffixStart
+def stable_system_suffix_start(blocks: list[Any]) -> int:
+    """Índice onde começa o sufixo volátil de system; ``len(blocks)`` se não houver."""
+    start = len(blocks)
+    while start > 0:
+        block = blocks[start - 1]
+        text = str(block.get("text", "")) if isinstance(block, dict) else ""
+        if not any(text.startswith(marker) for marker in VOLATILE_SYSTEM_MARKERS):
+            break
+        start -= 1
+    return start
+
+
+def _is_deferred_tool(tool: Any) -> bool:
+    """O LiteLLM aceita ``defer_loading`` no topo ou dentro de ``function``
+    (``transformation.py:843``), logo os dois sítios contam."""
+    if not isinstance(tool, dict):
+        return False
+    if tool.get("defer_loading"):
+        return True
+    nested = tool.get("function")
+    return bool(isinstance(nested, dict) and nested.get("defer_loading"))
+
+
+# omp: providers/anthropic.ts :: countHeadBreakpoints
+def count_head_breakpoints(system_blocks: list[Any] | None, tools: list[Any] | None) -> int:
+    """Marcadores presentes em system e em tools."""
+    total = 0
+    for block in system_blocks or ():
+        if isinstance(block, dict) and block.get("cache_control") is not None:
+            total += 1
+    for tool in tools or ():
+        if isinstance(tool, dict) and tool.get("cache_control") is not None:
+            total += 1
+    return total
+
+
+# omp: providers/anthropic.ts :: applyHeadCaching
+def apply_head_cache(system_blocks: list[Any] | None, tools: list[Any] | None) -> int:
+    """Ancora o head estável — última tool não-deferred e último bloco estável de system.
+
+    Devolve quantos marcadores ficaram no head. A ordem no fio é tools -> system ->
+    messages, logo um marcador no último bloco estável de system faz cache do prefixo
+    tools+system inteiro; o marcador nas tools mantém as definições em cache mesmo quando
+    o texto de system muda. Sem isto o head só era coberto pela âncora de cauda, que se
+    move a cada turno, e portanto era reescrito a preço cheio a cada pedido.
+    """
+    if tools and not any(
+        isinstance(tool, dict) and tool.get("cache_control") is not None for tool in tools
+    ):
+        # Uma tool deferred não entra no prefixo verificado enquanto não for referida, por
+        # isso ancorar nela deixaria de fora tudo o que vem antes.
+        for tool in reversed(tools):
+            if not isinstance(tool, dict) or _is_deferred_tool(tool):
+                continue
+            tool["cache_control"] = cache_control()
+            break
+
+    if system_blocks:
+        suffix_start = stable_system_suffix_start(system_blocks)
+        if suffix_start == len(system_blocks):
+            if not any(
+                isinstance(b, dict) and b.get("cache_control") is not None for b in system_blocks
+            ):
+                last = system_blocks[-1]
+                if isinstance(last, dict):
+                    last["cache_control"] = cache_control()
+        else:
+            # Com sufixo volátil o marcador de fronteira entra mesmo que já haja um mais
+            # atrás: caso contrário o único marcador de system fica antes do prompt
+            # estável e um refresh de memória re-factura-o.
+            anchor_index = len(system_blocks) - 1 if suffix_start == 0 else suffix_start - 1
+            anchor = system_blocks[anchor_index]
+            if isinstance(anchor, dict) and anchor.get("cache_control") is None:
+                anchor["cache_control"] = cache_control()
+
+    return count_head_breakpoints(system_blocks, tools)
+
+
+def _decimation_indices(messages: list[Any], end: int) -> list[int]:
+    """Índices dos turnos de utilizador cujo ordinal é múltiplo de ``DECIMATION_INTERVAL``.
+
+    Limitação face à fonte: o OMP conta turnos por `isConversationalUser`, um marcador de
+    proveniência que distingue um turno humano de um `developer` serializado ou de um
+    "Continue." interior. Recebemos kwargs em forma OpenAI e esse marcador não existe no
+    fio, logo a aproximação é ``role == "user"`` — uma mensagem `user` sintetizada conta
+    como turno onde o OMP não a contaria, o que desloca os checkpoints para posições mais
+    recentes do que as canónicas. Eles continuam a cair em posições fixas ao longo da
+    conversa, que é o que lhes dá valor.
+    """
+    indices: list[int] = []
+    ordinal = 0
+    for index in range(min(end + 1, len(messages))):
+        message = messages[index]
+        if isinstance(message, dict) and message.get("role") == "user":
+            ordinal += 1
+            if ordinal % DECIMATION_INTERVAL == 0:
+                indices.append(index)
+    return indices
+
+
+# omp: providers/anthropic.ts :: applyPromptCaching
 # omp: providers/anthropic.ts :: cloneAnthropicCacheControl
-def apply_conversation_cache(messages: list[Any]) -> int:
-    """Ancora os breakpoints nas últimas mensagens marcáveis. Muta ``messages``."""
+def apply_conversation_cache(messages: list[Any], head_breakpoints: int = 0) -> int:
+    """Ancora os breakpoints nas mensagens. Muta ``messages``.
+
+    ``head_breakpoints`` é o que `apply_head_cache` já gastou em tools e system: sai do
+    orçamento porque o tecto de 4 é por pedido, não por secção.
+    """
     anchors = [i for i, m in enumerate(messages) if is_markable(m)]
     if not anchors:
         return 0
@@ -327,14 +466,25 @@ def apply_conversation_cache(messages: list[Any]) -> int:
     if last.get("role") == "user" and last.get("content") == "Continue." and len(anchors) > 1:
         anchors = anchors[:-1]
 
-    # O que o cliente já gastou sai do nosso orçamento; a cauda é o que interessa manter,
-    # logo marca-se de trás para a frente e pára-se ao esgotar.
-    budget = CACHE_BREAKPOINT_CEILING - count_breakpoints(messages)
+    # O que o cliente já gastou e o que o head consumiu saem ambos do nosso orçamento.
+    budget = CACHE_BREAKPOINT_CEILING - head_breakpoints - count_breakpoints(messages)
     if budget <= 0:
         return 0
 
+    trailing = list(reversed(anchors[-CACHE_BREAKPOINT_MESSAGES:]))
+    markable = set(anchors)
+    decimation = [i for i in _decimation_indices(messages, anchors[-1]) if i in markable]
+
+    # Prioridade da fonte: cauda mais recente, depois os checkpoints de decimação do mais
+    # novo para o mais velho, e só então a segunda âncora de cauda. Com orçamento curto é
+    # o checkpoint estável que sobrevive, não a redundância da cauda.
+    candidates: list[int] = []
+    for index in (*trailing[:1], *reversed(decimation), *trailing[1:]):
+        if index not in candidates:
+            candidates.append(index)
+
     marked = 0
-    for index in reversed(anchors[-CACHE_BREAKPOINT_MESSAGES:]):
+    for index in candidates:
         if marked >= budget:
             break
         message = dict(messages[index])
@@ -479,7 +629,7 @@ def split_system_messages(messages: list[Any]) -> tuple[str, list[Any]]:
     return client_prompt, rest
 
 
-def build_system_blocks(client_prompt: str) -> list[dict[str, str]]:
+def build_system_blocks(client_prompt: str) -> list[dict[str, Any]]:
     """Identidade do Agent SDK primeiro, instruções do cliente a seguir.
 
     Medido no upstream com token OAuth (opus-5/sonnet-4-6/opus-4-8/opus-4-6,
@@ -494,7 +644,7 @@ def build_system_blocks(client_prompt: str) -> list[dict[str, str]]:
     haver só um bloco. Enfiar o prompt do cliente no primeiro turno user tirava-lhe a
     autoridade de system sem necessidade alguma.
     """
-    blocks = [{"type": "text", "text": CLAUDE_CODE_PROMPT}]
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": CLAUDE_CODE_PROMPT}]
     if client_prompt:
         blocks.append({"type": "text", "text": client_prompt})
     return blocks
@@ -530,7 +680,8 @@ def build_request(kwargs: dict[str, Any], model: str, access_token: str = "") ->
     headers = kwargs.setdefault("extra_headers", {})
     if isinstance(headers, dict):
         headers.update(CLIENT_HEADERS)
-        # A beta de effort só viaja quando o pedido pede raciocínio, como no OMP.
+        # A beta de effort só viaja quando o pedido pede raciocínio, como no OMP; a de TTL
+        # estendido acompanha a retenção que as âncoras deste pedido realmente levam.
         headers["anthropic-beta"] = build_betas(thinking=_wants_thinking(kwargs))
 
     apply_thinking_params(kwargs, model)
@@ -543,9 +694,13 @@ def build_request(kwargs: dict[str, Any], model: str, access_token: str = "") ->
     # (llms/anthropic/chat/transformation.py:1686), por isso a beta
     # mid-conversation-system-2026-04-07 que enviamos não se consegue honrar por aqui.
     client_prompt, rest = split_system_messages(messages)
-    identity = {"role": "system", "content": build_system_blocks(client_prompt)}
+    system_blocks = build_system_blocks(client_prompt)
+    identity = {"role": "system", "content": system_blocks}
 
-    # Nada é marcado em system; a âncora na cauda já cobre o prefixo todo.
-    apply_conversation_cache(rest)
+    # O head é ancorado primeiro para que o orçamento das mensagens já desconte o que ele
+    # gastou: o tecto de 4 é por pedido, e um quinto marcador dá 400.
+    tools = kwargs.get("tools")
+    head = apply_head_cache(system_blocks, tools if isinstance(tools, list) else None)
+    apply_conversation_cache(rest, head)
     kwargs["messages"] = [identity, *rest]
     return kwargs
