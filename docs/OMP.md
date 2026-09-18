@@ -4,6 +4,17 @@ O wiring é do [`@oh-my-pi/pi-ai`](https://www.npmjs.com/package/@oh-my-pi/pi-ai
 (`can1357/oh-my-pi`). Este pacote é uma porta para Python do que o OMP faz no fio, e o OMP
 é a fonte de verdade: quando um provedor muda, a correcção aparece lá primeiro.
 
+Está repartido por dois pacotes, e as âncoras podem apontar para qualquer um:
+
+| Pacote | O que tem |
+|---|---|
+| `@oh-my-pi/pi-ai` | a lógica — `providers/`, `utils/`, `stream.ts` |
+| `@oh-my-pi/pi-catalog` | as constantes de fio — valores de headers, versões de cliente fixadas |
+
+O segundo é fácil de esquecer: `providers/openai-codex-responses.ts` importa dele
+`OPENAI_HEADERS`, `OPENAI_HEADER_VALUES` e `CODEX_CLIENT_VERSION`, e sem ele os valores
+literais dos headers não são verificáveis. O `check_omp_drift.py` descarrega os dois.
+
 Isto só é útil se, ao ver uma mudança no OMP, se souber em dez segundos o que actualizar
 aqui. Daí uma convenção única.
 
