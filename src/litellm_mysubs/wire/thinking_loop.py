@@ -63,8 +63,14 @@ class ThinkingLoopDetector:
     """
 
     __slots__ = (
-        "buffer", "chars", "headers", "seen_anchors",
-        "seen_words", "segments", "stalled", "tail",
+        "buffer",
+        "chars",
+        "headers",
+        "seen_anchors",
+        "seen_words",
+        "segments",
+        "stalled",
+        "tail",
     )
 
     def __init__(self) -> None:

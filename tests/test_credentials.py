@@ -103,10 +103,10 @@ class TestExpiry:
         Com validade em 1_000_000 e leeway de 60s, o corte está em 999_940.
         """
         c = cred(expires_at=1_000_000)
-        assert c.is_expired(now=1_000_001, leeway_s=60) is True   # já passou
-        assert c.is_expired(now=999_950, leeway_s=60) is True     # dentro da leeway
-        assert c.is_expired(now=999_940, leeway_s=60) is True     # no limite exacto
-        assert c.is_expired(now=999_939, leeway_s=60) is False    # um segundo antes
+        assert c.is_expired(now=1_000_001, leeway_s=60) is True  # já passou
+        assert c.is_expired(now=999_950, leeway_s=60) is True  # dentro da leeway
+        assert c.is_expired(now=999_940, leeway_s=60) is True  # no limite exacto
+        assert c.is_expired(now=999_939, leeway_s=60) is False  # um segundo antes
 
 
 class TestEnvStore:

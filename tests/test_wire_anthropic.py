@@ -74,9 +74,7 @@ class TestSystemBlocks:
         assert blocks[1]["text"] == "sê breve"
 
     def test_identity_alone_when_no_client_prompt(self) -> None:
-        assert ant.build_system_blocks("") == [
-            {"type": "text", "text": ant.CLAUDE_CODE_PROMPT}
-        ]
+        assert ant.build_system_blocks("") == [{"type": "text", "text": ant.CLAUDE_CODE_PROMPT}]
 
     def test_client_prompt_keeps_system_authority(self) -> None:
         """Enfiar o prompt do cliente num turno user tirava-lhe autoridade de system."""
