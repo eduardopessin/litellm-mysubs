@@ -51,4 +51,17 @@ Onde não seguimos o OMP, e porquê. Cada uma foi medida contra o serviço real.
 | Variantes `-thinking` | descascáveis | só `gemini-2.5-flash-thinking` | `gemini-3.7/3.8-flash-thinking` não existem no upstream; descascá-los servia `-low` em silêncio para um nome inventado. |
 | Nome não servido | fallback para modelo próximo | levanta | Responder com outro modelo faz a facturação e as comparações mentirem, e o cliente nunca sabe. |
 
+## Divergências corrigidas ao comparar com a fonte
+
+Estas não eram decisões: eram erros de terem sido portadas de uma cópia intermédia em vez
+da fonte. Ficam registadas porque o modo de falha é instrutivo.
+
+| Onde | Estava | Corrigido para | Como se notou |
+|---|---|---|---|
+| `google_finish_reason` | enumerava as razões de **erro** | enumera as **normais** (`STOP`, `MAX_TOKENS`) e trata o resto como erro, como `mapStopReasonString` | Cinco razões (`FINISH_REASON_UNSPECIFIED`, `LANGUAGE`, `IMAGE_OTHER`, `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION`) passavam por `stop`: uma resposta bloqueada pelo servidor chegava ao cliente como se estivesse completa. |
+| `thinking_loop` | trigramas de **caracteres**, aglomerado de 2, sem aquecimento | trigramas de **palavras**, `SEGMENT_MIN_CLUSTER=4`, `SEGMENT_MIN_COUNT=8`, dois regimes de ciclo exacto, âncoras canonicalizadas | Trigramas de caracteres dão semelhança alta a textos sem relação; disparar a 2 segmentos matava raciocínio legítimo que o OMP deixa passar. |
+
+**Lição de método:** portar da fonte e verificar contra o intermediário — nunca o inverso.
+Uma cópia de segunda mão herda os erros da primeira sem os assinalar.
+
 Uma divergência sem medição não é uma divergência: é um bug por corrigir.

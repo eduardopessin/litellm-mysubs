@@ -98,6 +98,9 @@ for i, m in enumerate(CASES_C):
     if a != b:
         fails += 1
         print("DIVERGE codex", i, a, b)
+# FINISH_REASON_UNSPECIFIED está deliberadamente fora desta lista: o intermediário
+# tratava-o como `stop`, o OMP (`providers/google-shared.ts :: mapStopReasonString`)
+# trata-o como erro, e seguimos o OMP. Ver a secção de divergências em docs/OMP.md.
 for raw in [
     None,
     "",
@@ -105,7 +108,6 @@ for raw in [
     "MAX_TOKENS",
     "SAFETY",
     "RECITATION",
-    "FINISH_REASON_UNSPECIFIED",
     "  max_tokens  ",
     "OTHER",
 ]:

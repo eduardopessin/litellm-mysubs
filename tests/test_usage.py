@@ -88,17 +88,39 @@ class TestGoogleFinishReason:
         assert google_finish_reason("MAX_TOKENS", has_tool_calls=True) == "tool_calls"
 
     @pytest.mark.parametrize(
-        "reason", ["SAFETY", "RECITATION", "PROHIBITED_CONTENT", "MALFORMED_FUNCTION_CALL"]
+        "reason",
+        [
+            "SAFETY",
+            "RECITATION",
+            "PROHIBITED_CONTENT",
+            "MALFORMED_FUNCTION_CALL",
+            # As cinco que faltavam quando se enumerava o erro em vez do sucesso.
+            "FINISH_REASON_UNSPECIFIED",
+            "LANGUAGE",
+            "IMAGE_OTHER",
+            "IMAGE_PROHIBITED_CONTENT",
+            "IMAGE_RECITATION",
+        ],
     )
     def test_server_side_blocks_surface_as_content_filter(self, reason: str) -> None:
         """O único valor OpenAI que não mente sobre um corte imposto pelo servidor."""
         assert google_finish_reason(reason, has_tool_calls=False) == "content_filter"
 
+    def test_unknown_reason_is_an_error_not_a_stop(self) -> None:
+        """O OMP enumera o que é normal e trata o resto como erro.
+
+        Uma razão nova do upstream tratada como `stop` entrega uma resposta cortada como
+        se estivesse completa. Tratada como erro, no pior caso é ruidosa de mais.
+        """
+        assert google_finish_reason("RAZAO_QUE_AINDA_NAO_EXISTE", has_tool_calls=False) == (
+            "content_filter"
+        )
+
     def test_blocked_reason_is_not_masked_by_tool_calls(self) -> None:
         """Um bloqueio de segurança não pode passar por tool_calls."""
         assert google_finish_reason("SAFETY", has_tool_calls=True) == "content_filter"
 
-    @pytest.mark.parametrize("reason", [None, "", "STOP", "FINISH_REASON_UNSPECIFIED"])
+    @pytest.mark.parametrize("reason", [None, "", "STOP"])
     def test_normal_completion(self, reason: object) -> None:
         assert google_finish_reason(reason, has_tool_calls=False) == "stop"
 

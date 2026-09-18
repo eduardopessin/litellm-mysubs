@@ -1,41 +1,80 @@
 """Detecção de raciocínio em fuga.
 
-Porte do ``ThinkingLoopDetector`` do omp (``packages/ai/src/utils/thinking-loop.ts``,
-descrito em ``provider-quirks.md:192``), com os limiares dele. O omp vigia as famílias
-Gemini, DeepSeek e Grok antes de cada tool call e mata o stream com um erro retryable.
+Porte directo de ``utils/thinking-loop.ts``. Os limiares não são escolhas nossas: o
+comentário da fonte diz que foram calibrados contra **536 mil blocos reais de raciocínio**,
+e que a corrida legítima mais longa de segmentos de baixa informação observada foi 7 — daí
+o gatilho em 8. Mexer neles sem um corpus equivalente é adivinhar.
 
-Quatro formas de fuga:
+Três formas de fuga, com propósitos distintos:
 
-1. repetição verbatim na cauda (janela 4096, >= 180 chars repetidos)
-2. segmentos quase duplicados (Jaccard de trigramas >= 0.8 nos últimos 16)
-3. estagnação de progresso (novidade <= 0.2 em 8 segmentos sem âncoras novas)
-4. títulos de sumário em excesso (24)
+1. **Ciclo exacto no sufixo** — repetição literal. Dois regimes: ciclos curtos (≤60 chars)
+   exigem 4 repetições e ≥180 chars; ciclos longos exigem 3 e ≥1024. Aplica-se sempre.
+2. **Aglomerado de quase-duplicados** — o mesmo parágrafo reescrito com deriva cosmética,
+   por sobreposição de trigramas de palavras.
+3. **Estagnação de léxico** — parágrafos que reciclam vocabulário recente e não introduzem
+   nenhuma referência concreta nova.
 
-Módulo próprio porque não depende de nada do Antigravity: é análise de texto, e um
-provedor novo que sofra do mesmo problema reutiliza-o sem arrastar o bridge.
+As duas últimas são heurísticas semânticas e podem ser desligadas; a primeira não.
 """
 
 from __future__ import annotations
 
 import re
-from collections import deque
 from typing import Final
 
-TAIL_WINDOW: Final = 4096
-TAIL_REPEAT: Final = 180
+#: Cauda retida para detecção de ciclo exacto.
+EXACT_TAIL_WINDOW: Final = 4096
+#: Maior ciclo considerado.
+EXACT_MAX_UNIT: Final = 1024
+#: Caracteres novos entre varrimentos. Evita trabalho quadrático por cada delta.
+EXACT_CHECK_STRIDE: Final = 128
+#: Fronteira entre o regime curto e o longo.
+EXACT_SHORT_MAX_UNIT: Final = 60
+EXACT_SHORT_MIN_REPEATED_CHARS: Final = 180
+EXACT_LONG_MIN_REPEATED_CHARS: Final = 1024
+
+#: Tecto de um segmento sem terminador; força um flush para que um muro de texto sem
+#: linhas em branco continue a ser segmentado.
+SEGMENT_CHAR_CAP: Final = 700
+#: Abaixo deste comprimento normalizado o segmento é ignorado — demasiado curto para ser
+#: um parágrafo com significado, e um título sozinho não pode disparar a detecção.
+SEGMENT_MIN_NORM_CHARS: Final = 60
 SEGMENT_WINDOW: Final = 16
-TRIGRAM_JACCARD: Final = 0.8
-MIN_SEGMENT_CHARS: Final = 40
-STALL_SEGMENTS: Final = 8
-STALL_NOVELTY: Final = 0.2
-HEADER_RUNAWAY: Final = 24
+SEGMENT_SIMILARITY: Final = 0.8
+#: Aquecimento: segmentos substanciais necessários antes de a detecção poder disparar.
+SEGMENT_MIN_COUNT: Final = 8
+#: Tamanho do aglomerado de quase-duplicados que dispara.
+SEGMENT_MIN_CLUSTER: Final = 4
 
-HEADER_RE: Final = re.compile(r"^\s*(?:\*\*[^*\n]{3,}\*\*|#{1,6}\s+\S.*)\s*$", re.M)
+#: Janela cujo vocabulário é a linha de base da novidade.
+LEX_NOVELTY_WINDOW: Final = 8
+LEX_STALL_NOVELTY_FLOOR: Final = 0.2
+LEX_STALL_MIN_RUN: Final = 8
 
-# Âncoras concretas: caminhos, identificadores com chamada, e números. Um segmento que
-# traga uma destas nova está a progredir, mesmo com pouco léxico novo.
-ANCHOR_RE: Final = re.compile(r"[\w./-]+\.[A-Za-z0-9]{1,8}\b|\b[A-Za-z_][\w]*\(|\b\d+\b")
-WORD_RE: Final = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
+# Uma referência concreta sobre a qual o modelo está de facto a raciocinar: um trecho de
+# código, uma extensão ou membro com ponto, um caminho de vários segmentos, ou um
+# identificador snake/camel/Pascal. Exclui dígitos nus, abreviaturas e decimais ("Passo 2",
+# "i.e.", "1.2") para que enchimento numerado não seja auto-âncora.
+CONCRETE_ANCHOR: Final = re.compile(
+    r"`[^`]+`"
+    r"|\b\w{2,}\.[a-zA-Z]\w{0,4}\b"
+    r"|[\w-]+(?:/[\w-]+){2,}"
+    r"|\b\w+_\w+\b"
+    r"|\b[a-z]+[A-Z]\w*\b"
+    r"|\b[A-Z][a-z]+[A-Z]\w*\b"
+)
+
+# Títulos de sumário ("**Mantendo o Ritmo**", "## Secção") são formatação por pensamento,
+# não raciocínio. A sua redacção sempre diferente inflacionaria a novidade e mascararia um
+# loop, por isso são removidos antes da análise.
+_HEADING = re.compile(r"^[ \t]*#{1,6}[ \t].*$", re.M)
+_BOLD_TITLE = re.compile(r"^[ \t]*\*{2,3}.+?\*{2,3}[ \t]*$", re.M)
+
+_PARAGRAPH_BOUNDARY = re.compile(r"\n\s*\n")
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_BACKTICKED = re.compile(r"`([^`]*)`")
+_HAS_LETTER = re.compile(r"[a-z]")
+_LETTER_OR_EMOJI = re.compile(r"[^\W\d_]", re.UNICODE)
 
 
 class ThinkingLoopError(Exception):
@@ -46,109 +85,233 @@ class ThinkingLoopError(Exception):
     """
 
 
-def trigrams(text: str) -> set[str]:
-    squashed = re.sub(r"\s+", " ", text.strip().lower())
-    return {squashed[i : i + 3] for i in range(max(0, len(squashed) - 2))}
+def normalize_segment(segment: str) -> str:
+    """Minúsculas, sem pontuação, só palavras que contenham letras."""
+    lowered = _BACKTICKED.sub(r" \1 ", segment.lower())
+    tokens = _NON_ALNUM.sub(" ", lowered).split()
+    return " ".join(token for token in tokens if _HAS_LETTER.search(token))
+
+
+def trigram_shingles(normalized: str) -> set[str]:
+    """Trigramas de **palavras** — não de caracteres.
+
+    Trigramas de caracteres davam semelhança alta a textos sem relação nenhuma, o que faz
+    a detecção disparar em raciocínio legítimo.
+    """
+    words = [word for word in normalized.split(" ") if word]
+    if len(words) < 3:
+        return {" ".join(words)} if words else set()
+    return {" ".join(words[index : index + 3]) for index in range(len(words) - 2)}
+
+
+def jaccard(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    small, large = (left, right) if len(left) < len(right) else (right, left)
+    intersection = sum(1 for item in small if item in large)
+    union = len(left) + len(right) - intersection
+    return intersection / union if union else 0.0
+
+
+def detect_exact_suffix_cycle(text: str) -> tuple[str, int] | None:
+    """Ciclo literal repetido no fim do texto, por algoritmo Z sobre o inverso.
+
+    Dois regimes: um ciclo curto tem de aparecer 4 vezes e cobrir 180 chars; um longo, 3
+    vezes e 1024. Um ciclo sem letras nenhumas (só pontuação ou espaços) não conta.
+    """
+    if len(text) < EXACT_SHORT_MIN_REPEATED_CHARS:
+        return None
+
+    reversed_text = text[::-1]
+    length = len(reversed_text)
+    z = [0] * length
+    left = right = 0
+    for index in range(1, length):
+        if index <= right:
+            z[index] = min(right - index + 1, z[index - left])
+        while (
+            index + z[index] < length and reversed_text[z[index]] == reversed_text[index + z[index]]
+        ):
+            z[index] += 1
+        if index + z[index] - 1 > right:
+            left, right = index, index + z[index] - 1
+
+    max_unit = min(EXACT_MAX_UNIT, length // 3)
+    for unit_length in range(2, max_unit + 1):
+        count = 1 + z[unit_length] // unit_length
+        short = unit_length <= EXACT_SHORT_MAX_UNIT
+        min_count = 4 if short else 3
+        min_chars = EXACT_SHORT_MIN_REPEATED_CHARS if short else EXACT_LONG_MIN_REPEATED_CHARS
+        if count < min_count or unit_length * count < min_chars:
+            continue
+        unit = text[-unit_length:]
+        if _LETTER_OR_EMOJI.search(unit):
+            return unit, count
+    return None
 
 
 # omp: utils/thinking-loop.ts :: ThinkingLoopDetector
 class ThinkingLoopDetector:
-    """Detecta raciocínio em fuga a partir do texto que vai passando.
+    """Alimentado com os deltas de raciocínio; devolve a razão na primeira fuga.
 
-    Desvio deliberado do omp: lá o gatilho é um erro *retryable* e a camada de retry volta
-    a pedir. Aqui não se retenta, levanta-se. O gerador já despejou ao cliente tudo o que
-    for ``reasoning_content``, e a detecção acontece depois de 8 segmentos ou 180 chars
-    repetidos — muito depois do primeiro despejo. Retentar duplicaria raciocínio no mesmo
-    stream, o que o omp evita com uma janela replay-safe que aqui não existe.
+    Desvio deliberado do OMP: lá o gatilho é um erro *retryable* e a camada de retry volta
+    a pedir. Aqui levanta-se. O gerador já despejou ao cliente tudo o que for
+    ``reasoning_content`` antes de a detecção acontecer, e retentar duplicaria raciocínio
+    no mesmo stream — o OMP evita isso com uma janela replay-safe que aqui não existe.
     """
 
     __slots__ = (
-        "buffer",
+        "_anchor_window",
+        "_count",
+        "_exact_scanned_at",
+        "_lex_stall_run",
+        "_pending",
+        "_semantic",
+        "_tail",
+        "_window",
+        "_word_window",
         "chars",
-        "headers",
-        "seen_anchors",
-        "seen_words",
-        "segments",
-        "stalled",
-        "tail",
     )
 
-    def __init__(self) -> None:
-        self.tail = ""
-        self.buffer = ""
-        self.segments: deque[set[str]] = deque(maxlen=SEGMENT_WINDOW)
-        self.seen_words: set[str] = set()
-        self.seen_anchors: set[str] = set()
-        self.stalled = 0
-        self.headers = 0
+    def __init__(self, *, semantic_heuristics: bool = True) -> None:
+        self._semantic = semantic_heuristics
+        self._tail = ""
+        self._exact_scanned_at = 0
+        self._pending = ""
+        self._window: list[set[str]] = []
+        self._word_window: list[set[str]] = []
+        self._anchor_window: list[set[str]] = []
+        self._count = 0
+        self._lex_stall_run = 0
         self.chars = 0
 
-    def feed(self, text: str) -> str | None:
-        """Devolve a razão do loop, ou ``None``. Nunca levanta."""
-        if not text:
+    def feed(self, delta: str) -> str | None:
+        """Razão do loop, ou ``None``. Nunca levanta."""
+        if not delta:
             return None
-        self.chars += len(text)
-        self.tail = (self.tail + text)[-TAIL_WINDOW:]
-        if reason := self._verbatim_tail():
-            return reason
+        self.chars += len(delta)
 
-        self.buffer += text
-        # Um segmento fecha num parágrafo; assim um delta a meio de uma frase não conta
-        # como progresso nem como estagnação.
-        while "\n\n" in self.buffer:
-            segment, _, self.buffer = self.buffer.partition("\n\n")
-            if reason := self._close_segment(segment):
+        # 1. Ciclos exactos, varridos a cadência limitada em vez de trabalho quadrático
+        # por cada delta do tamanho de um token.
+        self._tail = (self._tail + delta)[-EXACT_TAIL_WINDOW:]
+        self._exact_scanned_at += len(delta)
+        if self._exact_scanned_at >= EXACT_CHECK_STRIDE or len(delta) >= EXACT_CHECK_STRIDE:
+            self._exact_scanned_at = 0
+            if reason := self._exact_reason():
+                return reason
+
+        if not self._semantic:
+            return None
+
+        # 2. Segmentos: acumula e drena os que fecharam.
+        self._pending += delta
+        while True:
+            boundary = _PARAGRAPH_BOUNDARY.search(self._pending)
+            if boundary:
+                raw = self._pending[: boundary.start()]
+                self._pending = self._pending[boundary.end() :]
+            elif len(self._pending) > SEGMENT_CHAR_CAP:
+                # Sem fronteira mas longo de mais: força um flush para que um muro de
+                # texto sem parágrafos continue a ser analisado.
+                raw = self._pending[:SEGMENT_CHAR_CAP]
+                self._pending = self._pending[SEGMENT_CHAR_CAP:]
+            else:
+                return None
+            if reason := self._consume_chunks(raw):
+                return reason
+
+    def flush(self) -> str | None:
+        """Processa o parágrafo final, que pode ser o que completa um aglomerado.
+
+        Um stream pode terminar antes da próxima cadência, por isso força-se também uma
+        verificação exacta final.
+        """
+        if reason := self._exact_reason():
+            return reason
+        if not self._semantic or not self._pending:
+            return None
+        pending, self._pending = self._pending, ""
+        return self._consume_chunks(pending)
+
+    # -- internos --------------------------------------------------------------
+
+    def _exact_reason(self) -> str | None:
+        found = detect_exact_suffix_cycle(self._tail)
+        if found is None:
+            return None
+        unit, times = found
+        return f"ciclo exacto de {len(unit)} caracteres repetido {times}x seguidas"
+
+    def _consume_chunks(self, raw: str) -> str | None:
+        """Parte um segmento longo de mais para que cada pedaço fique comparável."""
+        rest = raw
+        while rest:
+            chunk, rest = rest[:SEGMENT_CHAR_CAP], rest[SEGMENT_CHAR_CAP:]
+            if reason := self._consume_segment(chunk):
                 return reason
         return None
 
-    def _verbatim_tail(self) -> str | None:
-        if len(self.tail) < TAIL_REPEAT * 2:
-            return None
-        probe = self.tail[-TAIL_REPEAT:]
-        if probe.strip() and probe in self.tail[:-TAIL_REPEAT]:
-            return f"repeticao verbatim de {TAIL_REPEAT} chars na cauda"
-        return None
-
-    def _close_segment(self, segment: str) -> str | None:
-        text = segment.strip()
-        if not text:
+    def _consume_segment(self, raw: str) -> str | None:
+        segment = _BOLD_TITLE.sub("", _HEADING.sub("", raw))
+        normalized = normalize_segment(segment)
+        if len(normalized) < SEGMENT_MIN_NORM_CHARS:
             return None
 
-        if HEADER_RE.match(text):
-            self.headers += 1
-            if self.headers >= HEADER_RUNAWAY:
-                return f"{self.headers} titulos de sumario sem accao"
+        # (a) Aglomerado de quase-duplicados.
+        fingerprint = trigram_shingles(normalized)
+        cluster = 1 + sum(
+            1 for previous in self._window if jaccard(fingerprint, previous) >= SEGMENT_SIMILARITY
+        )
 
-        if len(text) < MIN_SEGMENT_CHARS:
-            return None
+        # (b) Estagnação de léxico: parágrafos que reciclam o vocabulário recente e não
+        # acrescentam nenhuma referência concreta *nova*. Exigir uma âncora nova — e não
+        # apenas uma qualquer — apanha o enchimento que repete o mesmo caminho a cada
+        # parágrafo, e poupa o trabalho genuíno que nomeia um ficheiro diferente de cada vez.
+        words = {word for word in normalized.split(" ") if word}
+        prior_vocabulary: set[str] = set()
+        for seen in self._word_window:
+            prior_vocabulary |= seen
+        unseen = sum(1 for word in words if word not in prior_vocabulary)
+        novelty = 1.0 if not prior_vocabulary else unseen / len(words)
 
-        grams = trigrams(text)
-        if grams:
-            for previous in self.segments:
-                union = grams | previous
-                if union and len(grams & previous) / len(union) >= TRIGRAM_JACCARD:
-                    return "segmentos de raciocinio quase duplicados"
-        self.segments.append(grams)
+        # Canonicaliza para que a mesma referência escrita como `Foo`, Foo ou FOO seja uma
+        # só âncora e não se possa fazer passar por nova.
+        anchors = {
+            match.group(0).replace("`", "").lower() for match in CONCRETE_ANCHOR.finditer(segment)
+        }
+        new_anchor = any(
+            all(anchor not in seen for seen in self._anchor_window) for anchor in anchors
+        )
 
-        words = set(WORD_RE.findall(text.lower()))
-        anchors = set(ANCHOR_RE.findall(text))
-        novelty = len(words - self.seen_words) / len(words) if words else 0.0
-        fresh_anchor = bool(anchors - self.seen_anchors)
-        self.seen_words |= words
-        self.seen_anchors |= anchors
-
-        if novelty <= STALL_NOVELTY and not fresh_anchor:
-            self.stalled += 1
-            if self.stalled >= STALL_SEGMENTS:
-                return (
-                    f"{self.stalled} segmentos sem novidade "
-                    f"(novidade {novelty:.2f} <= {STALL_NOVELTY})"
-                )
+        if novelty <= LEX_STALL_NOVELTY_FLOOR and not new_anchor:
+            self._lex_stall_run += 1
         else:
-            self.stalled = 0
+            self._lex_stall_run = 0
+
+        self._window.append(fingerprint)
+        del self._window[:-SEGMENT_WINDOW]
+        self._word_window.append(words)
+        del self._word_window[:-LEX_NOVELTY_WINDOW]
+        self._anchor_window.append(anchors)
+        del self._anchor_window[:-LEX_NOVELTY_WINDOW]
+        self._count += 1
+
+        if self._count < SEGMENT_MIN_COUNT:
+            return None
+        if cluster >= SEGMENT_MIN_CLUSTER:
+            return f"{cluster} segmentos quase idênticos nos últimos {SEGMENT_WINDOW}"
+        if self._lex_stall_run >= LEX_STALL_MIN_RUN:
+            return f"{self._lex_stall_run} segmentos de baixa informação a reciclar o texto recente"
         return None
 
 
+# omp: utils/thinking-loop.ts :: isLoopGuardedModel
 def guard_for(model: str) -> ThinkingLoopDetector | None:
-    """Vigia só as famílias que de facto fogem."""
-    return ThinkingLoopDetector() if "gemini" in str(model).lower() else None
+    """Vigia as famílias que de facto fogem.
+
+    O OMP guarda Gemini, DeepSeek e xAI. Aqui só o Gemini é servido, mas a lista fica
+    alinhada com a fonte para que um provedor novo não passe despercebido.
+    """
+    lowered = str(model).lower()
+    guarded = ("gemini", "deepseek", "grok", "xai")
+    return ThinkingLoopDetector() if any(name in lowered for name in guarded) else None

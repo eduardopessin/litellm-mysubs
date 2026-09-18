@@ -100,43 +100,34 @@ def codex_usage(meta: dict[str, Any]) -> Usage:
     )
 
 
-# Sem isto o finalizador dava sempre "stop", e um corte por limite de tokens ou um bloqueio
-# de segurança chegava ao cliente como uma resposta normal e curta.
-GOOGLE_FINISH_ERROR: Final[tuple[str, ...]] = (
-    "SAFETY",
-    "BLOCKLIST",
-    "PROHIBITED_CONTENT",
-    "SPII",
-    "IMAGE_SAFETY",
-    "RECITATION",
-    "MALFORMED_FUNCTION_CALL",
-    "UNEXPECTED_TOOL_CALL",
-    "NO_IMAGE",
-    "OTHER",
-)
+# O OMP usa uma lista de *permitidos*, não de proibidos: em `mapStopReasonString` só
+# `STOP` e `MAX_TOKENS` têm significado próprio e **tudo o resto é erro**. A forma
+# inversa — enumerar as razões de erro — perde as que o upstream acrescentar: ao comparar
+# com a fonte encontraram-se cinco em falta (FINISH_REASON_UNSPECIFIED, LANGUAGE,
+# IMAGE_OTHER, IMAGE_PROHIBITED_CONTENT, IMAGE_RECITATION), todas a passar por `stop`.
+#
+# Uma razão desconhecida tratada como `stop` entrega ao cliente uma resposta cortada como
+# se estivesse completa; tratada como erro, no pior caso é ruidosa de mais.
+NORMAL_FINISH: Final = "STOP"
+TRUNCATED_FINISH: Final = "MAX_TOKENS"
 
 #: Razões em que uma tool call pendente ainda é o desfecho correcto do turno.
-_TOOL_CALL_COMPATIBLE: Final[tuple[str, ...]] = (
-    "",
-    "STOP",
-    "MAX_TOKENS",
-    "FINISH_REASON_UNSPECIFIED",
-)
+_TOOL_CALL_COMPATIBLE: Final[tuple[str, ...]] = ("", NORMAL_FINISH, TRUNCATED_FINISH)
 
 
-# omp: providers/google-shared.ts :: mapStopReason
+# omp: providers/google-shared.ts :: mapStopReasonString
 def google_finish_reason(raw: object, has_tool_calls: bool) -> str:
     """Traduz ``candidates[0].finishReason`` para a forma OpenAI."""
     reason = str(raw or "").strip().upper()
     if has_tool_calls and reason in _TOOL_CALL_COMPATIBLE:
         return "tool_calls"
-    if reason == "MAX_TOKENS":
+    if reason == TRUNCATED_FINISH:
         return "length"
-    if reason in GOOGLE_FINISH_ERROR:
-        # `content_filter` é o único valor OpenAI que não mente sobre um corte imposto
-        # pelo servidor; o nome cru vai no erro in-band quando existe.
-        return "content_filter"
-    return "stop"
+    if reason in ("", NORMAL_FINISH):
+        return "stop"
+    # `content_filter` é o único valor OpenAI que não mente sobre um corte imposto pelo
+    # servidor; o nome cru vai no erro in-band quando existe.
+    return "content_filter"
 
 
 def codex_finish_reason(status: object, has_tool_calls: bool) -> str:
