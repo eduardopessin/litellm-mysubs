@@ -75,6 +75,7 @@ class MySubs(_base()):  # type: ignore[misc]
             "disabled": disabled(),
             "patched": self._bootstrap.patched,
             "mounted": self._bootstrap.mounted,
+            "menu": self._bootstrap.menu,
             "error": self._bootstrap.error,
         }
 

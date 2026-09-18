@@ -65,6 +65,7 @@ class Bootstrap:
     def __init__(self) -> None:
         self.patched = False
         self.mounted = False
+        self.menu = ""
         self.error = ""
         self._lock = threading.Lock()
 
@@ -84,6 +85,18 @@ class Bootstrap:
             return False
 
     # -- aplicação -------------------------------------------------------------
+
+    def _inject_menu(self, app: Any) -> None:
+        """Acrescenta o item ao menu do LiteLLM. Falhar aqui não é falhar.
+
+        A página funciona por URL directo; o botão é conveniência. O chunk da UI tem um
+        nome que é hash de build, e uma versão nova do LiteLLM pode não ser reconhecida —
+        nesse caso regista-se a razão e segue-se.
+        """
+        try:
+            self.menu = _inject_menu_impl(app)
+        except Exception as error:
+            self.menu = f"não injectado: {type(error).__name__}: {error}"
 
     def patch(self, store: Any) -> bool:
         """Aplica o monkey-patch se houver subscrição ligada. Idempotente."""
@@ -116,10 +129,17 @@ class Bootstrap:
 
                 install_ui(app, store=store)
                 self.mounted = True
+                self._inject_menu(app)
                 return True
             except Exception as error:
                 self.error = f"mount: {type(error).__name__}: {error}"
                 return False
+
+
+def _inject_menu_impl(app: Any) -> str:
+    from .ui.menu import install_menu
+
+    return install_menu(app).reason
 
 
 def _providers() -> tuple[str, ...]:
