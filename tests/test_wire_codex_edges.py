@@ -105,22 +105,80 @@ class TestMalformedInput:
 
 
 class TestCacheKeyEdges:
-    def test_non_dict_messages_ignored(self) -> None:
-        assert codex.prompt_cache_key([None, "x"]) is None
+    def test_no_session_means_no_key(self) -> None:
+        assert codex.prompt_cache_key(None) is None
+        assert codex.prompt_cache_key("") is None
 
-    def test_assistant_only_history_has_no_key(self) -> None:
-        assert codex.prompt_cache_key([{"role": "assistant", "content": "r"}]) is None
+    def test_long_session_id_is_hashed(self) -> None:
+        """O backend recusa chaves acima de 64 caracteres."""
+        key = codex.prompt_cache_key("s" * 200)
+        assert key is not None
+        assert key.startswith("pc_") and len(key) <= 64
 
-    def test_empty_history_has_no_key(self) -> None:
-        assert codex.prompt_cache_key([]) is None
+    def test_short_session_id_travels_verbatim(self) -> None:
+        assert codex.prompt_cache_key("sessao-curta") == "sessao-curta"
 
-    def test_key_uses_only_first_two_head_messages(self) -> None:
-        """Duas mensagens bastam para identificar a conversa; incluir mais tornava a
-        chave sensível a edições a meio do histórico."""
-        head = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
-        assert codex.prompt_cache_key(head) == codex.prompt_cache_key(
-            [*head, {"role": "user", "content": "outra"}]
+    def test_retention_none_disables_it(self) -> None:
+        assert codex.prompt_cache_key("s", cache_retention="none") is None
+
+
+class TestCallIdSanitisation:
+    def test_invalid_characters_are_replaced(self) -> None:
+        """Um id com caracteres fora do conjunto dá 400 do backend."""
+        assert codex.split_call_id("call id!") != "call id!"
+        assert " " not in codex.split_call_id("call id!")
+
+    def test_valid_id_passes_through(self) -> None:
+        assert codex.split_call_id("call_abc-123") == "call_abc-123"
+
+    def test_composite_id_keeps_only_the_call(self) -> None:
+        assert codex.split_call_id("call-1|item-9") == "call-1"
+
+    def test_newline_also_separates(self) -> None:
+        """Ids reencaminhados de outro provedor trazem `\n`; cortar só em `|` deixava
+        passar o segundo segmento."""
+        assert codex.split_call_id("call-1\nlixo") == "call-1"
+
+    def test_long_id_is_truncated_with_a_hash(self) -> None:
+        sanitized = codex.split_call_id("c" * 200)
+        assert len(sanitized) <= codex.CALL_ID_MAX_CHARS
+
+    def test_different_long_ids_do_not_collide(self) -> None:
+        """Truncar sem hash fazia dois ids distintos colapsarem no mesmo."""
+        assert codex.split_call_id("a" * 100) != codex.split_call_id("b" * 100)
+
+    def test_empty_id_gets_a_stable_placeholder(self) -> None:
+        assert codex.split_call_id("").startswith("call_")
+
+
+class TestOrphanRepair:
+    def test_tool_name_is_preserved(self) -> None:
+        """Sem o nome, o modelo não sabe o que produziu o resultado órfão."""
+        items = codex.repair_tool_pairs(
+            [{"type": "function_call_output", "call_id": "x", "name": "ler", "output": "r"}]
         )
+        assert "[Previous ler result; call_id=x]" in items[0]["content"]
+
+    def test_missing_name_falls_back(self) -> None:
+        items = codex.repair_tool_pairs(
+            [{"type": "function_call_output", "call_id": "x", "output": "r"}]
+        )
+        assert "[Previous tool result" in items[0]["content"]
+
+    def test_huge_output_is_truncated(self) -> None:
+        """Um ficheiro de 2 MB rebentava o limite do corpo em vez de ser cortado."""
+        items = codex.repair_tool_pairs(
+            [{"type": "function_call_output", "call_id": "x", "output": "y" * 40_000}]
+        )
+        assert "...[truncated]" in items[0]["content"]
+        assert len(items[0]["content"]) < 20_000
+
+    def test_structured_output_is_serialised_as_json(self) -> None:
+        """`str()` de um dict dá aspas simples e `True`/`None` — repr Python no prompt."""
+        items = codex.repair_tool_pairs(
+            [{"type": "function_call_output", "call_id": "x", "output": {"ok": True}}]
+        )
+        assert '{"ok": true}' in items[0]["content"]
 
 
 class TestBodyOptionalFields:

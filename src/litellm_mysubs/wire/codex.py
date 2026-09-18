@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Callable
 from typing import Any, Final
@@ -188,27 +189,25 @@ def content_to_text(content: object) -> str:
     return str(content) if content is not None else ""
 
 
-def prompt_cache_key(messages: list[Any]) -> str | None:
-    """Chave estável por conversa.
+PROMPT_CACHE_KEY_MAX_CHARS: Final = 64
 
-    O backend só reaproveita o prefixo em cache quando o pedido repete a mesma chave, e o
-    prefixo estável é a cabeça da conversa (developer/system + primeiro turno do
-    utilizador). Incluir a cauda mudaria a chave a cada turno e nunca haveria hit.
+
+# omp: providers/openai-shared.ts :: getOpenAIPromptCacheKey
+def prompt_cache_key(session_id: str | None, *, cache_retention: str | None = None) -> str | None:
+    """Chave de cache de prompt, derivada da **identidade da sessão**.
+
+    Não se deriva do conteúdo: duas conversas distintas que partilhem o prompt de sistema
+    e a primeira mensagem colidiriam na mesma chave — entre sessões e entre utilizadores —
+    e uma conversa cuja cabeça fosse editada perderia o hit sem razão.
+
+    ``cache_retention="none"`` desliga o cache; sem isto não havia forma de o chamador o
+    dispensar.
     """
-    digest = hashlib.sha256()
-    seen = 0
-    for message in messages or []:
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role", "user")
-        if role not in ("system", "developer", "user"):
-            continue
-        digest.update(str(role).encode("utf-8"))
-        digest.update(content_to_text(message.get("content")).encode("utf-8"))
-        seen += 1
-        if seen >= 2:
-            break
-    return digest.hexdigest()[:32] if seen else None
+    if cache_retention == "none" or not session_id:
+        return None
+    if len(session_id) <= PROMPT_CACHE_KEY_MAX_CHARS:
+        return session_id
+    return f"pc_{_stable_hash(session_id)}"
 
 
 def image_part(part: dict[str, Any]) -> dict[str, str] | None:
@@ -295,10 +294,82 @@ def composite_call_id(call_id: str | None, item_id: str | None) -> str:
     return call_id or item_id or f"call_{uuid.uuid4().hex[:8]}"
 
 
+#: O backend recusa ids fora deste conjunto ou acima deste comprimento.
+CALL_ID_MAX_CHARS: Final = 64
+_INVALID_CALL_ID_CHARS: Final = re.compile(r"[^a-zA-Z0-9_-]")
+_TRAILING_UNDERSCORES: Final = re.compile(r"_+$")
+#: Separadores: `|` é o nosso composto, `\n` aparece em ids reencaminhados de outro provedor.
+_CALL_ID_SEPARATOR: Final = re.compile(r"[\n|]")
+
+
+def _stable_hash(text: str) -> str:
+    """Hash curto e determinístico, em base36 como o do OMP."""
+    digest = int(hashlib.sha256(text.encode("utf-8")).hexdigest()[:16], 16)
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while digest:
+        digest, remainder = divmod(digest, 36)
+        out = alphabet[remainder] + out
+    return out or "0"
+
+
+# omp: providers/openai-codex/request-transformer.ts :: sanitizeCodexCallId
 def split_call_id(value: object) -> str:
-    return str(value or "").split("|", 1)[0]
+    """Id de chamada saneado para o wire do Codex.
+
+    Um id vindo de outro provedor traz frequentemente caracteres que o backend recusa, ou
+    passa dos 64 caracteres; deixá-lo passar cru dá 400. Quando é preciso alterar o id,
+    acrescenta-se um hash para que dois ids diferentes não colapsem no mesmo.
+    """
+    raw = str(value or "")
+    if not raw:
+        return f"call_{_stable_hash('empty')}"
+
+    match = _CALL_ID_SEPARATOR.search(raw)
+    if match is None:
+        base = raw
+    elif match.start() == 0:
+        base = raw[1:]
+    else:
+        base = raw[: match.start()]
+
+    sanitized = _TRAILING_UNDERSCORES.sub("", _INVALID_CALL_ID_CHARS.sub("_", base))
+    if 0 < len(sanitized) <= CALL_ID_MAX_CHARS and sanitized == base:
+        return sanitized
+
+    digest = _stable_hash(base or raw)
+    effective = sanitized or "call"
+    prefix_length = max(0, CALL_ID_MAX_CHARS - 1 - len(digest))
+    return f"{effective[:prefix_length]}_{digest}"[:CALL_ID_MAX_CHARS]
 
 
+# omp: providers/openai-codex/request-transformer.ts :: CODEX_ORPHAN_OUTPUT_LIMIT
+#: Um resultado órfão gigante (a leitura de um ficheiro de 2 MB, por exemplo) rebentava o
+#: limite do corpo do pedido em vez de ser cortado.
+ORPHAN_OUTPUT_LIMIT: Final = 16_000
+
+# omp: providers/openai-codex/request-transformer.ts :: CODEX_INTERRUPTED_TOOL_OUTPUT
+INTERRUPTED_TOOL_OUTPUT: Final = (
+    "[No tool output recorded: the tool call was interrupted before it produced a result.]"
+)
+
+
+def _orphan_output_text(item: dict[str, Any]) -> str:
+    """Texto de um resultado cuja chamada se perdeu, truncado."""
+    output = item.get("output")
+    if isinstance(output, str):
+        text = output
+    else:
+        try:
+            text = json.dumps(output)
+        except (TypeError, ValueError):
+            text = str(output if output is not None else "")
+    if len(text) > ORPHAN_OUTPUT_LIMIT:
+        text = f"{text[:ORPHAN_OUTPUT_LIMIT]}\n...[truncated]"
+    return text
+
+
+# omp: providers/openai-codex/request-transformer.ts :: orphanFunctionOutputToMessage
 def repair_tool_pairs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fecha pares ``function_call`` / ``function_call_output`` incompletos.
 
@@ -321,13 +392,16 @@ def repair_tool_pairs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for item in items:
         call_id = item.get("call_id")
         if item.get("type") == "function_call_output" and call_id not in calls:
+            # O nome da tool vem do próprio item: sem ele o modelo não sabe o que produziu
+            # o resultado órfão.
+            tool_name = item.get("name") if isinstance(item.get("name"), str) else "tool"
             repaired.append(
                 {
                     "type": "message",
                     "role": "assistant",
                     "content": (
-                        f"[Previous tool result; call_id={call_id}]: "
-                        f"{content_to_text(item.get('output'))}"
+                        f"[Previous {tool_name} result; call_id={call_id}]: "
+                        f"{_orphan_output_text(item)}"
                     ),
                 }
             )
@@ -338,10 +412,7 @@ def repair_tool_pairs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 {
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": (
-                        "[No tool output recorded: the tool call was interrupted "
-                        "before it produced a result.]"
-                    ),
+                    "output": INTERRUPTED_TOOL_OUTPUT,
                 }
             )
     return repaired
@@ -440,28 +511,43 @@ def normalize_effort(value: object) -> tuple[str | None, str | None]:
 
 
 # omp: providers/openai-responses.ts :: getJuiceValue
+def juice_for(effort: str | None) -> int:
+    """Orçamento de raciocínio reservado quando o thinking é desligado.
+
+    O valor é o do effort **pedido pelo cliente**, não zero: desligar o raciocínio não
+    significa que o modelo deva ficar sem orçamento nenhum. Um effort desconhecido cai no
+    default de ``medium``.
+    """
+    return JUICE.get(str(effort or "medium").strip().lower(), JUICE["medium"])
+
+
 def build_request_body(
     model: str,
     messages: list[Any],
     tools: list[Any] | None = None,
     extra: dict[str, Any] | None = None,
     unsupported: dict[str, str] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Corpo de um pedido à Responses API."""
     req_model = resolve_model(model, unsupported)
+    extra = extra or {}
     body: dict[str, Any] = {
         "model": req_model,
         "store": False,
         "stream": True,
         "input": messages_to_input(messages),
+        # Sem isto o backend não devolve o raciocínio encriptado, e num histórico
+        # stateless (`store: false`) o modelo recomeça a raciocinar a cada turno.
+        "include": ["reasoning.encrypted_content"],
     }
 
-    if cache_key := prompt_cache_key(messages):
+    cache_key = prompt_cache_key(session_id, cache_retention=extra.get("cache_retention"))
+    if cache_key:
         body["prompt_cache_key"] = cache_key
     if codex_tools := tools_to_codex_tools(tools):
         body["tools"] = codex_tools
 
-    extra = extra or {}
     choice = tool_choice(extra.get("tool_choice"))
     if choice is not None:
         body["tool_choice"] = choice
@@ -470,10 +556,11 @@ def build_request_body(
     # (verificado: sem ele, zero eventos response.reasoning_summary_text.delta). O omp
     # manda sempre um effort, por isso o default aqui é "medium" em vez de omitir.
     effort, summary = normalize_effort(extra.get("reasoning_effort"))
-    effort = effort or "medium"
     summary = summary if summary in ("auto", "detailed", "concise") else "auto"
 
     if effort == "none":
+        # Desligar o raciocínio não dispensa o item: as gerações recentes continuam a
+        # reservar juice, e é ele que o fixa no valor pedido.
         if wire_generation(req_model) >= JUICE_MIN_GENERATION:
             body["input"] = [
                 *body["input"],
@@ -481,12 +568,18 @@ def build_request_body(
                     "type": "message",
                     "role": "developer",
                     "content": [
-                        {"type": "input_text", "text": f"# Juice: {JUICE['none']} !important"}
+                        {
+                            "type": "input_text",
+                            "text": (
+                                f"# Juice: "
+                                f"{juice_for(extra.get('juice_effort') or effort)} !important"
+                            ),
+                        }
                     ],
                 },
             ]
     else:
-        body["reasoning"] = {"effort": effort, "summary": summary, "context": "all_turns"}
+        body["reasoning"] = {"effort": effort or "medium", "summary": summary}
 
     if extra.get("service_tier") is not None:
         body["service_tier"] = extra["service_tier"]

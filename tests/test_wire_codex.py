@@ -298,15 +298,52 @@ class TestRequestBody:
     def test_reasoning_object_always_present(self) -> None:
         """Sem ele, zero eventos response.reasoning_summary_text.delta."""
         body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
-        assert body["reasoning"] == {"effort": "medium", "summary": "auto", "context": "all_turns"}
+        assert body["reasoning"] == {"effort": "medium", "summary": "auto"}
+
+    def test_all_turns_context_is_not_forced(self) -> None:
+        """O OMP só o força no transporte Lite e apaga-o nos modelos que não o suportam."""
+        body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
+        assert "context" not in body["reasoning"]
+
+    def test_encrypted_reasoning_is_requested(self) -> None:
+        """Sem isto não há replay de raciocínio num histórico stateless."""
+        body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
+        assert body["include"] == ["reasoning.encrypted_content"]
 
     def test_effort_none_adds_juice_item_on_new_generations(self) -> None:
-        """GPT-5.6+ continua a reservar juice com o reasoning desligado."""
+        """GPT-5.6+ continua a reservar juice com o reasoning desligado.
+
+        O valor é o do effort pedido, não zero: desligar o raciocínio não significa que o
+        modelo deva ficar sem orçamento nenhum.
+        """
         body = codex.build_request_body(
             "gpt-5.6-terra", [{"role": "user", "content": "x"}], extra={"reasoning_effort": "none"}
         )
         assert "reasoning" not in body
-        assert body["input"][-1]["content"][0]["text"] == "# Juice: 0 !important"
+        # `none` é o pedido explícito de desligar; o juice segue esse valor.
+        assert (
+            body["input"][-1]["content"][0]["text"] == f"# Juice: {codex.JUICE['none']} !important"
+        )
+
+    def test_juice_follows_a_separate_effort_when_given(self) -> None:
+        """No OMP o desligar é um flag à parte do effort: quem pede `high` e desliga o
+        raciocínio continua a reservar o orçamento de `high`."""
+        body = codex.build_request_body(
+            "gpt-5.6-terra",
+            [{"role": "user", "content": "x"}],
+            extra={"reasoning_effort": "none", "juice_effort": "high"},
+        )
+        assert (
+            body["input"][-1]["content"][0]["text"] == f"# Juice: {codex.JUICE['high']} !important"
+        )
+
+    def test_juice_defaults_to_medium(self) -> None:
+        assert codex.juice_for(None) == codex.JUICE["medium"]
+        assert codex.juice_for("inventado") == codex.JUICE["medium"]
+
+    def test_juice_follows_the_requested_effort(self) -> None:
+        assert codex.juice_for("high") == 48
+        assert codex.juice_for("max") == 960
 
     def test_effort_none_skips_juice_on_older_generations(self) -> None:
         body = codex.build_request_body(
@@ -327,23 +364,36 @@ class TestRequestBody:
         body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
         assert body["stream"] is True and body["store"] is False
 
-    def test_cache_key_stable_across_turns(self) -> None:
-        """A chave vem da cabeça da conversa; mudá-la a cada turno anulava o cache."""
-        head = [{"role": "system", "content": "regra"}, {"role": "user", "content": "primeira"}]
-        first = codex.build_request_body("gpt-5.5", head)
+    def test_cache_key_is_the_session_identity(self) -> None:
+        """Derivar do conteúdo fazia duas conversas com o mesmo prompt de sistema
+        partilharem chave — entre sessões e entre utilizadores."""
+        body = codex.build_request_body(
+            "gpt-5.5", [{"role": "user", "content": "x"}], session_id="sessao-1"
+        )
+        assert body["prompt_cache_key"] == "sessao-1"
+
+    def test_cache_key_survives_history_edits(self) -> None:
+        """A mesma sessão mantém o hit mesmo com a cabeça da conversa editada."""
+        first = codex.build_request_body(
+            "gpt-5.5", [{"role": "user", "content": "original"}], session_id="s"
+        )
         later = codex.build_request_body(
-            "gpt-5.5",
-            [*head, {"role": "assistant", "content": "r"}, {"role": "user", "content": "b"}],
+            "gpt-5.5", [{"role": "user", "content": "editada"}], session_id="s"
         )
         assert first["prompt_cache_key"] == later["prompt_cache_key"]
 
-    def test_cache_key_differs_per_conversation(self) -> None:
-        a = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "um"}])
-        b = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "dois"}])
-        assert a["prompt_cache_key"] != b["prompt_cache_key"]
+    def test_cache_can_be_disabled(self) -> None:
+        """Sem isto não havia forma de o chamador dispensar o cache."""
+        body = codex.build_request_body(
+            "gpt-5.5",
+            [{"role": "user", "content": "x"}],
+            extra={"cache_retention": "none"},
+            session_id="s",
+        )
+        assert "prompt_cache_key" not in body
 
-    def test_no_cache_key_without_head_messages(self) -> None:
-        body = codex.build_request_body("gpt-5.5", [{"role": "assistant", "content": "x"}])
+    def test_no_cache_key_without_session(self) -> None:
+        body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
         assert "prompt_cache_key" not in body
 
     def test_service_tier_forwarded(self) -> None:
