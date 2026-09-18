@@ -34,10 +34,10 @@ desta lista fechado, a sessão falhou.
 | 1 | Botão "MySubs" no Experimental | falta |
 | 2 | Página de adicionar sub | falta |
 | 3 | Cards do Quota Desktop | falta |
-| 4 | OAuth + paste da URL de retorno | falta |
-| 5 | Rotina de renovação | parcial — `Credential` e `CredentialStore` existem; **não há refresh** |
-| 6 | Seleccionar modelos e aplicar | parcial — `registry.apply()` existe; **não há descoberta** |
-| 7 | Instalação fácil + patch automático | em curso — `transport/client.py` feito, `plugin.py` a fechar |
+| 4 | OAuth + paste da URL de retorno | ✅ `credentials/oauth.py` — três formatos de paste, state verificado |
+| 5 | Rotina de renovação | ✅ rotação do refresh aplicada, dono único respeitado |
+| 6 | Seleccionar modelos e aplicar | ✅ `catalog/{discovery,deployments}.py` — sonda tri-estado |
+| 7 | Instalação fácil + patch automático | ✅ `plugin.py` — smoke test ponta-a-ponta passa |
 
 ## O que já está verificado (e não precisa de ser revisitado)
 
@@ -74,13 +74,36 @@ release pública.**
 
 ## Próximo passo
 
-Quando o `plugin.py` fechar (passo 7), atacar em paralelo:
+**Só falta a UI (passos 1-3).** Tudo o que ela precisa existe e está verificado em
+execução, não só em teste:
 
-- **OAuth + refresh** (passos 4 e 5) — PKCE, paste do código, renovador com dono único.
-  A regra do dono único não é estilo: tokens rotativos de uso único com dois renovadores
-  produzem `invalid_grant` em ciclo e forçam re-login manual.
-- **Descoberta de modelos** (passo 6) — catálogo real no Google; curada + sonda nos outros.
-- **UI `/mysubs`** (passos 1-3) — sub-app FastAPI por `app.mount()`, com os cards do Quota.
+    oauth.begin(provider)              -> AuthRequest(url, state, verifier)
+    oauth.complete(p, req, colado)     -> Credential          (passo 4)
+    oauth.refresh(cred, store=…)       -> Credential          (passo 5)
+    discovery.discover(cred)           -> list[DiscoveredModel]  (passo 6)
+    deployments.to_deployments(…)      -> list[dict]
+    registry.ModelRegistry.apply(…)    -> injecta no Router
+    plugin.install()                   -> patch                (passo 7)
+
+Falta a sub-app FastAPI em `/mysubs` que junta isto: cards por provedor, botão de
+conectar, caixa de paste, lista de modelos com checkbox, botão de aplicar. Decisão de
+como o botão entra no menu do LiteLLM está em `docs/DECISIONS.md` (D5).
+
+## Bugs que os gates verdes não apanharam
+
+Registo, porque o padrão repete-se e é o que justifica insistir em smoke tests reais:
+
+1. **`install()` só patchava metade.** `litellm/__init__.py` faz
+   `from .main import acompletion`, que **copia** a referência — `litellm.acompletion`
+   ficava por patchar. 42 testes passavam porque afirmavam todos sobre o sítio que o
+   código patcha. Um pedido real rebentava com `LLM Provider NOT provided`.
+2. **`rotation.started` nunca reposto.** Depois do primeiro stream completo, o failover de
+   host morria em silêncio para sempre. Apanhado por mutação.
+3. **`_strip_output_limits` era código morto**, com um teste tautológico a cobri-lo —
+   afirmava a ausência de chaves que nunca estariam presentes.
+
+A lição comum: **um teste escrito a partir da implementação confirma o que ela faz; não
+deteta o que ela esqueceu.**
 
 ## Referências
 
