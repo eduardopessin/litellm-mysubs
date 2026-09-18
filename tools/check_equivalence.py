@@ -241,9 +241,7 @@ def load_original(path: str) -> Any:
     """
     tree = ast.parse(Path(path).read_text("utf-8"))
     functions = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in WANTED
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in WANTED
     ]
     missing = WANTED - {f.name for f in functions}
     if missing:
