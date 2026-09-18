@@ -62,10 +62,15 @@ src = ["src", "tests"]
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
 
 [tool.mypy]
-python_version = "3.11"
+# O `numpy` que o LiteLLM arrasta tem stubs com sintaxe de 3.12 (`type X = …`). Fixar 3.11
+# aqui fazia o mypy abortar a análise no primeiro ficheiro dele, antes de chegar ao nosso
+# código — um gate que falha por uma dependência não diz nada sobre o pacote.
+#
+# O suporte a 3.11 continua declarado em `requires-python` e é o que a matriz do CI mede.
+python_version = "3.12"
 strict = true
 files = ["src/litellm_mysubs"]
-# O LiteLLM não publica stubs; o acoplamento a ele é isolado em patch.py.
+# Nem o LiteLLM nem o numpy publicam stubs utilizáveis.
 [[tool.mypy.overrides]]
-module = ["litellm.*"]
+module = ["litellm.*", "numpy.*"]
 ignore_missing_imports = true

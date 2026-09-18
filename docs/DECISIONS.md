@@ -182,3 +182,47 @@ fixar o degrau mais baixo é a única forma de o reduzir sem o 400 de
 Reposto depois de o verificador o apanhar em falta. O gate é geracional — opus ≥ 4.7,
 sonnet/fable/mythos ≥ 5 (`compat/resolve.ts :: defaultSupportsDisplay`) — e não coincide
 com `is_adaptive`: opus-4-6 e sonnet-4-6 são adaptativos e recusam o campo com 400.
+
+## D5 — Como o botão "MySubs" entra na UI do LiteLLM
+
+**Data:** 2026-09-18 · **Estado:** decidido
+
+### O que se mediu
+
+A UI do proxy é Next.js **pré-compilado**, servido de
+`litellm/proxy/_experimental/out/`. O menu lateral é código React dentro de um chunk
+minificado:
+
+    out/_next/static/chunks/0c63y7umyjwi-.js
+    …{key:"experimental",page:"experimental",label:"Experimental",
+       icon:(0,a.jsx)($.FlaskConical,{…}),children:[{key:"prompts",…}]}
+
+Dois factos que decidem:
+
+1. O item `experimental` tem **`children`** — acrescentar uma entrada é acrescentar um
+   elemento a essa lista.
+2. Outras entradas usam **`external_url`** (`learning-resources` aponta para
+   `models.litellm.ai/cookbook`). Há precedente para um item de menu que sai da SPA.
+
+O nome do chunk é um hash de build: muda a cada versão do LiteLLM.
+
+### Decisão
+
+**Sub-app FastAPI montada em `/mysubs` com `app.mount()`**, servindo UI própria. O acesso
+faz-se por URL directo e por um item de menu injectado.
+
+**A injecção do item de menu é opcional e best-effort.** Um patch de string num bundle
+minificado cujo nome é um hash de build parte em silêncio na próxima versão do LiteLLM —
+e um botão que desaparece sem aviso é pior que um botão que nunca existiu. Portanto:
+
+- `/mysubs` funciona sempre, por URL, sem depender de nenhum patch.
+- A injecção procura o padrão; **se não o encontrar, não falha** — regista que a UI desta
+  versão não foi reconhecida e diz ao utilizador o URL directo.
+- Nunca se reescreve o ficheiro no `site-packages`: serve-se uma cópia alterada em
+  memória, para um `pip install --force-reinstall` não deixar estado inconsistente.
+
+### Alternativa rejeitada
+
+Recompilar a UI do LiteLLM com a entrada incluída. Dá um botão nativo, mas obriga a
+acompanhar cada release do upstream com um fork do frontend — custo permanente por um
+ganho estético.
