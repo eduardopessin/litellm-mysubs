@@ -65,11 +65,17 @@ def collect_anchors() -> list[Anchor]:
 def fetch_sources(version: str) -> dict[str, str]:
     """Ficheiros ``src/`` dos tarballs, indexados por caminho relativo.
 
-    Os dois pacotes partilham o espaço de nomes: um caminho só existe num deles.
+    Os dois pacotes **partilham caminhos** — `index.ts`, `types.ts` e `utils.ts` existem
+    nos dois. Juntá-los sem cuidado faz o segundo tapar o primeiro, e uma âncora para um
+    símbolo do ficheiro tapado falha como se ele não existisse. Concatena-se o conteúdo em
+    vez de o substituir: a pergunta que se faz é "este símbolo existe neste caminho", e a
+    resposta certa é sim quando existe em qualquer um dos pacotes.
     """
     sources: dict[str, str] = {}
     for package in PACKAGES:
-        sources.update(_fetch_package_sources(package, version))
+        for path, content in _fetch_package_sources(package, version).items():
+            existing = sources.get(path)
+            sources[path] = f"{existing}\n{content}" if existing else content
     return sources
 
 
