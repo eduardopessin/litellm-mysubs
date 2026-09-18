@@ -9,7 +9,13 @@ from __future__ import annotations
 
 import pytest
 
-from litellm_mysubs.transport.hosts import HOSTS, STREAM_PATH, HostRotation
+from litellm_mysubs.transport.hosts import (
+    HOSTS,
+    MAX_EMPTY_RETRIES,
+    STREAM_PATH,
+    HostRotation,
+    empty_retry_delay,
+)
 from litellm_mysubs.transport.retry import (
     Action,
     decide_antigravity,
@@ -90,32 +96,52 @@ class TestHostRotation:
         """Ambos são sempre tentados: nenhum fica excluído por uma falha anterior."""
         assert len(HostRotation().urls()) == len(HOSTS)
 
-    def test_remembers_the_last_good_host(self) -> None:
+    def test_commit_remembers_the_last_good_host(self) -> None:
         rotation = HostRotation()
-        rotation.mark_good(HOSTS[1] + STREAM_PATH)
+        rotation.commit(HOSTS[1] + STREAM_PATH)
         assert rotation.urls()[0].startswith(HOSTS[1])
         assert rotation.current == HOSTS[1]
 
     def test_fallback_host_still_offered_after_switching(self) -> None:
         """O primário não é abandonado: pode voltar a responder."""
         rotation = HostRotation()
-        rotation.mark_good(HOSTS[1] + STREAM_PATH)
+        rotation.commit(HOSTS[1] + STREAM_PATH)
         assert any(url.startswith(HOSTS[0]) for url in rotation.urls())
 
     def test_unknown_url_does_not_move_the_pointer(self) -> None:
         rotation = HostRotation()
-        rotation.mark_good("https://exemplo.invalido/x")
+        rotation.commit("https://exemplo.invalido/x")
         assert rotation.current == HOSTS[0]
+
+    def test_failover_allowed_before_anything_is_emitted(self) -> None:
+        assert HostRotation().can_failover(is_last=False) is True
+
+    def test_no_failover_after_the_first_event(self) -> None:
+        """O cliente já viu parte da resposta: recomeçar noutro host duplicava-a."""
+        rotation = HostRotation()
+        rotation.mark_started()
+        assert rotation.can_failover(is_last=False) is False
+
+    def test_no_failover_on_the_last_endpoint(self) -> None:
+        assert HostRotation().can_failover(is_last=True) is False
 
     def test_path_is_configurable(self) -> None:
         rotation = HostRotation()
-        assert all(
-            url.endswith("/v1internal:fetchAvailableModels")
-            for url in rotation.urls("/v1internal:fetchAvailableModels")
-        )
+        urls = rotation.urls("/v1internal:fetchAvailableModels")
+        assert all(url.endswith("/v1internal:fetchAvailableModels") for url in urls)
 
     def test_instances_do_not_share_memory(self) -> None:
         """Dois clientes no mesmo processo podem estar em hosts diferentes."""
         first, second = HostRotation(), HostRotation()
-        first.mark_good(HOSTS[1] + STREAM_PATH)
+        first.commit(HOSTS[1] + STREAM_PATH)
         assert second.current == HOSTS[0]
+
+
+class TestEmptyStreamRetry:
+    def test_backoff_doubles(self) -> None:
+        """500 ms, 1 s — como o OMP."""
+        assert empty_retry_delay(1) == 0.5
+        assert empty_retry_delay(2) == 1.0
+
+    def test_retry_budget_matches_the_source(self) -> None:
+        assert MAX_EMPTY_RETRIES == 2

@@ -37,13 +37,10 @@ FILE_URI_PREFIXES: Final[tuple[str, ...]] = (
     "https://generativelanguage.googleapis.com/",
 )
 
+# omp: stream.ts :: mapEffortToGoogleThinkingLevel
 # Effort -> thinkingLevel do Gemini 3 (o dialecto 2.x usa thinkingBudget).
-# MINIMAL não vai para o fio: gemini-3.8-* e gemini-3.1-pro respondem 400 "Thinking level
-# MINIMAL is not supported for this model" (só gemini-3.5-flash-* e 2.5-* o aceitam). A
-# regra é mapear para o effort mais baixo suportado em vez de inventar um valor inválido.
-LOWEST_THINKING_LEVEL: Final = "LOW"
 THINKING_LEVEL: Final[dict[str, str]] = {
-    "minimal": LOWEST_THINKING_LEVEL,
+    "minimal": "MINIMAL",
     "low": "LOW",
     "medium": "MEDIUM",
     "high": "HIGH",
@@ -51,10 +48,32 @@ THINKING_LEVEL: Final[dict[str, str]] = {
     "max": "HIGH",
 }
 
+#: Nível usado para **suprimir** o raciocínio. O OMP manda `{level: "MINIMAL"}` ou
+#: `{budget: 0}`; mandar `LOW` ou o `minThinkingBudget` do catálogo (que para várias
+#: variantes não é zero) continua a gastar orçamento — e com `includeThoughts: false` os
+#: tokens são facturados sem o texto voltar.
+SUPPRESSED_THINKING_LEVEL: Final = "MINIMAL"
+
 DEFAULT_MAX_OUTPUT_TOKENS: Final = 64000
 
-#: O CCA valida a assinatura do primeiro functionCall do turno.
+# omp: providers/google-shared.ts :: SKIP_THOUGHT_SIGNATURE
+#: O CCA exige a sentinela quando a **primeira** chamada de um turno assistant vai sem
+#: assinatura; chamadas seguintes do mesmo turno ficam nuas.
 SIGNATURE_SENTINEL: Final = "skip_thought_signature_validator"
+
+#: Texto de um tool result que só traz imagem.
+IMAGE_ONLY_RESULT: Final = "(see attached image)"
+
+#: Assinaturas de raciocínio são base64 com padding. Uma string que não case dá 400 do
+#: CCA — e como é truthy, impedia a sentinela de salvar o pedido.
+_BASE64_SIGNATURE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+
+# omp: providers/google-shared.ts :: isValidThoughtSignature
+def is_valid_signature(signature: object) -> bool:
+    text = str(signature or "")
+    return bool(text) and len(text) % 4 == 0 and _BASE64_SIGNATURE.match(text) is not None
+
 
 TEXT_PART_TYPES: Final[tuple[str, ...]] = ("text", "input_text", "output_text")
 
@@ -277,7 +296,9 @@ def tool_result_value(
     """
     content = message.get("content")
     if isinstance(content, list):
-        text = "".join(
+        # Separador entre partes: sem ele a última palavra de uma cola-se à primeira da
+        # seguinte e o modelo lê duas frases como uma.
+        text = "\n".join(
             str(part.get("text", ""))
             for part in content
             if isinstance(part, dict) and part.get("type") in (None, *TEXT_PART_TYPES)
@@ -290,6 +311,11 @@ def tool_result_value(
     else:
         text = str(content or "")
         media = []
+
+    # Um resultado só com imagem tem de dizer alguma coisa: `output: ""` é lido como tool
+    # sem resultado, e o modelo tende a repetir a chamada.
+    if not text and media:
+        text = IMAGE_ONLY_RESULT
     value = {"error" if message.get("is_error") else "output": text}
     return value, media
 
@@ -308,14 +334,15 @@ def _thinking_config(effort: str, info: Mapping[str, Any]) -> dict[str, Any]:
     também é aceite.
     """
     budget = info.get("thinkingBudget")
-    min_budget = info.get("minThinkingBudget")
 
     if effort == "none":
+        # Suprimir é orçamento zero, não o mínimo do catálogo: com `includeThoughts: False`
+        # um orçamento positivo é facturado sem devolver texto nenhum.
         config: dict[str, Any] = {"includeThoughts": False}
-        if isinstance(min_budget, int):
-            config["thinkingBudget"] = min_budget
+        if isinstance(budget, int):
+            config["thinkingBudget"] = 0
         else:
-            config["thinkingLevel"] = LOWEST_THINKING_LEVEL
+            config["thinkingLevel"] = SUPPRESSED_THINKING_LEVEL
         return config
 
     config = {"includeThoughts": True}
@@ -362,7 +389,6 @@ def build_payload(
     contents: list[dict[str, Any]] = []
     system_parts: list[dict[str, Any]] = []
     pending_tool_responses: list[dict[str, Any]] = []
-    sentinel_used = False
 
     def flush() -> None:
         nonlocal pending_tool_responses
@@ -397,6 +423,10 @@ def build_payload(
             continue
 
         if role == "assistant":
+            # A sentinela é por **turno**, não por pedido: o CCA exige-a sempre que a
+            # primeira chamada de um turno assistant vai sem assinatura. Marcá-la uma vez
+            # só deixava os turnos seguintes com chamadas nuas e 400 na validação.
+            first_tool_call = True
             for tool_call in message.get("tool_calls") or []:
                 function = tool_call.get("function") or {}
                 call_id, _, encoded_signature = str(tool_call.get("id") or "").partition("|")
@@ -415,17 +445,26 @@ def build_payload(
                     function_call["id"] = call_id
                 part: dict[str, Any] = {"functionCall": function_call}
 
-                signature = (
-                    tool_call.get("thoughtSignature")
-                    or tool_call.get("thought_signature")
-                    or encoded_signature
-                    or signatures.get(call_id)
+                # Só se reenvia uma assinatura que seja base64 válido: uma string
+                # arbitrária dá 400 e, por ser truthy, impedia a sentinela de a salvar.
+                candidate = next(
+                    (
+                        value
+                        for value in (
+                            tool_call.get("thoughtSignature"),
+                            tool_call.get("thought_signature"),
+                            encoded_signature,
+                            signatures.get(call_id),
+                        )
+                        if is_valid_signature(value)
+                    ),
+                    None,
                 )
-                if signature:
-                    part["thoughtSignature"] = signature
-                elif not sentinel_used:
+                if candidate:
+                    part["thoughtSignature"] = candidate
+                elif first_tool_call:
                     part["thoughtSignature"] = SIGNATURE_SENTINEL
-                    sentinel_used = True
+                first_tool_call = False
                 parts.append(part)
             if parts:
                 contents.append({"role": "model", "parts": parts})

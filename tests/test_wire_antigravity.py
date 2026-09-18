@@ -69,15 +69,18 @@ class TestThinkingConfig:
         config = body["request"]["generationConfig"]["thinkingConfig"]
         assert config["includeThoughts"] is False
 
-    def test_minimal_never_goes_on_the_wire(self) -> None:
-        """400 "Thinking level MINIMAL is not supported for this model"."""
+    def test_minimal_is_served_as_minimal(self) -> None:
+        """O OMP tem MINIMAL no tipo e manda-o; não há clamp para LOW.
+
+        Servir `minimal` como `LOW` custava mais latência e mais tokens do que o cliente
+        pediu, em modelos que aceitam MINIMAL.
+        """
         body = payload(
             [{"role": "user", "content": "x"}],
             model="gemini-3.5-flash",
             extra={"reasoning_effort": "minimal"},
         )
-        config = body["request"]["generationConfig"]["thinkingConfig"]
-        assert config.get("thinkingLevel") == "LOW"
+        assert body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "MINIMAL"
 
     def test_catalog_budget_wins_over_level(self) -> None:
         """Com catálogo usa-se o budget anunciado para a variante."""
@@ -91,18 +94,27 @@ class TestThinkingConfig:
         assert config["thinkingBudget"] == 1000
         assert "thinkingLevel" not in config
 
-    def test_min_budget_used_to_disable(self) -> None:
+    def test_suppression_is_zero_budget_not_the_catalog_minimum(self) -> None:
+        """Com `includeThoughts: False`, um orçamento positivo é facturado sem devolver
+        texto nenhum. O `minThinkingBudget` do catálogo não é zero em várias variantes."""
         catalog = ModelCatalog(
             ids=("gemini-3-pro-low",),
-            info={"gemini-3-pro-low": {"minThinkingBudget": 128}},
+            info={"gemini-3-pro-low": {"thinkingBudget": 1000, "minThinkingBudget": 128}},
             fetched_at=1.0,
         )
-        body = payload(
+        config = payload(
             [{"role": "user", "content": "x"}],
             catalog=catalog,
             extra={"reasoning_effort": "none"},
-        )
-        assert body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 128
+        )["request"]["generationConfig"]["thinkingConfig"]
+        assert config["includeThoughts"] is False
+        assert config["thinkingBudget"] == 0
+
+    def test_suppression_without_catalog_uses_minimal(self) -> None:
+        config = payload([{"role": "user", "content": "x"}], extra={"reasoning_effort": "none"})[
+            "request"
+        ]["generationConfig"]["thinkingConfig"]
+        assert config["thinkingLevel"] == "MINIMAL"
 
 
 class TestModelMapping:
@@ -228,13 +240,13 @@ class TestToolCalls:
                 {
                     "role": "assistant",
                     "tool_calls": [
-                        {"id": "c1|sig-real", "function": {"name": "f", "arguments": "{}"}}
+                        {"id": "c1|c2lnLXJlYWw=", "function": {"name": "f", "arguments": "{}"}}
                     ],
                 },
-                {"role": "tool", "tool_call_id": "c1|sig-real", "content": "r"},
+                {"role": "tool", "tool_call_id": "c1|c2lnLXJlYWw=", "content": "r"},
             ]
         )
-        assert body["request"]["contents"][0]["parts"][0]["thoughtSignature"] == "sig-real"
+        assert body["request"]["contents"][0]["parts"][0]["thoughtSignature"] == "c2lnLXJlYWw="
 
     def test_remembered_signature_is_used(self) -> None:
         body = payload(
@@ -245,9 +257,9 @@ class TestToolCalls:
                 },
                 {"role": "tool", "tool_call_id": "c1", "content": "r"},
             ],
-            thought_signatures={"c1": "sig-lembrada"},
+            thought_signatures={"c1": "c2lnLWxlbWJyYWRh"},
         )
-        assert body["request"]["contents"][0]["parts"][0]["thoughtSignature"] == "sig-lembrada"
+        assert body["request"]["contents"][0]["parts"][0]["thoughtSignature"] == "c2lnLWxlbWJyYWRh"
 
     def test_invalid_arguments_preserved_as_raw(self) -> None:
         """Deitar fora os argumentos perdia a intenção da chamada."""
@@ -317,6 +329,86 @@ class TestToolCalls:
         response = body["request"]["contents"][1]["parts"][0]["functionResponse"]
         assert response["response"] == {"output": "captura"}
         assert "inlineData" in response["parts"][0]
+
+    def test_sentinel_is_per_turn_not_per_request(self) -> None:
+        """O CCA exige a sentinela na primeira chamada de **cada** turno assistant.
+
+        Marcá-la uma vez por pedido deixava os turnos seguintes com chamadas nuas, e o
+        backend respondia 400 na validação de assinatura.
+        """
+        body = payload(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"id": "a1", "function": {"name": "f", "arguments": "{}"}}],
+                },
+                {"role": "tool", "tool_call_id": "a1", "content": "r1"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"id": "b1", "function": {"name": "g", "arguments": "{}"}}],
+                },
+                {"role": "tool", "tool_call_id": "b1", "content": "r2"},
+            ]
+        )
+        turns = [c for c in body["request"]["contents"] if c["role"] == "model"]
+        assert len(turns) == 2
+        for turn in turns:
+            assert turn["parts"][0]["thoughtSignature"] == ag.SIGNATURE_SENTINEL
+
+    def test_invalid_signature_is_replaced_by_the_sentinel(self) -> None:
+        """Uma assinatura não-base64 dá 400 e, por ser truthy, bloqueava a sentinela."""
+        body = payload(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "thoughtSignature": "isto nao e base64!",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "r"},
+            ]
+        )
+        assert (
+            body["request"]["contents"][0]["parts"][0]["thoughtSignature"] == ag.SIGNATURE_SENTINEL
+        )
+
+    def test_secondary_calls_stay_bare_when_first_is_signed(self) -> None:
+        """Turno com primeira chamada assinada: as seguintes não levam sentinela."""
+        body = payload(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "c1|c2lnLXJlYWw=", "function": {"name": "f", "arguments": "{}"}},
+                        {"id": "c2", "function": {"name": "g", "arguments": "{}"}},
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1|c2lnLXJlYWw=", "content": "r1"},
+                {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+            ]
+        )
+        parts = body["request"]["contents"][0]["parts"]
+        assert parts[0]["thoughtSignature"] == "c2lnLXJlYWw="
+        assert "thoughtSignature" not in parts[1]
+
+    def test_multipart_text_keeps_a_separator(self) -> None:
+        """Sem separador, a última palavra de uma parte cola-se à primeira da seguinte."""
+        value, _ = ag.tool_result_value(
+            {"content": [{"type": "text", "text": "primeira"}, {"type": "text", "text": "segunda"}]}
+        )
+        assert value == {"output": "primeira\nsegunda"}
+
+    def test_image_only_result_is_announced(self) -> None:
+        """`output: ""` é lido como tool sem resultado e o modelo repete a chamada."""
+        value, media = ag.tool_result_value(
+            {"content": [{"type": "image_url", "image_url": {"url": PNG}}]}
+        )
+        assert value == {"output": ag.IMAGE_ONLY_RESULT}
+        assert len(media) == 1
 
     def test_error_result_uses_error_key(self) -> None:
         value, _ = ag.tool_result_value({"content": "falhou", "is_error": True})
