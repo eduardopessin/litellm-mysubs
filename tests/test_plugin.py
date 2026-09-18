@@ -92,9 +92,7 @@ def gemini_events(
     return [
         {
             "response": {
-                "candidates": [
-                    {"content": {"parts": [{"text": text}]}, "finishReason": finish}
-                ],
+                "candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": finish}],
                 "usageMetadata": usage or {},
             }
         }
@@ -244,9 +242,7 @@ class TestPositionalArguments:
         transport = install_transport(FakeTransport(codex_events(text="posicional")))
         plugin.install()
 
-        response = await litellm.main.acompletion(
-            "gpt-5.5", [{"role": "user", "content": "oi"}]
-        )
+        response = await litellm.main.acompletion("gpt-5.5", [{"role": "user", "content": "oi"}])
 
         assert response.choices[0].message.content == "posicional"
         assert transport.specs[0].model == "gpt-5.5"
@@ -326,29 +322,21 @@ class TestUpstreamErrors:
 
     async def test_truncated_codex_stream_is_a_failure(self) -> None:
         """Sem evento terminal a resposta está cortada: devolvê-la mentia ao cliente."""
-        install_transport(
-            FakeTransport([{"type": "response.output_text.delta", "delta": "meia "}])
-        )
+        install_transport(FakeTransport([{"type": "response.output_text.delta", "delta": "meia "}]))
         with pytest.raises(plugin.StreamError, match=r"response\.completed"):
             await plugin.dispatch(model="gpt-5.5", messages=[{"role": "user", "content": "x"}])
 
     async def test_antigravity_in_band_error_propagates(self) -> None:
-        install_transport(
-            FakeTransport([{"error": {"code": 429, "message": "sem quota"}}])
-        )
+        install_transport(FakeTransport([{"error": {"code": 429, "message": "sem quota"}}]))
         with pytest.raises(plugin.StreamError, match="sem quota"):
-            await plugin.dispatch(
-                model="gemini-3-pro", messages=[{"role": "user", "content": "x"}]
-            )
+            await plugin.dispatch(model="gemini-3-pro", messages=[{"role": "user", "content": "x"}])
 
     async def test_antigravity_blocked_content_propagates(self) -> None:
         install_transport(
             FakeTransport([{"response": {"promptFeedback": {"blockReason": "SAFETY"}}}])
         )
         with pytest.raises(plugin.StreamError, match="SAFETY"):
-            await plugin.dispatch(
-                model="gemini-3-pro", messages=[{"role": "user", "content": "x"}]
-            )
+            await plugin.dispatch(model="gemini-3-pro", messages=[{"role": "user", "content": "x"}])
 
 
 class TestNonStreamingShape:
@@ -505,12 +493,8 @@ class TestStreamingShape:
     async def test_stream_ends_with_finish_then_usage(self) -> None:
         """O chunk de usage tem de vir e tem de trazer `choices` não vazio: o iterador da
         rota /v1/responses faz `chunk.choices[0]` sem guarda."""
-        install_transport(
-            FakeTransport(codex_events(text="fluxo", usage={"input_tokens": 7}))
-        )
-        chunks = await collect_stream(
-            model="gpt-5.5", messages=[{"role": "user", "content": "x"}]
-        )
+        install_transport(FakeTransport(codex_events(text="fluxo", usage={"input_tokens": 7})))
+        chunks = await collect_stream(model="gpt-5.5", messages=[{"role": "user", "content": "x"}])
 
         assert [c.choices[0].delta.content for c in chunks if c.choices[0].delta.content] == [
             "fluxo"
@@ -552,15 +536,13 @@ class TestStreamingShape:
         tool_chunks = [c for c in chunks if c.choices[0].delta.tool_calls]
 
         assert tool_chunks[0].choices[0].delta.tool_calls[0].function.name == "ler"
-        assert json.loads(
-            tool_chunks[1].choices[0].delta.tool_calls[0].function.arguments
-        ) == {"path": "a"}
+        assert json.loads(tool_chunks[1].choices[0].delta.tool_calls[0].function.arguments) == {
+            "path": "a"
+        }
         assert chunks[-2].choices[0].finish_reason == "tool_calls"
 
     async def test_stream_error_is_not_swallowed(self) -> None:
-        install_transport(
-            FakeTransport([{"type": "response.output_text.delta", "delta": "meia "}])
-        )
+        install_transport(FakeTransport([{"type": "response.output_text.delta", "delta": "meia "}]))
         with pytest.raises(plugin.StreamError):
             await collect_stream(model="gpt-5.5", messages=[{"role": "user", "content": "x"}])
 
@@ -587,18 +569,14 @@ class TestRequestConstruction:
         cliente nunca nomeou.
         """
         transport = install_transport(FakeTransport(codex_events()))
-        response = await plugin.dispatch(
-            model="gpt-6", messages=[{"role": "user", "content": "x"}]
-        )
+        response = await plugin.dispatch(model="gpt-6", messages=[{"role": "user", "content": "x"}])
 
         assert transport.specs[0].body["model"] == "gpt-6-astra"
         assert response.model == "gpt-6"
 
     async def test_antigravity_request_carries_project_and_token(self) -> None:
         transport = install_transport(FakeTransport(gemini_events()))
-        await plugin.dispatch(
-            model="gemini-3-pro", messages=[{"role": "user", "content": "x"}]
-        )
+        await plugin.dispatch(model="gemini-3-pro", messages=[{"role": "user", "content": "x"}])
         spec = transport.specs[0]
 
         assert spec.body["project"] == "proj-1"
@@ -630,9 +608,7 @@ class TestRequestConstruction:
                 ]
             )
         )
-        await plugin.dispatch(
-            model="gemini-3-pro", messages=[{"role": "user", "content": "x"}]
-        )
+        await plugin.dispatch(model="gemini-3-pro", messages=[{"role": "user", "content": "x"}])
         assert plugin._state.signatures["c1"] == "sig-abc"
 
 

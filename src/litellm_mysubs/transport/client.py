@@ -204,9 +204,7 @@ class Transport:
             refreshed = False
             while True:
                 response = await self._client.send(
-                    self._client.build_request(
-                        "POST", url, json=dict(spec.body), headers=headers
-                    ),
+                    self._client.build_request("POST", url, json=dict(spec.body), headers=headers),
                     stream=True,
                 )
                 if response.status_code == 200:

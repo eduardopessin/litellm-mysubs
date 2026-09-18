@@ -501,9 +501,7 @@ class TestProjectDiscovery:
             },
         )
         async with client_of(backend) as client:
-            credencial = await complete(
-                "google-antigravity", request_for(), "abc", client=client
-            )
+            credencial = await complete("google-antigravity", request_for(), "abc", client=client)
 
         assert credencial.project_id == "projecto-1"
         assert ONBOARD_URL not in backend.urls, "a conta já tinha tier; não se provisiona"
@@ -522,9 +520,7 @@ class TestProjectDiscovery:
             },
         )
         async with client_of(backend) as client:
-            credencial = await complete(
-                "google-antigravity", request_for(), "abc", client=client
-            )
+            credencial = await complete("google-antigravity", request_for(), "abc", client=client)
 
         assert credencial.project_id == "projecto-novo"
         assert ONBOARD_URL in backend.urls
@@ -542,9 +538,7 @@ class TestProjectDiscovery:
             },
         )
         async with client_of(backend) as client:
-            credencial = await complete(
-                "google-antigravity", request_for(), "abc", client=client
-            )
+            credencial = await complete("google-antigravity", request_for(), "abc", client=client)
 
         assert credencial.project_id == "projecto-novo"
         assert "https://daily-cloudcode-pa.googleapis.com/v1internal/operations/1" in backend.urls
@@ -586,10 +580,16 @@ class TestProjectDiscovery:
         """Princípio 3: nunca fabricar um valor plausível. Um projecto inventado daria 400
         em cada pedido, sem dizer porquê."""
         backend = Antigravity(
-            {"currentTier": {"id": "free-tier"}, "allowedTiers": [{"id": "free-tier"}],
-             "paidTier": {"id": "pago"}},
-            {"currentTier": {"id": "free-tier"}, "allowedTiers": [{"id": "free-tier"}],
-             "paidTier": {"id": "pago"}},
+            {
+                "currentTier": {"id": "free-tier"},
+                "allowedTiers": [{"id": "free-tier"}],
+                "paidTier": {"id": "pago"},
+            },
+            {
+                "currentTier": {"id": "free-tier"},
+                "allowedTiers": [{"id": "free-tier"}],
+                "paidTier": {"id": "pago"},
+            },
         )
         async with client_of(backend) as client:
             with pytest.raises(OAuthError) as excinfo:
@@ -664,9 +664,7 @@ class TestAntigravityRefresh:
 
         async with client_of(handler) as client:
             await refresh(
-                Credential(
-                    "google-antigravity", "at", refresh_token="rt", project_id="projecto-1"
-                ),
+                Credential("google-antigravity", "at", refresh_token="rt", project_id="projecto-1"),
                 client=client,
             )
         assert seen[0]["client_secret"].startswith("GOCSPX-")
@@ -741,9 +739,7 @@ class TestSurvivorsClosed:
         }
         backend = Antigravity(conta, conta)
         async with client_of(backend) as client:
-            credencial = await complete(
-                "google-antigravity", request_for(), "abc", client=client
-            )
+            credencial = await complete("google-antigravity", request_for(), "abc", client=client)
         assert credencial.project_id == "projecto-1"
 
     async def test_paste_of_only_whitespace_never_reaches_the_network(self) -> None:

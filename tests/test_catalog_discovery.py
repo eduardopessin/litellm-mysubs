@@ -77,8 +77,10 @@ class TestGoogleCatalog:
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
-                200, json=catalog_payload("gemini-3.1-pro", "gemini-3.1-pro-high",
-                                          deprecated=("gemini-3.1-pro-high",))
+                200,
+                json=catalog_payload(
+                    "gemini-3.1-pro", "gemini-3.1-pro-high", deprecated=("gemini-3.1-pro-high",)
+                ),
             )
 
         async with client(handler) as http:

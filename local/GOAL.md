@@ -31,9 +31,9 @@ desta lista fechado, a sessão falhou.
 
 | # | Passo | Estado |
 |---|---|---|
-| 1 | Botão "MySubs" no Experimental | falta |
-| 2 | Página de adicionar sub | falta |
-| 3 | Cards do Quota Desktop | falta |
+| 1 | Botão "MySubs" no Experimental | ✅ `/mysubs` montado; injecção do item é best-effort (D5) |
+| 2 | Página de adicionar sub | ✅ `ui/app.py` — verificada no browser |
+| 3 | Cards do Quota Desktop | ✅ três cards com estado, validade e contagem no Router |
 | 4 | OAuth + paste da URL de retorno | ✅ `credentials/oauth.py` — três formatos de paste, state verificado |
 | 5 | Rotina de renovação | ✅ rotação do refresh aplicada, dono único respeitado |
 | 6 | Seleccionar modelos e aplicar | ✅ `catalog/{discovery,deployments}.py` — sonda tri-estado |

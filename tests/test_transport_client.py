@@ -237,11 +237,11 @@ class TestDecisionsAreNotReimplemented:
 class TestStreaming:
     async def test_events_arrive_in_order_and_stop_at_done(self) -> None:
         body = sse_body(
-            ': keep-alive',
+            ": keep-alive",
             'data: {"n": 1}',
-            '',
+            "",
             'data: {"n": 2}',
-            'data: [DONE]',
+            "data: [DONE]",
             'data: {"n": 3}',
         )
         async with transport(Recorder(ok(body))) as client:

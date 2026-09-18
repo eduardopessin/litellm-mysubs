@@ -73,8 +73,14 @@ _TRAJECTORY_ID: Final = uuid.uuid4().hex[:16]
 class _State:
     """Estado do módulo, num objecto só para que `uninstall` não deixe pontas soltas."""
 
-    __slots__ = ("original_acompletion", "original_completion", "signatures", "step", "store",
-                 "transport")
+    __slots__ = (
+        "original_acompletion",
+        "original_completion",
+        "signatures",
+        "step",
+        "store",
+        "transport",
+    )
 
     def __init__(self) -> None:
         self.original_acompletion: Callable[..., Any] | None = None
@@ -88,9 +94,7 @@ class _State:
 _state = _State()
 
 
-def configure(
-    *, store: CredentialStore | None = None, transport: Transport | None = None
-) -> None:
+def configure(*, store: CredentialStore | None = None, transport: Transport | None = None) -> None:
     """Liga as dependências. Chamar antes de `install`.
 
     Ambas são injectadas em vez de descobertas: é o que permite exercer o despacho inteiro
@@ -183,9 +187,7 @@ def _codex_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> Reque
         model=str(body.get("model") or model),
         service_tier=extra.get("service_tier"),
     )
-    return RequestSpec(
-        url=CODEX_URL, headers=headers, body=body, provider="codex", model=model
-    )
+    return RequestSpec(url=CODEX_URL, headers=headers, body=body, provider="codex", model=model)
 
 
 def _antigravity_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> RequestSpec:
@@ -348,9 +350,7 @@ class _CodexReader:
         entregava output truncado como se estivesse completo.
         """
         if not self._turn.terminal:
-            raise StreamError(
-                "Codex: stream terminou sem response.completed/response.incomplete"
-            )
+            raise StreamError("Codex: stream terminou sem response.completed/response.incomplete")
         return []
 
 
@@ -449,9 +449,7 @@ class _AntigravityReader:
 
 
 def _delta_chunk(delta: Delta) -> ModelResponseStream:
-    return ModelResponseStream(
-        choices=[StreamingChoices(index=0, delta=delta, finish_reason=None)]
-    )
+    return ModelResponseStream(choices=[StreamingChoices(index=0, delta=delta, finish_reason=None)])
 
 
 def _tool_open_chunk(index: int, call_id: str, name: str) -> ModelResponseStream:
@@ -472,9 +470,7 @@ def _tool_open_chunk(index: int, call_id: str, name: str) -> ModelResponseStream
 
 
 def _tool_delta_chunk(index: int, arguments: str) -> ModelResponseStream:
-    return _delta_chunk(
-        Delta(tool_calls=[{"index": index, "function": {"arguments": arguments}}])
-    )
+    return _delta_chunk(Delta(tool_calls=[{"index": index, "function": {"arguments": arguments}}]))
 
 
 def _finish_chunk(reason: str) -> ModelResponseStream:
