@@ -140,6 +140,7 @@ def normalize_effort(value: object) -> tuple[str | None, str | None]:
     )
 
 
+# omp: providers/anthropic.ts :: getCacheControl
 def cache_control() -> dict[str, str]:
     """Marcador de cache.
 
@@ -267,6 +268,7 @@ def mark_breakpoint(message: dict[str, Any]) -> bool:
     return False
 
 
+# omp: providers/anthropic.ts :: cloneAnthropicCacheControl
 def apply_conversation_cache(messages: list[Any]) -> int:
     """Ancora os breakpoints nas últimas mensagens marcáveis. Muta ``messages``."""
     anchors = [i for i, m in enumerate(messages) if is_markable(m)]
@@ -312,6 +314,9 @@ def _forced_tool_choice(choice: object) -> bool:
     return isinstance(choice, str) and choice in ("required", "any")
 
 
+# omp: providers/anthropic.ts :: ensureMaxTokensForThinking
+# omp: providers/anthropic.ts :: supportsSamplingParams
+# omp: providers/anthropic.ts :: disableThinkingIfToolChoiceForced
 def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
     """Normaliza thinking, temperatura, top_p e tectos de tokens. Muta ``kwargs``.
 

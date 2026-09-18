@@ -61,9 +61,20 @@ jobs:
         # Sem --no-cov: este job corre um subconjunto e o gate de cobertura é do job test.
         run: pytest tests/test_litellm_contract.py -v --no-cov
 
+  # O wiring é do OMP. Um rename do lado deles deixa as âncoras `# omp:` a apontar para
+  # nada, e ninguém dá por isso até alguém tentar seguir uma.
+  omp-anchors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python tools/check_omp_drift.py
+
   build:
     # Um artefacto construído à mão esconde um pipeline morto. O que se publica é o do CI.
-    needs: [test, litellm-contract]
+    needs: [test, litellm-contract, omp-anchors]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -283,6 +283,7 @@ def content_to_parts(content: object, *, assistant: bool = False) -> list[dict[s
 # -- tool calls ----------------------------------------------------------------
 
 
+# omp: providers/transform-messages.ts :: normalizeResponsesToolCallId
 def composite_call_id(call_id: str | None, item_id: str | None) -> str:
     """Junta ``(call_id, item_id)`` num só identificador.
 
@@ -438,6 +439,7 @@ def normalize_effort(value: object) -> tuple[str | None, str | None]:
     )
 
 
+# omp: providers/openai-responses.ts :: getJuiceValue
 def build_request_body(
     model: str,
     messages: list[Any],
