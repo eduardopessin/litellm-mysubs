@@ -186,7 +186,7 @@ pytest                  # unit tests
 ruff check . && mypy    # lint and types
 ```
 
-1628 tests, 86% branch coverage (the suite fails below 85%), `ruff` and `mypy --strict`
+1629 tests, 86% branch coverage (the suite fails below 85%), `ruff` and `mypy --strict`
 clean. Tests that touch real LiteLLM internals need the proxy extras:
 
 ```bash
@@ -199,10 +199,31 @@ That file asserts the internal symbols the patch depends on — `Router.acomplet
 `litellm[proxy]` 1.101.0 and the current release, which turns an incompatible upstream
 upgrade into a red build instead of a production outage.
 
-CI also runs the unit suite on Python 3.11, 3.12 and 3.13, and verifies 186 source anchors
-against the upstream implementations they were ported from, on every push. An anchor pins
-both the symbol name and, where it matters, its value — a renamed endpoint path or a bumped
-client version fails the build rather than drifting silently.
+## Where the wiring comes from
+
+The protocol work is a Python port of [`@oh-my-pi/pi-ai`](https://www.npmjs.com/package/@oh-my-pi/pi-ai)
+and its sibling packages ([`can1357/oh-my-pi`](https://github.com/can1357/oh-my-pi)) — the
+headers each provider expects, the client versions they check, the endpoint paths, the
+shape of every stream event. That is published work, and this package does not pretend to
+have discovered it.
+
+What the port adds is traceability. Every borrowed constant carries an anchor naming its
+source:
+
+```python
+# omp: usage/openai-codex.ts :: CODEX_USAGE_PATH
+# omp= CODEX_USAGE_PATH = "wham/usage"
+```
+
+CI checks all 186 of them against the published tarballs on every push. The first form
+proves the symbol still exists; the second proves its **value** has not changed, which is
+the failure that matters — a renamed endpoint or a bumped client version keeps the symbol
+and breaks the wire, and that is exactly how `wham/usage` once shipped as
+`codex/wham/usage` and returned 403 against every account.
+
+CI also runs the unit suite on Python 3.11, 3.12 and 3.13. When upstream moves, the build
+goes red with the file, the symbol and the new value in the message — months before a user
+would have found it.
 
 ## Architecture
 
