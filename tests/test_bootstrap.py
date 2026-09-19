@@ -183,3 +183,45 @@ class TestProxyContract:
         from litellm_mysubs.setup_cli import CALLBACK_PATH
 
         assert CALLBACK_PATH.endswith("proxy_handler_instance")
+
+
+class TestStoreIsWired:
+    """O patch sem store é um patch inútil — e o sintoma aparece longe da causa."""
+
+    def test_patching_configures_the_plugin_store(self) -> None:
+        """Medido no proxy real: `install()` sem `configure()` deixa `_access_token` a
+        devolver "", o pedido sai com `Authorization: Bearer ` e o httpx recusa-o com
+        `Illegal header value b'Bearer '`. O erro chega do cliente do provedor, não do
+        plugin, e não diz nada sobre a credencial em falta.
+        """
+        from litellm_mysubs import plugin
+
+        store = ConnectedStore()
+        boot = Bootstrap()
+        try:
+            assert boot.patch(store) is True
+            assert plugin._state.store is store
+        finally:
+            plugin.uninstall()
+
+    def test_the_router_entrypoint_is_patched(self) -> None:
+        """O proxy encaminha por `Router.acompletion`, não pelas funções de módulo.
+
+        `route_llm_request.py:487` faz `getattr(llm_router, route_type)(**data)`. Sem este
+        patch, um modelo de subscrição resolvia o deployment e ia para o cliente nativo
+        antes de qualquer função de módulo ser tocada. O `sitecustomize.py` original diz-o
+        no comentário da linha 2812; o porte só patchava as funções de módulo.
+        """
+        from litellm.router import Router
+
+        from litellm_mysubs import plugin
+
+        original = Router.acompletion
+        try:
+            plugin.configure(store=ConnectedStore())
+            plugin.install()
+            assert Router.acompletion is not original
+            assert Router.acompletion.__name__ == "_wrapped_router_acompletion"
+        finally:
+            plugin.uninstall()
+        assert Router.acompletion is original

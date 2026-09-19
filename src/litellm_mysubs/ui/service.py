@@ -8,6 +8,7 @@ web, e o dia em que houver um CLI ele chama estas funções sem passar por FastA
 from __future__ import annotations
 
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -15,10 +16,19 @@ import httpx
 
 from ..catalog.deployments import to_deployments
 from ..catalog.discovery import DiscoveredModel, discover
-from ..catalog.usage import UsageSnapshot, from_headers
+from ..catalog.usage import (
+    QUOTA_SUMMARY_PATH,
+    UsageSnapshot,
+    from_antigravity_summary,
+    from_headers,
+)
 from ..credentials import oauth
 from ..credentials.store import PROVIDER_IDS, Credential, CredentialStore, ProviderId
 from ..registry import ModelRegistry, RouterLike
+
+#: Idade a partir da qual o uso é pedido outra vez. A quota move-se em minutos; pedir a
+#: cada carregamento de página seria ruído contra o upstream sem ganho nenhum.
+USAGE_TTL_S = 120.0
 
 #: Nome legível de cada provedor, para os cards.
 PROVIDER_LABELS: dict[ProviderId, str] = {
@@ -197,6 +207,58 @@ class MySubsService:
         return renewed
 
     # -- modelos ---------------------------------------------------------------
+
+    async def fetch_usage(self, provider: ProviderId) -> UsageSnapshot:
+        """Vai buscar o uso onde ele existir.
+
+        Só o Antigravity precisa disto: Anthropic e Codex publicam o estado nos cabeçalhos
+        das respostas, que o `observe` absorve sem custo. O Antigravity não publica nada aí
+        — medido, zero cabeçalhos — mas tem o endpoint que a UI dele própria usa.
+        """
+        if provider != "google-antigravity":
+            return self.usage.get(provider) or UsageSnapshot()
+
+        credential = self._require(provider)
+        from ..catalog.discovery import ANTIGRAVITY_USER_AGENT
+        from ..transport.hosts import HOSTS
+
+        async with self.client_factory() as client:
+            for host in HOSTS:
+                try:
+                    response = await client.post(
+                        f"{host}{QUOTA_SUMMARY_PATH}",
+                        headers={
+                            "Authorization": f"Bearer {credential.access_token}",
+                            "Content-Type": "application/json",
+                            "User-Agent": ANTIGRAVITY_USER_AGENT,
+                        },
+                        json={"project": credential.project_id},
+                        timeout=30.0,
+                    )
+                except Exception:
+                    continue
+                if response.status_code == 200:
+                    snapshot = from_antigravity_summary(response.json())
+                    if snapshot.known:
+                        self.usage[provider] = snapshot
+                    return snapshot
+        # Um host em baixo não é prova de que o uso mudou: mantém-se o que já se sabia.
+        return self.usage.get(provider) or UsageSnapshot()
+
+    async def refresh_usage(self) -> None:
+        """Actualiza o uso dos provedores que o exigem, sem deixar falhar a página.
+
+        Um TTL curto evita pedir a cada carregamento: a quota move-se em minutos, não em
+        milissegundos, e um pedido por refresh de página seria ruído contra o upstream.
+        """
+        for provider in PROVIDER_IDS:
+            if provider != "google-antigravity" or self._safe_get(provider) is None:
+                continue
+            known = self.usage.get(provider)
+            if known is not None and known.age_s() < USAGE_TTL_S:
+                continue
+            with suppress(Exception):
+                await self.fetch_usage(provider)
 
     async def discover(self, provider: ProviderId) -> list[DiscoveredModel]:
         """Passo 6: lista o que a subscrição serve."""

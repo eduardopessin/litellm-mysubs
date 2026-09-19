@@ -106,6 +106,12 @@ class Bootstrap:
             try:
                 from . import plugin
 
+                # Sem isto o plugin não tem de onde tirar a credencial: `_access_token`
+                # devolve "" e o pedido sai com `Authorization: Bearer `, que o httpx
+                # recusa com `Illegal header value b'Bearer '`. O `install()` sozinho põe
+                # o patch e deixa-o inútil — e o sintoma aparece longe da causa, no cliente
+                # do provedor.
+                plugin.configure(store=store)
                 plugin.install()
                 self.patched = True
                 return True

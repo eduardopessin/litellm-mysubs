@@ -14,9 +14,9 @@ Os nomes e as formas foram **medidos** contra o proxy real, não lidos de docume
 As duas escalas diferem — o Codex dá inteiros de 0 a 100, a Anthropic uma fracção de 0 a 1
 — e tratá-las como iguais mostrava 0.24% onde são 24%.
 
-O Google Antigravity **não devolve nada disto**: medido, zero cabeçalhos de quota. Um card
-desse provedor tem de dizer que não sabe, em vez de mostrar uma barra a zero que seria lida
-como "por usar".
+O Google Antigravity **não devolve nada disto** nos cabeçalhos: medido, zero. Mas tem um
+endpoint próprio — `:retrieveUserQuotaSummary`, o mesmo que a UI dele usa — que devolve as
+janelas de 5 horas e semanal. Ver `from_antigravity_summary`.
 """
 
 from __future__ import annotations
@@ -169,3 +169,90 @@ def from_headers(
     if provider == "anthropic":
         return from_anthropic_headers(headers, now=now)
     return UsageSnapshot()
+
+
+# omp: usage/google-antigravity.ts :: RETRIEVE_USER_QUOTA_SUMMARY_PATH
+#: O endpoint que a própria UI do Antigravity usa. Ao contrário do catálogo de modelos,
+#: reporta as duas janelas mesmo quando nenhuma está esgotada.
+QUOTA_SUMMARY_PATH: Final = "/v1internal:retrieveUserQuotaSummary"
+
+#: Grupo cujo uso interessa. A conta reporta vários — "Gemini Models" e
+#: "Claude and GPT models" — e somá-los daria um número que não corresponde a limite nenhum.
+_PREFERRED_GROUP: Final = "gemini"
+
+
+# omp: usage/google-antigravity.ts :: classifyWindow
+def _classify_window(raw: str) -> str:
+    """Nome legível da janela, a partir do `window` ou do `bucketId`."""
+    lowered = raw.lower()
+    if "week" in lowered or "7d" in lowered:
+        return "7d"
+    if "5h" in lowered or "five" in lowered:
+        return "5h"
+    if "day" in lowered or "24h" in lowered:
+        return "24h"
+    return raw or "?"
+
+
+def _reset_epoch(raw: object) -> float:
+    """`2026-09-23T02:30:06Z` em epoch, ou `0.0` se não vier."""
+    if not isinstance(raw, str) or not raw:
+        return 0.0
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+# omp: usage/google-antigravity.ts :: buildQuotaSummaryReport
+def from_antigravity_summary(
+    payload: Mapping[str, Any], *, now: float | None = None
+) -> UsageSnapshot:
+    """Uso do Antigravity a partir de `:retrieveUserQuotaSummary`.
+
+    O campo é `remainingFraction` — **o inverso** do que a UI mostra. Um `0.7833` são 21.7%
+    usados, e tratá-lo como "usado" mostrava uma conta quase esgotada onde ela está a um
+    quinto do limite.
+
+    Escolhe-se o grupo do Gemini: a conta reporta vários ("Gemini Models", "Claude and GPT
+    models") e somá-los daria um número que não corresponde a limite nenhum.
+    """
+    groups = payload.get("groups") or payload.get("quotaGroups") or []
+    if not isinstance(groups, list) or not groups:
+        return UsageSnapshot()
+
+    chosen: Mapping[str, Any] | None = None
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        name = str(group.get("displayName") or "").lower()
+        if _PREFERRED_GROUP in name:
+            chosen = group
+            break
+        chosen = chosen or group
+    if chosen is None:
+        return UsageSnapshot()
+
+    windows: list[Window] = []
+    for bucket in chosen.get("buckets") or []:
+        if not isinstance(bucket, dict):
+            continue
+        remaining = bucket.get("remainingFraction")
+        if not isinstance(remaining, int | float):
+            continue
+        windows.append(
+            Window(
+                label=_classify_window(str(bucket.get("window") or bucket.get("bucketId") or "")),
+                used_percent=max(0.0, min(100.0, (1.0 - float(remaining)) * 100.0)),
+                resets_at=_reset_epoch(bucket.get("resetTime")),
+            )
+        )
+    if not windows:
+        return UsageSnapshot()
+    return UsageSnapshot(
+        windows=tuple(windows),
+        plan=str(chosen.get("displayName") or ""),
+        taken_at=time.time() if now is None else now,
+    )

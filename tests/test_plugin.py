@@ -7,6 +7,7 @@ o que o `Transport` real entrega (`AsyncIterator[dict]`, contrato em `local/CONT
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
@@ -624,3 +625,123 @@ class TestRefresh:
 
         assert token == "novo"
         assert store.reloads == 1
+
+
+class TestTokenRenewal:
+    """Renovação automática. Antes disto, um token expirado exigia carregar num botão."""
+
+    def _store(self, *, expired: bool, owns: bool = True, refresh_token: str = "RT") -> Any:
+        class Store:
+            owns_refresh = owns
+
+            def __init__(self) -> None:
+                self.credential = Credential(
+                    provider="openai-codex",
+                    access_token="AT-velho",
+                    refresh_token=refresh_token,
+                    expires_at=time.time() + (-10 if expired else 3600),
+                )
+                self.written: list[str] = []
+
+            def get(self, provider: str) -> Credential:
+                return self.credential
+
+            def set(self, provider: str, credential: Credential) -> None:
+                self.credential = credential
+                self.written.append(credential.access_token)
+
+            def delete(self, provider: str) -> None: ...
+
+            def reload(self) -> bool:
+                self.reloads += 1
+                return False
+
+        store = Store()
+        store.reloads = 0
+        return store
+
+    @pytest.fixture(autouse=True)
+    def _fake_oauth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def refresh(credential: Credential, *, client: Any, store: Any = None) -> Credential:
+            return credential.with_access_token("AT-novo", expires_at=time.time() + 3600)
+
+        monkeypatch.setattr("litellm_mysubs.credentials.oauth.refresh", refresh)
+
+    @pytest.mark.asyncio
+    async def test_an_expired_token_is_renewed_before_the_request(self) -> None:
+        """Renovar aqui, e não à espera do 401, evita uma ida ao upstream por cada token
+        que expira — e evita que um pedido em streaming falhe a meio, onde já não é
+        recuperável: o transporte só repete o que ainda não entregou."""
+        store = self._store(expired=True)
+        plugin.configure(store=store)
+        assert await plugin._access_token("codex") == "AT-novo"
+
+    @pytest.mark.asyncio
+    async def test_the_renewed_credential_is_persisted(self) -> None:
+        """Sem gravar, cada pedido gastaria um refresh token de uso único — e o segundo
+        falharia com `invalid_grant`."""
+        store = self._store(expired=True)
+        plugin.configure(store=store)
+        await plugin._access_token("codex")
+        assert store.written == ["AT-novo"]
+
+    @pytest.mark.asyncio
+    async def test_a_valid_token_is_not_renewed(self) -> None:
+        """Gastar uma rotação sem necessidade é a forma mais fácil de partir uma sessão
+        que estava boa."""
+        store = self._store(expired=False)
+        plugin.configure(store=store)
+        assert await plugin._access_token("codex") == "AT-velho"
+        assert store.written == []
+
+    @pytest.mark.asyncio
+    async def test_a_store_that_is_not_the_owner_never_rotates(self) -> None:
+        """Dois renovadores sobre tokens rotativos de uso único invalidam a cópia um do
+        outro e produzem `invalid_grant` em ciclo, forçando re-login manual."""
+        store = self._store(expired=True, owns=False)
+        plugin.configure(store=store)
+        assert await plugin._access_token("codex") == "AT-velho"
+        assert store.written == []
+
+    @pytest.mark.asyncio
+    async def test_without_a_refresh_token_there_is_nothing_to_rotate(self) -> None:
+        store = self._store(expired=True, refresh_token="")
+        plugin.configure(store=store)
+        assert await plugin._access_token("codex") == "AT-velho"
+        assert store.written == []
+
+    @pytest.mark.asyncio
+    async def test_a_valid_token_does_not_even_consult_the_provider(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Não basta devolver o token certo: não se pode falar com o provedor de todo.
+
+        Uma rotação desnecessária gasta um refresh token de uso único e transforma uma
+        sessão boa numa que precisa de re-login. O teste anterior passava mesmo com
+        `if True:` porque o `_refresh` relê a fonte antes de rodar — só contando as
+        chamadas é que a diferença aparece.
+        """
+        calls: list[str] = []
+
+        async def refresh(credential: Credential, *, client: Any, store: Any = None) -> Credential:
+            calls.append(credential.access_token)
+            return credential.with_access_token("AT-novo", expires_at=time.time() + 3600)
+
+        monkeypatch.setattr("litellm_mysubs.credentials.oauth.refresh", refresh)
+        plugin.configure(store=self._store(expired=False))
+        assert await plugin._access_token("codex") == "AT-velho"
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_valid_token_does_not_touch_the_store_source(self) -> None:
+        """Nem sequer se relê a fonte.
+
+        O `_refresh` começa por um `store.reload()` — leitura de disco ou chamada ao cofre.
+        Chamá-lo com um token válido é um I/O por pedido servido, no caminho quente. A
+        guarda `is_expired` é o que o evita, e só contar os `reload` a torna visível: o
+        resultado devolvido é o mesmo com ou sem ela.
+        """
+        store = self._store(expired=False)
+        plugin.configure(store=store)
+        await plugin._access_token("codex")
+        assert store.reloads == 0

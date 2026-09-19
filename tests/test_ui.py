@@ -15,7 +15,7 @@ from litellm_mysubs.catalog.discovery import DiscoveredModel
 from litellm_mysubs.credentials.store import Credential, ProviderId
 from litellm_mysubs.ui import mount
 from litellm_mysubs.ui.app import _UNSET as _DEFAULT_GUARD
-from litellm_mysubs.ui.auth import auth_disabled, require_admin
+from litellm_mysubs.ui.auth import auth_disabled, require_admin, session_user
 from litellm_mysubs.ui.service import MySubsService
 
 
@@ -322,3 +322,71 @@ class TestErrorPages:
         )
         assert response.status_code == 401
         assert "Sem acesso" in response.text
+
+
+class TestSessionCookie:
+    """A sessão da UI tem de servir: é assim que se chega à página pelo menu."""
+
+    def _token(self, role: str = "proxy_admin", key: str = "sk-master") -> str:
+        import jwt
+
+        return jwt.encode(
+            {"user_id": "admin", "user_role": role, "exp": int(time.time()) + 600},
+            key,
+            algorithm="HS256",
+        )
+
+    def _request(self, cookies: dict[str, str]) -> Any:
+        return SimpleNamespace(cookies=cookies)
+
+    def test_a_valid_session_identifies_the_admin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """O `user_api_key_auth` só lê cabeçalhos — verificado, nem uma referência a
+        cookies nesse módulo. A dashboard contorna-o lendo o cookie por `document.cookie`
+        e construindo o `Authorization` em JavaScript; uma página servida fora da SPA não
+        faz isso, e sem este caminho uma sessão de administrador válida dava 401.
+        """
+        import litellm.proxy.proxy_server as proxy_server
+
+        monkeypatch.setattr(proxy_server, "master_key", "sk-master", raising=False)
+        user = session_user(self._request({"token": self._token()}))
+        assert user is not None
+        assert user.user_role == "proxy_admin"
+
+    def test_a_forged_cookie_is_not_a_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """O JWT é HS256 assinado com a `master_key`: sem ela, não se forja."""
+        import litellm.proxy.proxy_server as proxy_server
+
+        monkeypatch.setattr(proxy_server, "master_key", "sk-master", raising=False)
+        assert session_user(self._request({"token": self._token(key="outra")})) is None
+        assert session_user(self._request({"token": "abc.def.ghi"})) is None
+
+    def test_an_expired_session_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import jwt
+        import litellm.proxy.proxy_server as proxy_server
+
+        monkeypatch.setattr(proxy_server, "master_key", "sk-master", raising=False)
+        stale = jwt.encode(
+            {"user_id": "a", "user_role": "proxy_admin", "exp": int(time.time()) - 10},
+            "sk-master",
+            algorithm="HS256",
+        )
+        assert session_user(self._request({"token": stale})) is None
+
+    def test_no_cookie_is_not_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Ausência de sessão devolve `None` para o caminho da chave ter a sua vez."""
+        import litellm.proxy.proxy_server as proxy_server
+
+        monkeypatch.setattr(proxy_server, "master_key", "sk-master", raising=False)
+        assert session_user(self._request({})) is None
+
+    def test_a_viewer_session_still_cannot_manage_subscriptions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ter sessão não é ter mandato: o papel continua a decidir."""
+        import litellm.proxy.proxy_server as proxy_server
+
+        monkeypatch.setattr(proxy_server, "master_key", "sk-master", raising=False)
+        user = session_user(self._request({"token": self._token(role="proxy_admin_viewer")}))
+        assert user is not None
+        with pytest.raises(Exception, match="administradores"):
+            require_admin(user)

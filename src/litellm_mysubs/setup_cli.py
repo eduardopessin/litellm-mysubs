@@ -28,6 +28,20 @@ from typing import Any
 #: A instância, não a classe: o proxy recusa uma classe com `ValueError` no arranque.
 CALLBACK_PATH = "litellm_mysubs.proxy_handler_instance"
 
+#: O item de menu é injectado num chunk que o Next.js serve com `max-age` de um ano e
+#: `immutable`. Uma entrada já em cache não volta ao servidor, por isso o `no-store` da
+#: resposta nova nunca chega a ser lido: quem já usou a UI antes de instalar continua a
+#: receber o bundle antigo, sem o botão.
+#:
+#: Podia patchar-se também o `index.html` para mudar o URL do script, mas isso é mais um
+#: ficheiro gerado a acompanhar em cada versão do LiteLLM. Uma limpeza de cache, uma vez
+#: por instalação, custa menos do que essa manutenção.
+CACHE_HINT = (
+    "Se o item não aparecer no menu, limpa a cache do browser (Ctrl+Shift+R):\n"
+    "  a UI guarda os chunks por um ano e o teu ainda é o de antes da instalação.\n"
+    "  A página funciona na mesma em <url-do-proxy>/mysubs."
+)
+
 #: Sítios onde um `config.yaml` costuma estar, por ordem de probabilidade. A variável de
 #: ambiente ganha porque é o que o container define.
 CANDIDATES: tuple[str, ...] = (
@@ -262,8 +276,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"\nFeito. Cópia do original em {backup.name}")
-    print("Reinicia o proxy e abre  <url-do-proxy>/mysubs")
-    print("\nA página exige uma chave de administrador (proxy_admin).")
+    print("\nA seguir:")
+    print("  1. reinicia o proxy")
+    print("  2. abre a UI e entra como administrador")
+    print("  3. Experimental -> MySubs")
+    print(f"\n{CACHE_HINT}")
+    print("\nA página aceita a sessão da UI; por fora, precisa de uma chave proxy_admin.")
     return 0
 
 

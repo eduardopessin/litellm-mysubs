@@ -40,6 +40,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import Any, Final, Protocol
 
+import httpx
 import litellm
 import litellm.main
 from litellm.litellm_core_utils.litellm_logging import Logging
@@ -76,6 +77,7 @@ class _State:
     __slots__ = (
         "original_acompletion",
         "original_completion",
+        "original_router_acompletion",
         "signatures",
         "step",
         "store",
@@ -85,6 +87,8 @@ class _State:
     def __init__(self) -> None:
         self.original_acompletion: Callable[..., Any] | None = None
         self.original_completion: Callable[..., Any] | None = None
+        #: O proxy encaminha por `Router.acompletion`, não pelas funções de módulo.
+        self.original_router_acompletion: Callable[..., Any] | None = None
         self.store: CredentialStore | None = None
         self.transport: Transport | None = None
         self.signatures: OrderedDict[str, str] = OrderedDict()
@@ -114,18 +118,46 @@ def _transport() -> Transport:
 
 
 async def _refresh(provider: str) -> str | None:
-    """Relê a credencial depois de um 401.
+    """Renova a credencial depois de um 401.
 
-    Não renova por sua conta: quem detém o refresh token é o store (ver a regra do dono
-    único em `credentials/store.py`). Aqui só se volta a ler a fonte, que outro processo
-    pode entretanto ter rodado.
+    Duas etapas, por esta ordem:
+
+    1. **Reler a fonte.** Outro processo — outro worker do proxy, o dashboard — pode ter
+       rodado o token entretanto. Se a leitura já trouxer um token diferente do que falhou,
+       está feito, e não se gasta o refresh token.
+    2. **Renovar**, mas só se este store for o dono. Tokens rotativos de uso único não
+       toleram dois renovadores: a regra está no topo de `credentials/store.py`, e um store
+       com `owns_refresh=False` lê e nunca troca.
+
+    Uma falha aqui devolve `None`, que o transporte traduz no erro real do upstream. Não se
+    levanta: o 401 original é mais informativo do que "falhei a renovar".
     """
     store = _state.store
     if store is None:
         return None
+
+    provider_id = _PROVIDER_IDS[provider]
     store.reload()
-    credential = store.get(_PROVIDER_IDS[provider])
-    return credential.access_token if credential else None
+    credential = store.get(provider_id)
+    if credential is None:
+        return None
+    if not credential.is_expired():
+        # A releitura trouxe algo que ainda serve: outro processo já renovou.
+        return credential.access_token
+
+    if not getattr(store, "owns_refresh", False) or not credential.refresh_token:
+        return None
+
+    try:
+        from .credentials import oauth
+
+        async with httpx.AsyncClient() as client:
+            renewed = await oauth.refresh(credential, client=client, store=store)
+    except Exception:
+        return None
+
+    store.set(provider_id, renewed)
+    return renewed.access_token
 
 
 _PROVIDER_IDS: Final[dict[str, ProviderId]] = {
@@ -135,12 +167,27 @@ _PROVIDER_IDS: Final[dict[str, ProviderId]] = {
 }
 
 
-def _access_token(provider: str) -> str:
+async def _access_token(provider: str) -> str:
+    """O token a usar no pedido, renovado antes de expirar se for preciso.
+
+    Renovar aqui em vez de esperar pelo 401 poupa uma ida ao upstream por cada token que
+    expira, e evita que um pedido em streaming falhe a meio — o transporte só repete o que
+    ainda não entregou, e um 401 depois do primeiro evento não é recuperável.
+
+    O `is_expired` do `Credential` já traz 60 segundos de folga: renova-se enquanto o token
+    ainda serve, para não haver janela entre a verificação e o pedido.
+    """
     store = _state.store
     if store is None:
         return ""
     credential = store.get(_PROVIDER_IDS[provider])
-    return credential.access_token if credential else ""
+    if credential is None:
+        return ""
+    if credential.is_expired():
+        renewed = await _refresh(provider)
+        if renewed:
+            return renewed
+    return credential.access_token
 
 
 def is_gemini_model(model: str) -> bool:
@@ -168,11 +215,11 @@ def _request_id() -> str:
     return f"agent/{_AGENT_ID}/{int(time.time() * 1000)}/{_TRAJECTORY_ID}/{_state.step}"
 
 
-def _codex_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> RequestSpec:
+async def _codex_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> RequestSpec:
     # Sem tectos de output a remover: `build_request_body` constrói o corpo de raiz e não
     # lê `max_tokens`/`max_output_tokens`/`max_completion_tokens` dos kwargs. O original
     # tinha de os apagar porque passava os kwargs adiante; aqui nunca chegam ao fio.
-    token = _access_token("codex")
+    token = await _access_token("codex")
     body = codex.build_request_body(
         model,
         messages,
@@ -190,8 +237,8 @@ def _codex_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> Reque
     return RequestSpec(url=CODEX_URL, headers=headers, body=body, provider="codex", model=model)
 
 
-def _antigravity_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> RequestSpec:
-    token = _access_token("antigravity")
+async def _antigravity_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> RequestSpec:
+    token = await _access_token("antigravity")
     store = _state.store
     credential = store.get("google-antigravity") if store else None
     body = antigravity.build_payload(
@@ -573,7 +620,7 @@ async def _pump(
 
 
 async def _codex_turn(model: str, messages: list[Any], extra: dict[str, Any]) -> ModelResponse:
-    spec = _codex_spec(model, messages, extra)
+    spec = await _codex_spec(model, messages, extra)
     turn = _Turn()
     await _drive(_transport().stream(spec), _CodexReader(turn))
     return _model_response(
@@ -587,7 +634,7 @@ async def _codex_turn(model: str, messages: list[Any], extra: dict[str, Any]) ->
 async def _antigravity_turn(
     model: str, messages: list[Any], extra: dict[str, Any]
 ) -> ModelResponse:
-    spec = _antigravity_spec(model, messages, extra)
+    spec = await _antigravity_spec(model, messages, extra)
     turn = _Turn()
     reader = _AntigravityReader(turn, wire_model=str(spec.body.get("model") or model))
     await _drive(_transport().stream(spec), reader)
@@ -602,7 +649,7 @@ async def _antigravity_turn(
 async def _codex_stream(
     model: str, messages: list[Any], extra: dict[str, Any]
 ) -> AsyncIterator[ModelResponseStream]:
-    spec = _codex_spec(model, messages, extra)
+    spec = await _codex_spec(model, messages, extra)
     turn = _Turn()
     async for chunk in _pump(_transport().stream(spec), _CodexReader(turn)):
         yield chunk
@@ -613,7 +660,7 @@ async def _codex_stream(
 async def _antigravity_stream(
     model: str, messages: list[Any], extra: dict[str, Any]
 ) -> AsyncIterator[ModelResponseStream]:
-    spec = _antigravity_spec(model, messages, extra)
+    spec = await _antigravity_spec(model, messages, extra)
     turn = _Turn()
     reader = _AntigravityReader(turn, wire_model=str(spec.body.get("model") or model))
     async for chunk in _pump(_transport().stream(spec), reader):
@@ -681,14 +728,14 @@ def _logging_obj(model: str, kwargs: dict[str, Any]) -> Logging:
     )
 
 
-def _delegate_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+async def _delegate_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Kwargs para o original, com o prompt Claude aplicado quando é um modelo Claude.
 
     É o que o ``_inject_claude_prompt`` do original faz: a subscrição Anthropic só valida
     a identidade do Claude Code como system message, e sem isto o pedido é recusado.
     """
     model = str(kwargs.get("model") or "")
-    return anthropic.build_request(kwargs, model, _access_token("anthropic"))
+    return anthropic.build_request(kwargs, model, await _access_token("anthropic"))
 
 
 async def _wrapped_acompletion(*args: Any, **kwargs: Any) -> Any:
@@ -698,7 +745,7 @@ async def _wrapped_acompletion(*args: Any, **kwargs: Any) -> Any:
         return served
     original = _state.original_acompletion
     assert original is not None
-    return await original(**_delegate_kwargs(kwargs))
+    return await original(**await _delegate_kwargs(kwargs))
 
 
 def _wrapped_completion(*args: Any, **kwargs: Any) -> Any:
@@ -714,7 +761,7 @@ def _wrapped_completion(*args: Any, **kwargs: Any) -> Any:
         return served
     original = _state.original_completion
     assert original is not None
-    return original(**_delegate_kwargs(kwargs))
+    return original(**_run_sync(_delegate_kwargs(kwargs)))
 
 
 def _run_sync(coroutine: Coroutine[Any, Any, Any]) -> Any:
@@ -753,6 +800,44 @@ _ASYNC_TARGETS: Final = ((litellm, "acompletion"), (litellm.main, "acompletion")
 _SYNC_TARGETS: Final = ((litellm, "completion"), (litellm.main, "completion"))
 
 
+def _router_class() -> Any:
+    """A classe `Router` do LiteLLM.
+
+    Importada aqui em vez de no topo: `litellm.Router` não é um export declarado e o mypy
+    recusa o acesso directo. O import local mantém o resto do módulo verificável.
+    """
+    from litellm.router import Router
+
+    return Router
+
+
+async def _wrapped_router_acompletion(
+    self: Any, model: str, messages: list[Any], stream: bool = False, **kwargs: Any
+) -> Any:
+    """O caminho que o **proxy** usa de facto.
+
+    O proxy não chama `litellm.acompletion`: chama `Router.acompletion`, que resolve o
+    deployment e constrói o cliente do provedor **antes** de qualquer função de módulo ser
+    tocada. Sem este patch, um modelo de subscrição chegava ao cliente nativo e rebentava
+    com `Illegal header value b'Bearer '` — o deployment não leva `api_key` porque a
+    credencial é OAuth e vive no store, não no `config.yaml`.
+
+    O `sitecustomize.py` original diz-o no comentário da linha 2812: *"Proxy routes through
+    Router.acompletion, not necessarily the module functions above."* O porte patchava só
+    as funções de módulo, e o sintoma só aparecia no proxy — nunca numa chamada à
+    biblioteca.
+    """
+    served = await dispatch(model=model, messages=messages, stream=stream, **kwargs)
+    if served is not None:
+        return served
+    original = _state.original_router_acompletion
+    assert original is not None
+    delegated = await _delegate_kwargs({"model": model, "messages": messages, **kwargs})
+    delegated.pop("model", None)
+    delegated.pop("messages", None)
+    return await original(self, model=model, messages=messages, stream=stream, **delegated)
+
+
 def install() -> None:
     """Aplica o patch. Idempotente.
 
@@ -764,10 +849,13 @@ def install() -> None:
         return
     _state.original_acompletion = litellm.main.acompletion
     _state.original_completion = litellm.main.completion
+    router_class = _router_class()
+    _state.original_router_acompletion = router_class.acompletion
     for module, name in _ASYNC_TARGETS:
         setattr(module, name, _wrapped_acompletion)
     for module, name in _SYNC_TARGETS:
         setattr(module, name, _wrapped_completion)
+    router_class.acompletion = _wrapped_router_acompletion
 
 
 def uninstall() -> None:
@@ -779,6 +867,9 @@ def uninstall() -> None:
     if _state.original_completion is not None:
         for module, name in _SYNC_TARGETS:
             setattr(module, name, _state.original_completion)
+    if _state.original_router_acompletion is not None:
+        _router_class().acompletion = _state.original_router_acompletion
+        _state.original_router_acompletion = None
     _state.original_acompletion = None
     _state.original_completion = None
 

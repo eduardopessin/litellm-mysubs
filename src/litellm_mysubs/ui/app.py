@@ -86,6 +86,10 @@ def build_app(service: MySubsService, *, guard: Any | None = _UNSET) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
+        # O Antigravity não publica uso nos cabeçalhos: tem de ser pedido. Uma falha aqui
+        # não pode esconder a página — os cards dos outros provedores continuam válidos, e
+        # o card dele mostra o último instantâneo conhecido com a idade.
+        await service.refresh_usage()
         return HTMLResponse(_page(service.cards(), service))
 
     @app.post("/connect/{provider}")
@@ -372,6 +376,18 @@ _SHELL = """<!doctype html>
 <html lang="pt"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MySubs</title>
+<script>
+ // Antes do CSS, de propósito: aplicar a classe depois da pintura dá um clarão branco a
+ // cada carregamento dentro de uma UI escura. O LiteLLM guarda a escolha em
+ // `localStorage.theme`; sem nada guardado, segue-se o sistema, que é o que ele faz.
+ (function () {{
+   try {{
+     var t = localStorage.getItem("theme");
+     if (!t) t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+     document.documentElement.className = t;
+   }} catch (e) {{ /* localStorage bloqueado: fica o tema claro */ }}
+ }})();
+</script>
 <style>
  :root{{
    --background:#fff; --foreground:#030712; --card:#fff; --border:#e5e7eb;
@@ -380,14 +396,16 @@ _SHELL = """<!doctype html>
    --on-bg:#e6f4ea; --on-fg:#137333; --warn-bg:#fce8e6; --warn-fg:#c5221f;
    --unk-bg:#fffbeb; --unk-fg:#b75000; --cool:#155dfc; --warm:#f99c00; --hot:#c5221f;
  }}
- @media (prefers-color-scheme: dark){{
-   :root{{
-     --background:#181818; --foreground:#f3f3f3; --card:#212121; --border:#303030;
-     --muted:#afafaf; --primary:#e7e7e7; --primary-foreground:#181818;
-     --accent:#303030; --ring:#777;
-     --on-bg:#12261a; --on-fg:#6ee7a0; --warn-bg:#2a1512; --warn-fg:#ff9e94;
-     --unk-bg:#2a2010; --unk-fg:#fcbb00;
-   }}
+ /* O LiteLLM não segue o tema do sistema: tem um interruptor próprio, que escreve
+    `localStorage.theme` e a classe `light`/`dark` no `<html>`. Usar
+    `prefers-color-scheme` aqui fazia a página ignorar essa escolha — claro dentro de uma
+    UI escura, que é pior do que não ter tema nenhum. Lê-se o mesmo sítio que ele usa. */
+ html.dark{{
+   --background:#181818; --foreground:#f3f3f3; --card:#212121; --border:#303030;
+   --muted:#afafaf; --primary:#e7e7e7; --primary-foreground:#181818;
+   --accent:#303030; --ring:#777;
+   --on-bg:#12261a; --on-fg:#6ee7a0; --warn-bg:#2a1512; --warn-fg:#ff9e94;
+   --unk-bg:#2a2010; --unk-fg:#fcbb00;
  }}
  *{{box-sizing:border-box}}
  body{{margin:0;padding:2rem 1.5rem;background:var(--background);color:var(--foreground);
