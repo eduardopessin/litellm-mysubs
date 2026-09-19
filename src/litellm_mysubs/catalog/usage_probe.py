@@ -30,7 +30,7 @@ from typing import Any, Final
 import httpx
 
 from ..credentials.store import Credential
-from ..wire.anthropic import CLAUDE_CODE_USER_AGENT
+from ..wire.anthropic import USER_AGENT
 from .usage import UsageSnapshot, from_anthropic_usage, from_codex_usage
 
 # omp: usage/claude.ts :: fetchClaudeUsage, DEFAULT_ENDPOINT
@@ -42,10 +42,13 @@ ANTHROPIC_USAGE_URL: Final = "https://api.anthropic.com/api/oauth/usage"
 #: Without the `/codex/` segment: measured, `/backend-api/codex/wham/usage` returns 403.
 CODEX_USAGE_URL: Final = "https://chatgpt.com/backend-api/wham/usage"
 
-#: The route belongs to the CLI, and the Claude Code `User-Agent` is not cosmetic: a
-#: different identity is unrecognised traffic against an endpoint only that client uses.
 #: The `oauth-2025-04-20` beta is what classifies the request as coming from an OAuth
 #: credential — without it the server treats it as an API key, which this token is not.
+#:
+#: The `User-Agent` is **not** part of that: measured against the real endpoint, this route
+#: answers 200 with the Claude Code string, with this package's own, and with no
+#: `User-Agent` at all. An earlier comment here claimed the CLI identity was required; it
+#: was never measured, and it is wrong.
 _ANTHROPIC_BETA: Final = "oauth-2025-04-20"
 
 #: Per-probe ceiling. High enough for a slow upstream, short enough not to hold the page
@@ -70,7 +73,7 @@ async def probe(credential: Credential, *, client: httpx.AsyncClient) -> UsageSn
         headers = {
             "Authorization": f"Bearer {credential.access_token}",
             "anthropic-beta": _ANTHROPIC_BETA,
-            "User-Agent": CLAUDE_CODE_USER_AGENT,
+            "User-Agent": USER_AGENT,
             "accept": "application/json",
         }
         parse = from_anthropic_usage

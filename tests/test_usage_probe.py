@@ -132,9 +132,14 @@ class TestAnthropic:
         assert snapshot.known is False
 
     @pytest.mark.asyncio
-    async def test_sends_the_measured_oauth_identity(self) -> None:
-        """The route belongs to the CLI: without the OAuth beta and the Claude Code UA it is
-        different traffic."""
+    async def test_sends_the_oauth_beta_and_its_own_identity(self) -> None:
+        """The beta is what the route gates on; the `User-Agent` is not.
+
+        Measured against the real endpoint: it answers 200 with the Claude Code string,
+        with this package's own, and with no `User-Agent` at all. The beta is the part
+        that matters — without it the server reads the token as an API key, which it is
+        not. So the identity claim is free, and the honest one ships.
+        """
         handle, seen = json_handler(ANTHROPIC_PAYLOAD)
         async with client(handle) as http:
             await probe(ANTHROPIC, client=http)
@@ -142,7 +147,8 @@ class TestAnthropic:
         headers = seen[0].headers
         assert headers["authorization"] == "Bearer tok-a"
         assert headers["anthropic-beta"] == "oauth-2025-04-20"
-        assert headers["user-agent"] == "claude-cli/2.1.257 (external, cli)"
+        assert headers["user-agent"].startswith("litellm-mysubs/")
+        assert "claude-cli" not in headers["user-agent"]
         assert headers["accept"] == "application/json"
 
 

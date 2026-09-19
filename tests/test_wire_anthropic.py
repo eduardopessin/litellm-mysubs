@@ -436,9 +436,16 @@ class TestBuildRequest:
         assert ant.EFFORT_BETA in ant.build_betas(thinking=True)
         assert ant.EFFORT_BETA not in ant.build_betas(thinking=False)
 
-    def test_user_agent_matches_the_x_app_entrypoint(self) -> None:
-        """`claude-desktop` in the UA with `x-app: cli` was an incoherent fingerprint."""
-        assert "(external, cli)" in ant.CLIENT_HEADERS["User-Agent"]
+    def test_the_user_agent_names_this_package(self) -> None:
+        """Claiming to be another program bought nothing, so it is not claimed.
+
+        Measured against the real endpoint: the `User-Agent` changes no outcome — the
+        identity block in `system` is what the subscription token is gated on. Since the
+        claim was free of consequence either way, the honest one is the one that ships.
+        """
+        agent = ant.CLIENT_HEADERS["User-Agent"]
+        assert agent.startswith("litellm-mysubs/")
+        assert "claude-cli" not in agent
         assert ant.CLIENT_HEADERS["x-app"] == "cli"
 
     def test_token_applied_when_given(self) -> None:

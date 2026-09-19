@@ -16,10 +16,19 @@ import re
 from typing import Any, Final
 
 # omp: providers/claude-code-fingerprint.ts :: claudeCodeSystemInstruction
-#: Identity block that the Claude Code runtime prepends. The measurement that existed
-#: before compared *identity vs no identity*, not *this string vs Claude Code's string* —
-#: and the string inherited from the intermediary was not the one the real CLI puts on the
-#: wire.
+#: Identity block that the Claude Code runtime prepends.
+#:
+#: **This one is not optional, and it is the only part of the fingerprint that is not.**
+#: Measured against the real endpoint, three runs each, `claude-sonnet-4-6` with
+#: `thinking` enabled: with this block the request returns 200; without it, 429
+#: `rate_limit_error` — regardless of what the `User-Agent` says. Subscription OAuth
+#: tokens are issued for this client, and the endpoint checks for it here rather than in
+#: the headers.
+#:
+#: So the package sends its own `User-Agent` (see `USER_AGENT`) and keeps this block: it
+#: claims nothing about itself that is untrue, and it does not pretend the request would
+#: work without the identity the token was issued against. Stripping it does not make the
+#: traffic more honest — it makes it fail.
 CLAUDE_CODE_PROMPT: Final = "You are Claude Code, Anthropic's official CLI for Claude."
 
 # omp: stream.ts :: ANTHROPIC_THINKING
@@ -173,13 +182,31 @@ def build_betas(*, thinking: bool) -> str:
 
 
 # omp: providers/claude-code-fingerprint.ts :: claudeCodeUserAgent
+#: The version the real CLI pins. Kept as a constant because the anchor above has to match
+#: something, and because a future measurement may show it matters again — it does not now.
 CLAUDE_CODE_VERSION: Final = "2.1.257"
-#: The entrypoint has to be `cli` to be consistent with the `x-app` that travels on the
-#: same request.
-CLAUDE_CODE_USER_AGENT: Final = f"claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"
+
+#: What this package calls itself on the wire.
+#:
+#: It used to send `claude-cli/{version} (external, cli)`, inherited from the port.
+#: Measured against the real endpoint, three runs each, `claude-sonnet-4-6` with
+#: `thinking` enabled:
+#:
+#: | User-Agent | system prompt | result |
+#: |---|---|---|
+#: | `claude-cli/2.1.257` | present | 200, 200, 200 |
+#: | `litellm-mysubs/0.1.0` | present | 200, 200, 200 |
+#: | `claude-cli/2.1.257` | absent | 429, 429, 429 |
+#: | `litellm-mysubs/0.1.0` | absent | 429, 429, 429 |
+#:
+#: The `User-Agent` changes nothing; the identity block in `system` is what the endpoint
+#: actually gates on. So the claim of being another program bought nothing, and claiming
+#: it anyway is the one thing every discussion of this mechanism asks implementations not
+#: to do. This one says what it is.
+USER_AGENT: Final = "litellm-mysubs/0.1.0 (+https://github.com/eduardopessin/litellm-mysubs)"
 
 CLIENT_HEADERS: Final[dict[str, str]] = {
-    "User-Agent": CLAUDE_CODE_USER_AGENT,
+    "User-Agent": USER_AGENT,
     "anthropic-dangerous-direct-browser-access": "true",
     "x-app": "cli",
 }
