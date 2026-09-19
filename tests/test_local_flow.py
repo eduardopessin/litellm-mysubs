@@ -264,7 +264,7 @@ class TestPortReleased:
         await settle()
         first_task = flow._tasks["anthropic"]
 
-        # The user pressed «Connect» again: new `state`, and the old server would sit
+        # The user pressed "Connect" again: new `state`, and the old server would sit
         # waiting for a `state` that never arrives, holding the port.
         request = auth_request(port, state="second")
         assert flow.start("anthropic", request).started

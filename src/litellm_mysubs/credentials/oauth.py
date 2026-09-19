@@ -172,10 +172,10 @@ _CODEX: Final = _Provider(
 # omp: compat/rules/auth/anthropic.kdl :: OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl
 # omp: compat/rules/auth/anthropic.kdl :: scopes, pkce, callback, credential
 _ANTHROPIC: Final = _Provider(
-    # Public client id, kept as base64 in the rule so that secret scanners do not fire.
-    # Decoded here because a base64 literal in the code would be worse: a divergence would
-    # go unnoticed.
-    client_id=base64.b64decode("OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl").decode(),
+    # Public client id of the Claude Code CLI, the same for every user of it. The OMP rule
+    # stores it base64-encoded so that secret scanners stay quiet; here it is in plain
+    # sight, because hiding a public constant only misleads whoever reads the file next.
+    client_id="9d1c250a-e61b-44d9-88ed-5944d1962f5e",
     authorize_url="https://claude.ai/oauth/authorize",
     token_url="https://api.anthropic.com/v1/oauth/token",
     # `user:inference` is what grants direct inference with an OAuth token. The
@@ -206,18 +206,25 @@ _ANTHROPIC: Final = _Provider(
     expiry_skew_s=300.0,
 )
 
-# The client id and the secret are base64 in the OMP rule; the anchors point at a prefix of
-# each, which is what fits on one line without breaking the substring check.
-# omp: compat/rules/auth/google-antigravity.kdl :: access_type, prompt, scopes, callback
+# The client id and the secret below are **not** secrets of whoever runs this proxy: they
+# identify the Antigravity desktop client itself and are the same for every user of it,
+# extracted from the shipped binary. A native OAuth client cannot keep a secret — it runs
+# on the user's machine — which is why Google issues these for installed applications and
+# why the flow's actual security is the browser consent plus the `state` check, not this
+# value. They sit here in plain sight, like the Codex client id above, because obfuscating
+# a public constant only misleads the next person to read the file.
+# The two anchors below still carry the base64 prefixes: that is the form the credentials
+# have in the OMP rule, and the anchor has to match what is there, not what we decoded.
 # omp: compat/rules/auth/google-antigravity.kdl :: MTA3MTAwNjA2MDU5MS10bWhzc2lu
 # omp: compat/rules/auth/google-antigravity.kdl :: R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNY
+# omp: compat/rules/auth/google-antigravity.kdl :: access_type, prompt, scopes, callback
 # omp: providers/google-auth.ts :: OAUTH_TOKEN_URL
 # omp= providers/google-auth.ts :: OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _ANTIGRAVITY: Final = _Provider(
-    client_id=base64.b64decode(
-        "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ=="
-    ).decode(),
-    client_secret=base64.b64decode("R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=").decode(),
+    client_id=(
+        "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+    ),
+    client_secret="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",
     authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
     token_url="https://oauth2.googleapis.com/token",
     scopes=(
