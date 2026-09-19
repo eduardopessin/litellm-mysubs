@@ -61,6 +61,9 @@ def session_user(request: Any) -> Any | None:
         return None
 
     try:
+        # `jwt` arrives with the proxy, not with this package: LiteLLM ships it and signs
+        # the UI session cookie with it. Declaring it as our dependency would install PyJWT
+        # for people who never mount the UI, so the import stays guarded.
         import jwt
         from litellm.proxy.proxy_server import master_key
     except ImportError:  # pragma: no cover - depends on the proxy environment

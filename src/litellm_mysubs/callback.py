@@ -20,7 +20,7 @@ meddling with the routing of models that are not ours.
 from __future__ import annotations
 
 import contextlib
-from typing import Any
+from typing import Any, cast
 
 from .bootstrap import Bootstrap, disabled
 from .credentials.store import ProviderId
@@ -38,9 +38,12 @@ def _base() -> type:
     drag in the whole package.
     """
     try:
+        # Without LiteLLM's stubs `CustomLogger` resolves to `Any`, and returning `Any`
+        # from a `-> type` function is an error under `--strict`. The cast states what the
+        # symbol is: a class, whatever the type checker can see of it.
         from litellm.integrations.custom_logger import CustomLogger
 
-        return CustomLogger
+        return cast(type, CustomLogger)
     except ImportError:
         return object
 

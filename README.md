@@ -34,7 +34,12 @@ pip install litellm-mysubs && mysubs-setup
 2. Restart the proxy.
 3. Open the LiteLLM UI as an admin and go to **Experimental → MySubs** (or go straight to
    `<proxy-url>/mysubs`).
-4. Press **Connect** on a provider card and follow the login.
+
+<img src="docs/menu.png" alt="The MySubs entry under Experimental in the LiteLLM sidebar" width="300">
+
+4. Press **Connect** on a provider card, follow the login, then pick the models you want.
+
+![The MySubs page, with the three provider cards and their quota windows](docs/mysubs.png)
 
 The single line `mysubs-setup` adds:
 
@@ -47,13 +52,26 @@ It does not touch `model_list`, `router_settings` or `general_settings` — rout
 already configured is not the installer's business. It leaves the original at
 `config.yaml.mysubs-bak` and refuses to write a file that would no longer load.
 
-![The MySubs page, with the three provider cards and their quota windows](docs/mysubs.png)
+### What you end up with
+
+The models you applied appear in **Models + Endpoints** like any other deployment — same
+table, same virtual keys, same cost tracking. The subscription is no longer a separate
+thing your clients have to know about.
+
+![The applied models listed in the LiteLLM Models page, with per-token costs](docs/models.png)
+
+Every one is callable straight away:
+
+```bash
+curl $PROXY/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  -d '{"model":"mysubs/claudecode/claude-opus-5","messages":[{"role":"user","content":"hi"}]}'
+```
 
 ## How connecting works
 
 1. **Press Connect.** The card opens the provider's login page in your browser.
 2. **Authenticate** with the provider as usual.
-3. **Return the result.** Two paths, both ending in the same place — see below.
+3. **Return the result.** Paste the URL your browser ends up on — see below.
 4. **Discovery runs.** The page probes each candidate model against your account and shows
    what actually answered. Nothing is listed as available unless the upstream replied.
 5. **Pick and apply.** The selected models are injected into the LiteLLM Router under the
@@ -62,29 +80,40 @@ already configured is not the installer's business. It leaves the original at
 Tokens are then refreshed in the background, with a `flock` held across processes so that
 multiple proxy workers never race on the same rotating refresh token.
 
-### Why there are two return paths
+### Returning the result
 
 These OAuth clients register `http://localhost:54545/callback` (and `:1455`, `:51121`) as
-their redirect. `localhost` resolves in the **browser**, so the callback port has to be open
-on the machine you are browsing from — and the proxy usually runs somewhere else.
+their redirect. `localhost` resolves in the **browser**, so that port would have to be open
+on the machine you are browsing from — and the proxy usually runs somewhere else. The
+redirect therefore lands on a page that cannot load. That is expected, and the page tells
+you so before you start.
 
-**Local command (transparent).** The page issues a pairing code; you run the command it
-shows on the machine with the browser:
+**Paste the URL.** Copy whatever is in the address bar after you authenticate — the
+`This site can't be reached` one — and paste it into the box on the page. The authorization
+code is in it. This is the default path, it needs nothing installed anywhere, and it works
+over SSH, from a phone, or on a machine with no browser at all.
+
+<details>
+<summary><b>Optional: skip the paste with a local command</b></summary>
+
+If you would rather not copy anything, the page also issues a pairing code for a helper you
+run on the machine with the browser:
 
 ```bash
 pip install litellm-mysubs
 mysubs-login anthropic --url https://your-proxy --code XXXX-XXXX-XXXX
 ```
 
-It opens the loopback port the provider requires, catches the code from the redirect, and
-deposits the credential in the proxy. Nothing is copied by hand. If LiteLLM runs on your own
-machine, drop `--url` and `--code` — it writes straight to the local store.
+It opens the loopback port the provider expects, catches the redirect itself, and deposits
+the credential in the proxy. The page notices and moves on by itself.
 
-The pairing code lives ten minutes, is single-use, and authorises exactly one provider. That
-is what keeps the proxy admin key off your command line.
+The pairing code lives ten minutes, is single-use, and authorises exactly one provider —
+that is what keeps the proxy admin key off your command line.
 
-**Paste (always works).** Authenticate, then paste the return URL — or just the code — back
-into the page. Survives an occupied port, SSH without a tunnel, or a machine with no browser.
+If LiteLLM runs on your own machine, drop `--url` and `--code`: it writes straight to the
+local store.
+
+</details>
 
 ## What is guaranteed
 
