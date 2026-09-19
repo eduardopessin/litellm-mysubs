@@ -8,6 +8,19 @@ OpenAI-compatible models through [LiteLLM](https://github.com/BerriAI/litellm).
 [![CI](https://github.com/eduardopessin/litellm-mysubs/actions/workflows/ci.yml/badge.svg)](https://github.com/eduardopessin/litellm-mysubs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+> **Read this before installing.** This is a personal tool, for your own subscription, on
+> your own machine. It signs in with the provider's OAuth flow and keeps the resulting
+> token so the proxy can use it — which is not how these providers expect subscription
+> credentials to be used. Anthropic's, OpenAI's and Google's terms on subscription
+> authentication are theirs to write and to change: read them and decide for yourself.
+> Enforcement, if it comes, lands on your account.
+>
+> Not affiliated with, endorsed by, or connected to Anthropic, OpenAI or Google. Nothing
+> here is legal advice, and the MIT licence means exactly what it says about warranty.
+>
+> If you are looking for something to put in front of other people, use API keys. That is
+> what they are for, and every provider supports them in LiteLLM already.
+
 ## The problem
 
 A subscription is not an API key, and the difference is not cosmetic:
