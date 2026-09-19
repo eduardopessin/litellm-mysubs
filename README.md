@@ -37,9 +37,14 @@ pip install litellm-mysubs && mysubs-setup
 
 <img src="docs/menu.png" alt="The MySubs entry under Experimental in the LiteLLM sidebar" width="300">
 
-4. Press **Connect** on a provider card, follow the login, then pick the models you want.
+4. Press **Connect** on a provider card, sign in, and paste back the URL your browser
+   lands on.
 
-![The MySubs page, with the three provider cards and their quota windows](docs/mysubs.png)
+![The MySubs page as it looks before anything is connected: three provider cards, each with a Connect button and a box to paste the return URL](docs/mysubs-empty.png)
+
+5. Pick the models you want and apply. Connected cards show the quota the provider reports:
+
+![The same page with all three subscriptions connected, each showing its quota windows and usage](docs/mysubs.png)
 
 The single line `mysubs-setup` adds:
 
