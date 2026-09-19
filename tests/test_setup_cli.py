@@ -44,6 +44,8 @@ class TestPatchShapes:
             ("inline", 'litellm_settings:\n  callbacks: ["prometheus"]\n'),
             ("empty inline", "litellm_settings:\n  callbacks: []\n"),
             ("settings without callbacks", "litellm_settings:\n  drop_params: true\n"),
+            ("settings as an inline empty mapping", "litellm_settings: {}\n"),
+            ("settings as a null key", "litellm_settings:\n"),
             ("no settings", "model_list:\n  - model_name: x\n"),
         ],
     )
@@ -206,3 +208,27 @@ class TestRealWorldConfigs:
         target.write_text("model_list: []\n")
         assert _create_config(target) == target
         assert target.read_text() == "model_list: []\n", "replaced an existing file"
+
+
+class TestWhatTheUserIsTold:
+    """What `mysubs-setup` prints is the whole interface at that moment.
+
+    Found by installing from a clean clone into an empty `HOME`: the run ended with
+    "Already connected. Nothing to do." on a machine with no credential at all. The line
+    was about the callback being in `config.yaml`, but nobody reads it that way — it sends
+    someone with a fresh install looking for a subscription they never connected.
+    """
+
+    def test_a_second_run_does_not_claim_a_subscription_is_connected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        config = tmp_path / "config.yaml"
+        config.write_text(patch_text("litellm_settings: {}\n"), "utf-8")
+        monkeypatch.setenv("LITELLM_CONFIG", str(config))
+
+        assert main(["--yes"]) == 0
+
+        out = capsys.readouterr().out
+        assert "callback is already in" in out
+        assert "connected" not in out.lower().split("connect a subscription")[0], out
+        assert "/mysubs" in out, "the user is still told where to go next"

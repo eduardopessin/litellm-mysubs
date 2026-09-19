@@ -174,11 +174,23 @@ def patch_text(original: str) -> str:
         return "\n".join(lines) + ("\n" if original.endswith("\n") else "")
 
     for index, line in enumerate(lines):
-        if line.strip().startswith("litellm_settings:"):
-            indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        if not stripped.startswith("litellm_settings:"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        value = stripped[len("litellm_settings:") :].strip()
+        if value in ("{}", "{ }"):
+            # `litellm_settings: {}` is an inline empty mapping. Appending an indented
+            # `callbacks:` under it produces a block mapping inside a flow mapping, which
+            # does not parse — measured: the setup then refused to write and left the user
+            # with an unexplained error. Replacing the `{}` with the key is the whole fix.
+            lines[index] = f"{' ' * indent}litellm_settings:"
             lines.insert(index + 1, f"{' ' * (indent + 2)}callbacks:")
             lines.insert(index + 2, f"{' ' * (indent + 4)}- {entry}")
             return "\n".join(lines) + ("\n" if original.endswith("\n") else "")
+        lines.insert(index + 1, f"{' ' * (indent + 2)}callbacks:")
+        lines.insert(index + 2, f"{' ' * (indent + 4)}- {entry}")
+        return "\n".join(lines) + ("\n" if original.endswith("\n") else "")
 
     tail = "" if original.endswith("\n") or not original else "\n"
     return original + tail + f"\nlitellm_settings:\n  callbacks:\n    - {entry}\n"
@@ -301,8 +313,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if already_installed(config):
-        print("\nAlready connected. Nothing to do.")
-        print("The page is at  <proxy-url>/mysubs")
+        # "Connected" would be read as "a subscription is connected", which this does not
+        # check — it only looks for the callback line. On a fresh install the two are
+        # opposite states, and saying the wrong one sends the user looking for a problem
+        # that is not there.
+        print(f"\nThe callback is already in {config_path.name}. Nothing to change.")
+        print("Next: restart the proxy, then connect a subscription at <proxy-url>/mysubs")
         return 0
 
     models = len(config.get("model_list") or [])
