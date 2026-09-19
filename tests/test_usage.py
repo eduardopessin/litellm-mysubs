@@ -1,8 +1,8 @@
-"""Contabilidade de tokens e desfecho de turno.
+"""Token accounting and turn outcome.
 
-O que não for reportado aqui perde-se: o LiteLLM cai para estimativas e os cache hits
-desaparecem do `/spend/logs`. Numa conta de subscrição, cache invisível é a diferença
-entre saber e não saber porque a quota acabou.
+Whatever is not reported here is lost: LiteLLM falls back to estimates and the cache hits
+disappear from `/spend/logs`. On a subscription account, invisible cache is the difference
+between knowing and not knowing why the quota ran out.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from litellm_mysubs.wire.usage import (
 
 class TestGoogleUsage:
     def test_cached_tokens_are_not_double_counted(self) -> None:
-        """promptTokenCount inclui os cached; somá-los outra vez inflaciona a factura."""
+        """promptTokenCount includes the cached ones; adding them again inflates the bill."""
         usage = google_usage(
             {
                 "promptTokenCount": 1000,
@@ -45,7 +45,7 @@ class TestGoogleUsage:
 
 class TestCodexUsage:
     def test_input_tokens_are_not_reduced_by_cache(self) -> None:
-        """Ao contrário do Google: subtrair aqui subcontaria o prompt."""
+        """Unlike Google: subtracting here would undercount the prompt."""
         usage = codex_usage({"input_tokens": 1000, "input_tokens_details": {"cached_tokens": 400}})
         assert usage.prompt_tokens == 1000
         assert usage.cached_tokens == 400
@@ -66,12 +66,12 @@ class TestMakeUsage:
         assert make_usage(prompt_tokens=10, completion_tokens=5).total_tokens == 15
 
     def test_explicit_total_wins(self) -> None:
-        """O upstream sabe melhor: pode incluir tokens que não discriminámos."""
+        """Upstream knows better: it may include tokens we did not break down."""
         assert make_usage(prompt_tokens=10, completion_tokens=5, total_tokens=99).total_tokens == 99
 
-    @pytest.mark.parametrize("value", [None, "", "nao-e-numero", -5])
+    @pytest.mark.parametrize("value", [None, "", "not-a-number", -5])
     def test_junk_becomes_zero(self, value: object) -> None:
-        """Um contador partido não pode rebentar a contabilidade do turno."""
+        """A broken counter must not blow up the turn accounting."""
         assert make_usage(prompt_tokens=value).prompt_tokens == 0
 
 
@@ -80,11 +80,11 @@ class TestGoogleFinishReason:
         assert google_finish_reason("STOP", has_tool_calls=True) == "tool_calls"
 
     def test_max_tokens_is_truncation(self) -> None:
-        """Sem isto, um corte por limite chegava como resposta normal e curta."""
+        """Without this, a cut-off by limit arrived as a normal, short answer."""
         assert google_finish_reason("MAX_TOKENS", has_tool_calls=False) == "length"
 
     def test_max_tokens_with_pending_tool_call(self) -> None:
-        """A chamada ainda é o desfecho do turno, mesmo com o limite atingido."""
+        """The call is still the turn outcome, even with the limit reached."""
         assert google_finish_reason("MAX_TOKENS", has_tool_calls=True) == "tool_calls"
 
     @pytest.mark.parametrize(
@@ -94,7 +94,7 @@ class TestGoogleFinishReason:
             "RECITATION",
             "PROHIBITED_CONTENT",
             "MALFORMED_FUNCTION_CALL",
-            # As cinco que faltavam quando se enumerava o erro em vez do sucesso.
+            # The five that were missing when the error was enumerated instead of success.
             "FINISH_REASON_UNSPECIFIED",
             "LANGUAGE",
             "IMAGE_OTHER",
@@ -103,21 +103,21 @@ class TestGoogleFinishReason:
         ],
     )
     def test_server_side_blocks_surface_as_content_filter(self, reason: str) -> None:
-        """O único valor OpenAI que não mente sobre um corte imposto pelo servidor."""
+        """The only OpenAI value that does not lie about a server-imposed cut-off."""
         assert google_finish_reason(reason, has_tool_calls=False) == "content_filter"
 
     def test_unknown_reason_is_an_error_not_a_stop(self) -> None:
-        """O OMP enumera o que é normal e trata o resto como erro.
+        """OMP enumerates what is normal and treats the rest as an error.
 
-        Uma razão nova do upstream tratada como `stop` entrega uma resposta cortada como
-        se estivesse completa. Tratada como erro, no pior caso é ruidosa de mais.
+        A new upstream reason treated as `stop` delivers a truncated answer as if it were
+        complete. Treated as an error, at worst it is too noisy.
         """
-        assert google_finish_reason("RAZAO_QUE_AINDA_NAO_EXISTE", has_tool_calls=False) == (
+        assert google_finish_reason("REASON_THAT_DOES_NOT_EXIST_YET", has_tool_calls=False) == (
             "content_filter"
         )
 
     def test_blocked_reason_is_not_masked_by_tool_calls(self) -> None:
-        """Um bloqueio de segurança não pode passar por tool_calls."""
+        """A safety block must not pass as tool_calls."""
         assert google_finish_reason("SAFETY", has_tool_calls=True) == "content_filter"
 
     @pytest.mark.parametrize("reason", [None, "", "STOP"])

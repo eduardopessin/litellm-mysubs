@@ -1,12 +1,11 @@
-"""Wire protocol do Google Antigravity (Cloud Code API).
+"""Google Antigravity (Cloud Code API) wire protocol.
 
-Extraído sem alteração de comportamento do ``sitecustomize.py`` original. Constrói o
-envelope de ``:streamGenerateContent``; o transporte (SSE, failover de host, catálogo)
-fica fora.
+Extracted from the original ``sitecustomize.py`` with no behaviour change. Builds the
+``:streamGenerateContent`` envelope; transport (SSE, host failover, catalog) stays out.
 
-Duas dependências injectadas em vez de globais: a busca de media por URL
-(``fetch_url``) e o catálogo (``ModelCatalog``). É o que permite construir o payload
-inteiro sem rede — o original chamava ``httpx.get`` a meio da conversão.
+Two injected dependencies instead of globals: media fetching by URL (``fetch_url``) and the
+catalog (``ModelCatalog``). That is what makes the whole payload buildable without the
+network — the original called ``httpx.get`` in the middle of the conversion.
 """
 
 from __future__ import annotations
@@ -22,24 +21,24 @@ from typing import Any, Final, NamedTuple
 from .antigravity_models import ModelCatalog, base_family, map_model, supports_function_ids
 from .schema import normalize_for_cca
 
-# Limite de bytes para inlinar media. O backend aceita bem além disto, mas um pedido que
-# arraste dezenas de MB por turno é um problema de latência e de janela, não de capacidade.
+# Byte limit for inlining media. The backend accepts well beyond this, but a request that
+# drags tens of MB per turn is a latency and context-window problem, not a capacity one.
 INLINE_MAX_BYTES: Final = 12 * 1024 * 1024
 FETCH_TIMEOUT_S: Final = 20.0
 FETCH_USER_AGENT: Final = "Mozilla/5.0 (X11; Linux x86_64) litellm-mysubs-antigravity/1.0"
 
 DATA_URI_RE: Final = re.compile(r"^data:([^;,]+)(;[^,]*)?,(.*)$", re.S)
 
-# URIs que o `fileData` aceita: Files API do Gemini e GCS. Um URL da web não serve —
-# medido: `fileData` com https://upload.wikimedia.org/... devolve "404 Requested entity was
-# not found", logo esses têm de ser buscados e inlinados por nós.
+# URIs that `fileData` accepts: the Gemini Files API and GCS. A web URL does not work —
+# measured: `fileData` with https://upload.wikimedia.org/... returns "404 Requested entity
+# was not found", so those have to be fetched and inlined by us.
 FILE_URI_PREFIXES: Final[tuple[str, ...]] = (
     "gs://",
     "https://generativelanguage.googleapis.com/",
 )
 
 # omp: stream.ts :: mapEffortToGoogleThinkingLevel
-# Effort -> thinkingLevel do Gemini 3 (o dialecto 2.x usa thinkingBudget).
+# Effort -> Gemini 3 thinkingLevel (the 2.x dialect uses thinkingBudget).
 THINKING_LEVEL: Final[dict[str, str]] = {
     "minimal": "MINIMAL",
     "low": "LOW",
@@ -49,24 +48,24 @@ THINKING_LEVEL: Final[dict[str, str]] = {
     "max": "HIGH",
 }
 
-#: Nível usado para **suprimir** o raciocínio. O OMP manda `{level: "MINIMAL"}` ou
-#: `{budget: 0}`; mandar `LOW` ou o `minThinkingBudget` do catálogo (que para várias
-#: variantes não é zero) continua a gastar orçamento — e com `includeThoughts: false` os
-#: tokens são facturados sem o texto voltar.
+#: Level used to **suppress** reasoning. omp sends `{level: "MINIMAL"}` or `{budget: 0}`;
+#: sending `LOW` or the catalog's `minThinkingBudget` (which for several variants is not
+#: zero) still spends budget — and with `includeThoughts: false` the tokens are billed
+#: without the text coming back.
 SUPPRESSED_THINKING_LEVEL: Final = "MINIMAL"
 
 DEFAULT_MAX_OUTPUT_TOKENS: Final = 64000
 
 # omp: providers/google-shared.ts :: SKIP_THOUGHT_SIGNATURE
-#: O CCA exige a sentinela quando a **primeira** chamada de um turno assistant vai sem
-#: assinatura; chamadas seguintes do mesmo turno ficam nuas.
+#: The CCA requires the sentinel when the **first** call of an assistant turn goes without
+#: a signature; later calls in the same turn go bare.
 SIGNATURE_SENTINEL: Final = "skip_thought_signature_validator"
 
-#: Texto de um tool result que só traz imagem.
+#: Text of a tool result that carries nothing but an image.
 IMAGE_ONLY_RESULT: Final = "(see attached image)"
 
-#: Assinaturas de raciocínio são base64 com padding. Uma string que não case dá 400 do
-#: CCA — e como é truthy, impedia a sentinela de salvar o pedido.
+#: Reasoning signatures are padded base64. A string that does not match gets a 400 from the
+#: CCA — and being truthy, it kept the sentinel from rescuing the request.
 _BASE64_SIGNATURE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 
 
@@ -79,37 +78,127 @@ def is_valid_signature(signature: object) -> bool:
 TEXT_PART_TYPES: Final[tuple[str, ...]] = ("text", "input_text", "output_text")
 
 # omp: providers/vision-guard.ts :: NON_VISION_IMAGE_PLACEHOLDER
-#: Mandar uma imagem a um modelo sem vision dá 400. Descartá-la em silêncio era pior: o
-#: modelo respondia sobre conteúdo que não recebeu. O placeholder di-lo em texto.
+#: Sending an image to a model without vision gives a 400. Dropping it silently was worse:
+#: the model answered about content it never received. The placeholder says so in text.
 NON_VISION_IMAGE_PLACEHOLDER: Final = "[image omitted: model does not support vision]"
 
-#: Um surrogate não codifica em UTF-8 e rebenta o payload.
+#: A surrogate does not encode as UTF-8 and blows up the payload.
 #:
-#: Diferença de linguagem que importa: em JavaScript um par `\ud83d\ude00` **é** um
-#: caractere (😀) e o `toWellFormed()` preserva-o, substituindo só os órfãos. Em Python
-#: são dois code points separados e nenhum deles codifica — um par "válido" continua a
-#: rebentar `str.encode("utf-8")` e o `json.dumps(..., ensure_ascii=False)` que muitos
-#: clientes HTTP usam. Aqui substituem-se **todos**, não apenas os órfãos.
+#: Language difference that matters: in JavaScript a `\ud83d\ude00` pair **is** one
+#: character (😀) and `toWellFormed()` preserves it, replacing only the lone ones. In Python
+#: they are two separate code points and neither encodes — a "valid" pair still blows up
+#: `str.encode("utf-8")` and the `json.dumps(..., ensure_ascii=False)` that many HTTP
+#: clients use. Here **all** of them are replaced, not just the lone ones.
 _SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 
 # omp: providers/google-shared.ts :: convertMessages
 def well_formed(text: object) -> str:
-    """Texto codificável em UTF-8, pronto para o fio.
+    """UTF-8-encodable text, ready for the wire.
 
-    Equivalente ao ``toWellFormed()`` do OMP, adaptado à semântica do Python: lá o par
-    sobrevive porque forma um caractere, aqui não forma nenhum e teria de rebentar na
-    serialização.
+    Equivalent to omp's ``toWellFormed()``, adapted to Python semantics: there the pair
+    survives because it forms one character, here it forms none and would have to blow up
+    during serialization.
     """
     return _SURROGATE.sub("\ufffd", str(text))
 
 
 class MediaTooLargeError(Exception):
-    """Media acima do limite de inline."""
+    """Media above the inlining limit."""
 
 
 class MediaFetchError(Exception):
-    """Não foi possível obter a media que o backend não aceita por URL."""
+    """The media the backend does not accept by URL could not be fetched."""
+
+
+#: Markers of the notice a retired model returns **instead** of an answer. Measured on the
+#: real account, with HTTP 200 and `finishReason: STOP`:
+#:
+#:     "Gemini 3.5 Flash is no longer available. Please switch to Gemini 3.7 Flash in the
+#:      latest version of Antigravity."
+#:
+#: Stored lowercase and compared lowercase: upstream has already changed the casing of the
+#: sentence between client versions, and a case-sensitive `in` would stop catching the
+#: notice without anything failing visibly.
+RETIREMENT_MARKERS: Final[tuple[str, ...]] = ("is no longer available", "please switch to")
+
+#: Counts the CCA returns in `usageMetadata`. A retired model comes back with all of them at
+#: zero (measured: `total_tokens=0`) because no model ran — not even the prompt was billed.
+_USAGE_COUNTS: Final[tuple[str, ...]] = (
+    "totalTokenCount",
+    "promptTokenCount",
+    "candidatesTokenCount",
+    "thoughtsTokenCount",
+    "cachedContentTokenCount",
+)
+
+
+class ModelRetiredError(Exception):
+    """Upstream accepted the request but the model no longer exists.
+
+    Its own type so that whoever catches it can tell this apart from a transport failure: a
+    network failure is worth retrying, a retired model never answers again — what you do is
+    migrate to the name the notice itself points at.
+    """
+
+    def __init__(self, wire_model: str, notice: str) -> None:
+        super().__init__(
+            f"Google Antigravity: {wire_model} has been retired — the upstream returned "
+            f"200 with a notice and zero tokens instead of running the model. "
+            f"Upstream: {notice.strip()!r}"
+        )
+        #: Name that went on the wire, for anyone wanting to mark it bad in the registry.
+        self.wire_model = wire_model
+        #: Upstream text exactly as it came: it is what says where to migrate.
+        self.notice = notice
+
+
+def is_retirement_notice(text: object) -> bool:
+    """The text has the shape of the retirement notice.
+
+    This alone is **not** proof: a legitimate answer discussing retired models would match
+    the same markers. See `is_retired_response`.
+    """
+    lowered = str(text or "").lower()
+    return all(marker in lowered for marker in RETIREMENT_MARKERS)
+
+
+def usage_is_zero(meta: Mapping[str, Any] | None) -> bool:
+    """No tokens counted — the request never got to run on a model.
+
+    This alone is not proof either: a turn that returns only a tool call, or an empty
+    answer, can arrive without counts.
+    """
+    if not meta:
+        return True
+    return not any(int(meta.get(key) or 0) > 0 for key in _USAGE_COUNTS)
+
+
+def is_retired_response(text: object, usage_meta: Mapping[str, Any] | None) -> bool:
+    """Retired-model response: notice text **and** zero usage.
+
+    Both conditions are required because each alone errs in a different direction: by text
+    you would catch a genuine answer about retired models (which came with billed tokens),
+    by usage you would catch any legitimate empty answer. It is the conjunction that
+    separates the guard from the false positive.
+
+    Note the proof is always the **response**, never the name. Measured on the same account:
+    `gemini-3.5-flash-lite` answers ("2 + 2 = 4", 12 tokens) while `-low` and `-extra-low`
+    are dead; `tab_flash_lite_preview` answers and `tab_jump_flash_lite_preview` gives 400.
+    A prefix rule killed good models and let the dead ones through.
+    """
+    return is_retirement_notice(text) and usage_is_zero(usage_meta)
+
+
+def raise_if_retired(text: object, usage_meta: Mapping[str, Any] | None, wire_model: str) -> None:
+    """Raises `ModelRetiredError` if the response is the retirement notice.
+
+    It has to run **before** the text is emitted: accepted as an answer, the notice enters
+    the conversation history as if the model had spoken. That is worse than an error — an
+    error is at least visible.
+    """
+    if is_retired_response(text, usage_meta):
+        raise ModelRetiredError(wire_model, str(text))
 
 
 class FetchedMedia(NamedTuple):
@@ -117,19 +206,20 @@ class FetchedMedia(NamedTuple):
     content: bytes
 
 
-#: Assinatura de quem vai buscar um URL. Injectada para o payload ser construível sem rede.
+#: Signature of whoever fetches a URL. Injected so the payload is buildable without network.
 UrlFetcher = Callable[[str], FetchedMedia]
 
 
 def _reject_fetch(url: str) -> FetchedMedia:
     raise MediaFetchError(
-        f"Google Antigravity: a media em {url[:120]} teria de ser buscada e inlinada "
-        f"(o backend não aceita URLs da web em fileData), mas não foi fornecido um fetcher"
+        f"Google Antigravity: the media at {url[:120]} would have to be fetched and "
+        f"inlined (the backend does not accept web URLs in fileData), but no fetcher "
+        f"was provided"
     )
 
 
 def normalize_effort(value: object) -> tuple[str | None, str | None]:
-    """Devolve ``(effort, summary)``; ver a mesma função em ``wire.anthropic``."""
+    """Returns ``(effort, summary)``; see the same function in ``wire.anthropic``."""
     if isinstance(value, dict):
         effort = value.get("effort")
         summary = value.get("summary")
@@ -150,8 +240,8 @@ def inline_part(mime: str | None, raw: bytes) -> dict[str, Any] | None:
         return None
     if len(raw) > INLINE_MAX_BYTES:
         raise MediaTooLargeError(
-            f"Google Antigravity: media de {len(raw)} bytes excede o limite "
-            f"de {INLINE_MAX_BYTES} para inlinar"
+            f"Google Antigravity: media of {len(raw)} bytes exceeds the "
+            f"{INLINE_MAX_BYTES} limit for inlining"
         )
     return {
         "inlineData": {
@@ -164,12 +254,12 @@ def inline_part(mime: str | None, raw: bytes) -> dict[str, Any] | None:
 def media_from_url(
     url: object, mime_hint: str | None = None, fetch: UrlFetcher | None = None
 ) -> dict[str, Any] | None:
-    """``inlineData`` a partir de um data URI, ``fileData`` de um URI aceite, ou fetch.
+    """``inlineData`` from a data URI, ``fileData`` from an accepted URI, or a fetch.
 
-    Medido no backend: ``inlineData.data`` tem de ser base64 nu (o prefixo
-    ``data:...;base64,`` dá 400 "Invalid value at ... inline_data.data"), e o ``mimeType``
-    é respeitado — um PDF inlinado com ``application/pdf`` foi lido (devolveu a palavra
-    que estava na página).
+    Measured on the backend: ``inlineData.data`` has to be bare base64 (the
+    ``data:...;base64,`` prefix gives 400 "Invalid value at ... inline_data.data"), and the
+    ``mimeType`` is honoured — a PDF inlined with ``application/pdf`` was read (it returned
+    the word that was on the page).
     """
     text = str(url or "")
 
@@ -191,7 +281,7 @@ def media_from_url(
         fetched = (fetch or _reject_fetch)(text)
         return inline_part(fetched.mime or mime_hint or "application/octet-stream", fetched.content)
 
-    # Base64 nu, que alguns clientes enviam sem prefixo.
+    # Bare base64, which some clients send with no prefix.
     if len(text) > 64 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", text):
         try:
             return inline_part(mime_hint or "image/png", base64.b64decode(text, validate=False))
@@ -200,8 +290,8 @@ def media_from_url(
     return None
 
 
-#: Tipos de bloco que carregam uma imagem — os únicos que a guarda de vision filtra. Um
-#: PDF ou áudio não passa pelo caminho de vision do backend.
+#: Block types that carry an image — the only ones the vision guard filters. A PDF or audio
+#: does not go through the backend's vision path.
 IMAGE_PART_TYPES: Final[tuple[str, ...]] = ("image_url", "input_image")
 
 
@@ -209,11 +299,11 @@ IMAGE_PART_TYPES: Final[tuple[str, ...]] = ("image_url", "input_image")
 def media_part(
     part: dict[str, Any], fetch: UrlFetcher | None = None, *, supports_images: bool = True
 ) -> dict[str, Any] | None:
-    """Converte uma parte multimodal do shape OpenAI.
+    """Converts a multimodal part in the OpenAI shape.
 
-    Sem isto, um pedido com imagem chegava ao modelo apenas com o texto e a resposta falava
-    de uma imagem que ele nunca viu. A ponte do Codex já tratava isto, logo a assimetria
-    não era intencional.
+    Without this, a request with an image reached the model with only the text and the
+    answer talked about an image it never saw. The Codex bridge already handled this, so the
+    asymmetry was not intentional.
     """
     kind = part.get("type")
 
@@ -250,11 +340,11 @@ def media_part(
 def content_parts(
     content: object, fetch: UrlFetcher | None = None, *, supports_images: bool = True
 ) -> list[dict[str, Any]]:
-    """Partes de um turno, com texto e media preservados pela ordem de entrada.
+    """Parts of a turn, with text and media preserved in input order.
 
-    Um bloco de texto vazio ou só com espaços não gera ``part``: a fonte diz que "can cause
-    issues with some models (e.g. Claude via Antigravity)", e um ``{"text": " "}`` não
-    transporta informação nenhuma para pagar esse risco.
+    A text block that is empty or whitespace-only produces no ``part``: the source says it
+    "can cause issues with some models (e.g. Claude via Antigravity)", and a
+    ``{"text": " "}`` carries no information to pay for that risk.
     """
     if not isinstance(content, list):
         text = well_formed(content) if content is not None else ""
@@ -286,13 +376,13 @@ def content_parts(
 def tools_to_declarations(
     model: str, tools: list[Any] | None
 ) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]]]:
-    """Declarações de função no dialecto do Antigravity.
+    """Function declarations in the Antigravity dialect.
 
-    Todas as declarações vão em ``parameters`` com o schema saneado — ``model`` fica só
-    para contexto de erro. O ``parametersJsonSchema`` nunca chega ao fio deste backend:
-    o Cloud Code Assist recusa com 400 os construtos que o JSON Schema completo permite
-    (``anyOf``, ``oneOf``, ``not``, ``$ref``, ``type: ["string", "null"]``, ``const``), e
-    mandá-los crus fazia o pedido falhar em vez de o schema ser normalizado.
+    Every declaration goes in ``parameters`` with the sanitized schema — ``model`` is there
+    only for error context. ``parametersJsonSchema`` never reaches this backend's wire:
+    Cloud Code Assist refuses with 400 the constructs full JSON Schema allows (``anyOf``,
+    ``oneOf``, ``not``, ``$ref``, ``type: ["string", "null"]``, ``const``), and sending them
+    raw made the request fail instead of the schema being normalized.
     """
     if not tools:
         return None, []
@@ -319,8 +409,8 @@ def tools_to_declarations(
 
 
 def tool_config(choice: object, declarations: list[dict[str, Any]]) -> dict[str, Any]:
-    """``VALIDATED`` por default: o backend valida a chamada contra o schema antes de a
-    emitir."""
+    """``VALIDATED`` by default: the backend validates the call against the schema before
+    emitting it."""
     if choice in (None, "auto"):
         return {"functionCallingConfig": {"mode": "VALIDATED"}}
     if choice == "none":
@@ -340,20 +430,20 @@ def tool_config(choice: object, declarations: list[dict[str, Any]]) -> dict[str,
 def tool_result_value(
     message: dict[str, Any], fetch: UrlFetcher | None = None, *, supports_images: bool = True
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    """Texto do resultado e a media que vai à parte, em ``functionResponse.parts``.
+    """Result text and the media that rides along, in ``functionResponse.parts``.
 
-    Medido: uma imagem dentro de ``functionResponse.parts`` é vista pelo modelo em todas as
-    gerações que esta conta serve — gemini-3.8-flash, 3.1-pro, 3.1-flash-lite, 2.5-flash,
-    2.5-flash-lite e pro-agent responderam todos "Azul" a uma captura azul devolvida por
-    uma tool. O omp só usa a forma inline no Gemini 3+ e nos anteriores manda a imagem num
-    turno user seguinte, porque a API pública antiga rejeita-a; no Antigravity não é
-    preciso, e é um turno sintético a menos no histórico.
+    Measured: an image inside ``functionResponse.parts`` is seen by the model on every
+    generation this account serves — gemini-3.8-flash, 3.1-pro, 3.1-flash-lite, 2.5-flash,
+    2.5-flash-lite and pro-agent all answered "Azul" (blue) to a blue screenshot returned by
+    a tool. omp only uses the inline form on Gemini 3+ and on earlier ones sends the image
+    in a following user turn, because the old public API rejects it; on Antigravity that is
+    unnecessary, and it is one synthetic turn less in the history.
     """
     content = message.get("content")
     omitted_image = False
     if isinstance(content, list):
-        # Separador entre partes: sem ele a última palavra de uma cola-se à primeira da
-        # seguinte e o modelo lê duas frases como uma.
+        # Separator between parts: without it the last word of one sticks to the first of
+        # the next and the model reads two sentences as one.
         text = "\n".join(
             well_formed(part.get("text", ""))
             for part in content
@@ -376,12 +466,12 @@ def tool_result_value(
         media = []
 
     if omitted_image:
-        # Sem a nota o modelo lê um resultado que cala a imagem que a tool devolveu, e
-        # responde como se ela não existisse.
+        # Without the note the model reads a result that omits the image the tool returned,
+        # and answers as if it did not exist.
         text = "\n".join(x for x in (text, NON_VISION_IMAGE_PLACEHOLDER) if x)
     elif not text and media:
-        # Um resultado só com imagem tem de dizer alguma coisa: `output: ""` é lido como
-        # tool sem resultado, e o modelo tende a repetir a chamada.
+        # A result with nothing but an image has to say something: `output: ""` is read as a
+        # tool with no result, and the model tends to repeat the call.
         text = IMAGE_ONLY_RESULT
     value = {"error" if message.get("is_error") else "output": text}
     return value, media
@@ -391,20 +481,19 @@ def tool_result_value(
 
 
 def _thinking_config(effort: str, info: Mapping[str, Any]) -> dict[str, Any]:
-    """Omitir ``thinkingConfig`` faz o CCA reaplicar os defaults do servidor e facturar
-    thinking tokens sem devolver o texto.
+    """Omitting ``thinkingConfig`` makes the CCA reapply the server defaults and bill
+    thinking tokens without returning the text.
 
-    O Antigravity usa transporte por *budget*; o ``thinkingLevel`` é o dialecto do
-    gemini-cli. Com catálogo usa-se o ``thinkingBudget`` anunciado para a variante
-    (-low 1000, -medium 4000, -high -1 = dinâmico, pro-agent 10001) e o
-    ``minThinkingBudget`` para desligar. Sem catálogo cai-se no ``thinkingLevel``, que
-    também é aceite.
+    Antigravity uses *budget* transport; ``thinkingLevel`` is the gemini-cli dialect. With a
+    catalog, the ``thinkingBudget`` advertised for the variant is used (-low 1000,
+    -medium 4000, -high -1 = dynamic, pro-agent 10001) plus ``minThinkingBudget`` to turn it
+    off. Without a catalog it falls back to ``thinkingLevel``, which is also accepted.
     """
     budget = info.get("thinkingBudget")
 
     if effort == "none":
-        # Suprimir é orçamento zero, não o mínimo do catálogo: com `includeThoughts: False`
-        # um orçamento positivo é facturado sem devolver texto nenhum.
+        # Suppressing means zero budget, not the catalog minimum: with
+        # `includeThoughts: False` a positive budget is billed without returning any text.
         config: dict[str, Any] = {"includeThoughts": False}
         if isinstance(budget, int):
             config["thinkingBudget"] = 0
@@ -432,10 +521,10 @@ def build_payload(
     thought_signatures: Mapping[str, str] | None = None,
     supports_images: bool = True,
 ) -> dict[str, Any]:
-    """Envelope de ``:streamGenerateContent``.
+    """``:streamGenerateContent`` envelope.
 
-    ``request_id`` entra por argumento: tem o formato ``agent/<id>/<ts>/<traj>/<passo>`` e
-    é estado de sessão, não algo que a conversão deva inventar.
+    ``request_id`` comes in as an argument: it has the form ``agent/<id>/<ts>/<traj>/<step>``
+    and is session state, not something the conversion should invent.
     """
     extra = extra or {}
     signatures = thought_signatures or {}
@@ -443,7 +532,8 @@ def build_payload(
     mapped_model = map_model(model, effort or None, catalog)
     supports_ids = supports_function_ids(model)
 
-    # O nome da função não viaja no tool result do formato OpenAI; recolhe-se das chamadas.
+    # The function name does not travel in the OpenAI-shaped tool result; collect it from
+    # the calls.
     tool_names: dict[str, str] = {}
     for message in messages:
         if not isinstance(message, dict):
@@ -491,9 +581,9 @@ def build_payload(
             continue
 
         if role == "assistant":
-            # A sentinela é por **turno**, não por pedido: o CCA exige-a sempre que a
-            # primeira chamada de um turno assistant vai sem assinatura. Marcá-la uma vez
-            # só deixava os turnos seguintes com chamadas nuas e 400 na validação.
+            # The sentinel is per **turn**, not per request: the CCA requires it whenever the
+            # first call of an assistant turn goes without a signature. Marking it only once
+            # left later turns with bare calls and a 400 at validation.
             first_tool_call = True
             for tool_call in message.get("tool_calls") or []:
                 function = tool_call.get("function") or {}
@@ -513,8 +603,8 @@ def build_payload(
                     function_call["id"] = call_id
                 part: dict[str, Any] = {"functionCall": function_call}
 
-                # Só se reenvia uma assinatura que seja base64 válido: uma string
-                # arbitrária dá 400 e, por ser truthy, impedia a sentinela de a salvar.
+                # Only a signature that is valid base64 is resent: an arbitrary string gives
+                # a 400 and, being truthy, kept the sentinel from rescuing it.
                 candidate = next(
                     (
                         value
@@ -542,8 +632,8 @@ def build_payload(
             contents.append({"role": "user", "parts": parts})
     flush()
 
-    # O OMP envia max_completion_tokens (estilo OpenAI); aceitar ambas as grafias, senão o
-    # tecto de output que o cliente pediu é substituído em silêncio pelo default.
+    # omp sends max_completion_tokens (OpenAI style); accept both spellings, otherwise the
+    # output ceiling the client asked for is silently replaced by the default.
     max_tokens = (
         extra.get("max_tokens") or extra.get("max_completion_tokens") or DEFAULT_MAX_OUTPUT_TOKENS
     )
@@ -556,8 +646,8 @@ def build_payload(
         },
     }
 
-    # O campo nativo é aceite com role "user" e sem limite prático de tamanho — verificado
-    # com 2520 chars: HTTP 200.
+    # The native field is accepted with role "user" and with no practical size limit —
+    # verified with 2520 chars: HTTP 200.
     if system_parts:
         request["systemInstruction"] = {"role": "user", "parts": system_parts}
 
@@ -580,19 +670,25 @@ __all__ = [
     "DEFAULT_MAX_OUTPUT_TOKENS",
     "INLINE_MAX_BYTES",
     "NON_VISION_IMAGE_PLACEHOLDER",
+    "RETIREMENT_MARKERS",
     "SIGNATURE_SENTINEL",
     "FetchedMedia",
     "MediaFetchError",
     "MediaTooLargeError",
+    "ModelRetiredError",
     "base_family",
     "build_payload",
     "content_parts",
     "inline_part",
+    "is_retired_response",
+    "is_retirement_notice",
     "media_from_url",
     "media_part",
     "normalize_effort",
+    "raise_if_retired",
     "tool_config",
     "tool_result_value",
     "tools_to_declarations",
+    "usage_is_zero",
     "well_formed",
 ]

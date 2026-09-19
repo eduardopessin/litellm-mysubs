@@ -1,18 +1,18 @@
-"""Saneamento do JSON Schema das ferramentas para o Cloud Code Assist.
+"""Tool JSON Schema sanitization for Cloud Code Assist.
 
-Porte de ``utils/schema/normalize.ts`` — só o caminho CCA (``normalizeSchemaForCCA``) e o
-fecho transitivo do que ela usa.
+Port of ``utils/schema/normalize.ts`` — only the CCA path (``normalizeSchemaForCCA``) and
+the transitive closure of what it uses.
 
-O backend do Cloud Code Assist faz protojson sobre um `Schema` proto fechado: qualquer
-campo que não caiba no proto devolve 400 com "Cannot find field", e as formas de
-composição (``anyOf``/``oneOf``/``allOf``/``not``/``$ref``) e ``type: ["string","null"]``
-não têm sequer representação. Mandar o schema do cliente cru faz o pedido inteiro falhar,
-não só a ferramenta — daí sanear antes de escrever no fio.
+The Cloud Code Assist backend runs protojson over a closed `Schema` proto: any field that
+does not fit the proto returns 400 with "Cannot find field", and the composition forms
+(``anyOf``/``oneOf``/``allOf``/``not``/``$ref``) and ``type: ["string","null"]`` have no
+representation at all. Sending the client's schema raw makes the whole request fail, not
+just the tool — hence sanitizing before writing to the wire.
 
-A estratégia é sempre **alargar**, nunca estreitar: um schema demasiado permissivo deixa o
-modelo produzir um argumento que a ferramenta rejeita depois; um schema estreitado de mais
-impede-o de sequer o tentar. Quando nem alargar chega, cai-se no schema vazio
-``{"type": "object", "properties": {}}`` — perde-se a tipagem, mas a chamada passa.
+The strategy is always to **widen**, never to narrow: an over-permissive schema lets the
+model produce an argument the tool then rejects; an over-narrowed one stops it from even
+trying. When widening is not enough either, it falls back to the empty schema
+``{"type": "object", "properties": {}}`` — typing is lost, but the call goes through.
 """
 
 from __future__ import annotations
@@ -23,9 +23,9 @@ from typing import Any, Final
 
 JsonObject = dict[str, Any]
 
-#: Campos que o proto Schema da Google não tem. Recursos de draft 2020-12 (``$dynamicRef``),
-#: pointers (``$ref``), anotações (``deprecated``, ``readOnly``) e toda a validação fina —
-#: protojson rejeita o nome desconhecido antes sequer de olhar para o valor.
+#: Fields Google's Schema proto does not have. Draft 2020-12 features (``$dynamicRef``),
+#: pointers (``$ref``), annotations (``deprecated``, ``readOnly``) and all fine-grained
+#: validation — protojson rejects the unknown name before it even looks at the value.
 # omp: utils/schema/fields.ts :: UNSUPPORTED_SCHEMA_FIELDS
 UNSUPPORTED_SCHEMA_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -63,9 +63,9 @@ UNSUPPORTED_SCHEMA_FIELDS: Final[frozenset[str]] = frozenset(
     }
 )
 
-#: Dos campos removidos, estes dizem algo ao modelo em linguagem natural. Vão para a
-#: ``description`` porque um ``minLength: 3`` apagado em silêncio custa uma chamada
-#: rejeitada que o modelo não tem como prever.
+#: Of the removed fields, these say something to the model in natural language. They move
+#: into ``description`` because a silently dropped ``minLength: 3`` costs a rejected call
+#: the model has no way to predict.
 # omp: utils/schema/fields.ts :: LIFTABLE_TO_DESCRIPTION_FIELDS
 LIFTABLE_TO_DESCRIPTION_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -152,13 +152,13 @@ CLOUD_CODE_ASSIST_SHARED_SCHEMA_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 
-#: O schema com que se substitui um que não dê para sanear. Objecto sem propriedades: o
-#: modelo perde a tipagem dos argumentos mas a ferramenta continua a existir no catálogo.
+#: The schema a non-sanitizable one is replaced with. An object with no properties: the
+#: model loses argument typing but the tool still exists in the catalog.
 # omp: utils/schema/normalize.ts :: CLOUD_CODE_ASSIST_CLAUDE_FALLBACK_SCHEMA
 CCA_FALLBACK_SCHEMA: Final[JsonObject] = {"type": "object", "properties": {}}
 
-#: python-genai renomeia estas chaves antes de serializar; o proto só conhece a forma
-#: camelCase, por isso um ``any_of`` que passasse cru seria descartado em silêncio.
+#: python-genai renames these keys before serializing; the proto only knows the camelCase
+#: form, so an ``any_of`` passed raw would be silently discarded.
 # omp: utils/schema/normalize.ts :: SNAKE_TO_CAMEL_RENAMES
 SNAKE_TO_CAMEL_RENAMES: Final[dict[str, str]] = {
     "additional_properties": "additionalProperties",
@@ -173,8 +173,8 @@ JSON_SCHEMA_COMBINERS: Final[tuple[str, str]] = ("anyOf", "oneOf")
 # omp: utils/schema/normalize.ts :: SCHEMA_COMPOSITION_COMBINERS
 SCHEMA_COMPOSITION_COMBINERS: Final[tuple[str, str, str]] = ("allOf", "anyOf", "oneOf")
 
-#: Palavras-chave cujo valor é *um* subschema. Um ``True``/``False`` cru aqui é um boolean
-#: subschema de draft 2020-12, não um valor literal.
+#: Keywords whose value is *one* subschema. A raw ``True``/``False`` here is a draft 2020-12
+#: boolean subschema, not a literal value.
 # omp: utils/schema/normalize.ts :: SUBSCHEMA_VALUE_KEYS
 SUBSCHEMA_VALUE_KEYS: Final[frozenset[str]] = frozenset(
     {
@@ -220,7 +220,7 @@ SUBSCHEMA_MAP_KEYS: Final[frozenset[str]] = frozenset(
 
 JSON_SCHEMA_DRAFT_2020_12_URI: Final = "https://json-schema.org/draft/2020-12/schema"
 
-#: Tanto a forma canónica com ``#`` como a sem — o Zod emite uma, os servidores MCP a outra.
+#: Both the canonical form with ``#`` and the one without — Zod emits one, MCP servers the other.
 # omp: utils/schema/draft.ts :: DRAFT_07_SCHEMA_URIS
 DRAFT_07_SCHEMA_URIS: Final[frozenset[str]] = frozenset(
     {
@@ -240,8 +240,8 @@ DRAFT_SCHEMA_MAP_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 
-#: Descer por aqui corromperia a carga: ``type: ["string","null"]`` é um valor, não um
-#: subschema, e um ``enum`` de objectos seria reescrito como se fossem schemas.
+#: Descending through these would corrupt the payload: ``type: ["string","null"]`` is a
+#: value, not a subschema, and an ``enum`` of objects would be rewritten as if they were schemas.
 # omp: utils/schema/draft.ts :: NON_SCHEMA_VALUE_KEYS
 NON_SCHEMA_VALUE_KEYS: Final[frozenset[str]] = frozenset(
     {
@@ -259,8 +259,8 @@ NON_SCHEMA_VALUE_KEYS: Final[frozenset[str]] = frozenset(
 
 # omp: utils/schema/equality.ts :: areJsonValuesEqual
 def _json_equal(left: object, right: object) -> bool:
-    """Igualdade estrutural. ``==`` do Python trata ``True == 1`` como verdadeiro, o que
-    fundiria um ``enum: [true]`` com um ``enum: [1]`` e perderia um membro."""
+    """Structural equality. Python's ``==`` treats ``True == 1`` as true, which would merge
+    an ``enum: [true]`` with an ``enum: [1]`` and lose a member."""
     if isinstance(left, bool) or isinstance(right, bool):
         return left is right
     if isinstance(left, list) or isinstance(right, list):
@@ -284,8 +284,8 @@ def _convert_ref(value: str) -> str:
 
 # omp: utils/schema/draft.ts :: combineSchemas
 def _combine_schemas(left: object, right: object) -> object:
-    """Intersecção. ``allOf`` é o único modo de manter ambas as restrições quando as
-    chaves de ``dependencies`` colidem — descartar uma perderia validação."""
+    """Intersection. ``allOf`` is the only way to keep both constraints when the keys of
+    ``dependencies`` collide — discarding one would lose validation."""
     if left is None or left is True:
         return right
     if right is None or right is True:
@@ -326,9 +326,9 @@ def _has_null_type(type_value: object) -> bool:
 
 # omp: utils/schema/draft.ts :: makeNullable
 def _make_nullable(schema: JsonObject) -> JsonObject:
-    """``nullable: true`` do OpenAPI 3.0 não existe em 2020-12; a forma equivalente
-    depende do que o nó já declara, e envolver sempre em ``anyOf`` criaria um combinador
-    onde bastava alargar o ``type``."""
+    """OpenAPI 3.0's ``nullable: true`` does not exist in 2020-12; the equivalent form
+    depends on what the node already declares, and always wrapping in ``anyOf`` would create
+    a combiner where widening ``type`` was enough."""
     type_value = schema.get("type")
     if isinstance(type_value, str):
         if type_value != "null":
@@ -349,8 +349,8 @@ def _make_nullable(schema: JsonObject) -> JsonObject:
 
 # omp: utils/schema/draft.ts :: upgradeJsonSchemaTo202012Impl
 def _upgrade_node(value: object, cache: dict[int, Any]) -> object:
-    """A cache é semeada **antes** da recursão para que uma aresta de retorno num grafo
-    cíclico resolva para a referência em construção em vez de entrar em ciclo infinito."""
+    """The cache is seeded **before** the recursion so that a back edge in a cyclic graph
+    resolves to the reference under construction instead of looping forever."""
     if isinstance(value, list):
         cached_list = cache.get(id(value))
         if cached_list is not None:
@@ -428,8 +428,8 @@ def _upgrade_node(value: object, cache: dict[int, Any]) -> object:
 
 # omp: utils/schema/draft.ts :: convertDependencies
 def _convert_dependencies(source: JsonObject, target: JsonObject, cache: dict[int, Any]) -> None:
-    """Draft-07 mistura dependências de array e de schema sob uma chave; 2020-12 separa-as
-    em ``dependentRequired`` e ``dependentSchemas``."""
+    """Draft-07 mixes array and schema dependencies under one key; 2020-12 splits them into
+    ``dependentRequired`` and ``dependentSchemas``."""
     dependencies = source.get("dependencies")
     if not isinstance(dependencies, dict):
         return
@@ -483,7 +483,7 @@ def _dereference_node(node: object, root: JsonObject, visiting: set[str]) -> obj
 
     ref = node.get("$ref")
     if isinstance(ref, str):
-        # Um ciclo de `$ref` inlinado nunca termina; `{}` corta-o mantendo o nó válido.
+        # An inlined `$ref` cycle never terminates; `{}` cuts it while keeping the node valid.
         if ref in visiting:
             return {}
         resolved = _resolve_local_ref(ref, root)
@@ -495,8 +495,8 @@ def _dereference_node(node: object, root: JsonObject, visiting: set[str]) -> obj
         siblings = [k for k in node if k != "$ref"]
         if not siblings or not isinstance(inlined, dict):
             return inlined
-        # Em 2020-12 as chaves irmãs de `$ref` são válidas e mais específicas que a
-        # definição apontada, por isso ganham.
+        # In 2020-12 keys sibling to `$ref` are valid and more specific than the definition
+        # pointed at, so they win.
         merged: JsonObject = {**inlined, **node}
         merged.pop("$ref", None)
         return merged
@@ -524,39 +524,40 @@ def dereference_schema(schema: object) -> object:
 
 
 # ---------------------------------------------------------------------------
-# Spill para description (utils/schema/spill.ts)
+# Spill into description (utils/schema/spill.ts)
 # ---------------------------------------------------------------------------
 
 
 # omp: utils/schema/spill.ts :: spillToDescription
 def _spill_to_description(node: JsonObject, entries: list[tuple[str, Any]]) -> None:
-    """Junta as restrições removidas ao fim da ``description``.
+    """Appends the removed constraints to the end of ``description``.
 
-    Formato "spill": um objecto JSON por nó, separado por linha em branco do texto
-    existente. Concatenar sem separador tornaria a restrição indistinguível da prosa.
+    "Spill" format: one JSON object per node, separated from the existing text by a blank
+    line. Concatenating without a separator would make the constraint indistinguishable from
+    the prose.
     """
     if not entries:
         return
     existing = node.get("description")
     existing_text = existing if isinstance(existing, str) else ""
-    # Separadores compactos: é o que `JSON.stringify` produz, e a descrição vai contar
-    # para a janela de contexto de cada chamada.
+    # Compact separators: that is what `JSON.stringify` produces, and the description counts
+    # against the context window of every call.
     body = ", ".join(f"{key}: {json.dumps(value, separators=(',', ':'))}" for key, value in entries)
     formatted = f"{{{body}}}"
     node["description"] = f"{existing_text}\n\n{formatted}" if existing_text else formatted
 
 
 # ---------------------------------------------------------------------------
-# Colapso de combinadores (utils/schema/normalize.ts, utils/schema/equality.ts)
+# Combiner collapse (utils/schema/normalize.ts, utils/schema/equality.ts)
 # ---------------------------------------------------------------------------
 
 
 # omp: utils/schema/normalize.ts :: classifySchemaChild
 def _classify_schema_child(key: str, value: object, inside_schema_map: bool) -> str | None:
-    """Só os filhos que são de facto JSON Schema; uma carga de instância fica opaca.
+    """Only the children that really are JSON Schema; an instance payload stays opaque.
 
-    Dentro de um mapa (``properties``) as chaves são nomes escolhidos pelo utilizador: uma
-    propriedade chamada ``items`` é um schema por ser valor do mapa, não pela palavra.
+    Inside a map (``properties``) the keys are user-chosen names: a property called
+    ``items`` is a schema because it is a map value, not because of the word.
     """
     if inside_schema_map:
         return "schema"
@@ -577,8 +578,9 @@ def _copy_without(schema: JsonObject, key: str) -> JsonObject:
 
 # omp: utils/schema/equality.ts :: mergeCompatibleEnumSchemas
 def _merge_compatible_enum_schemas(existing: object, incoming: object) -> JsonObject | None:
-    """União dos membros só quando os ramos concordam em ``type`` e em tudo o que não é
-    ``enum``. Discordar e fundir à mesma trocaria a descrição de um ramo pela do outro."""
+    """Union of the members only when the branches agree on ``type`` and on everything that
+    is not ``enum``. Merging despite disagreement would swap one branch's description for
+    the other's."""
     if not isinstance(existing, dict) or not isinstance(incoming, dict):
         return None
     existing_enum = existing.get("enum")
@@ -603,8 +605,8 @@ def _merge_compatible_enum_schemas(existing: object, incoming: object) -> JsonOb
 
 # omp: utils/schema/equality.ts :: mergePropertySchemas
 def _merge_property_schemas(existing: object, incoming: object) -> object:
-    """Duas definições da mesma propriedade em ramos diferentes: aceitar ambas. Escolher
-    uma rejeitaria argumentos válidos do outro ramo."""
+    """Two definitions of the same property in different branches: accept both. Picking one
+    would reject valid arguments from the other branch."""
     if _json_equal(existing, incoming):
         return existing
     merged_enum = _merge_compatible_enum_schemas(existing, incoming)
@@ -636,11 +638,11 @@ def _merge_descriptions(existing: object, incoming: object) -> str:
 
 # omp: utils/schema/normalize.ts :: mergeObjectCombinerVariants
 def _merge_object_combiner_variants(schema: JsonObject, combiner: str) -> JsonObject:
-    """Ramos todos de forma objecto fundem-se numa união de ``properties``.
+    """Branches that are all object-shaped merge into a union of ``properties``.
 
-    É a única projecção que não perde propriedades: colapsar para o primeiro ramo deixaria
-    o modelo sem saber que os campos dos outros existem. O ``required`` é que tem de
-    encolher — ver abaixo.
+    It is the only projection that loses no properties: collapsing to the first branch would
+    leave the model unaware that the other branches' fields exist. It is ``required`` that
+    has to shrink — see below.
     """
     variants_raw = schema.get(combiner)
     if not isinstance(variants_raw, list) or not variants_raw:
@@ -689,15 +691,15 @@ def _merge_object_combiner_variants(schema: JsonObject, combiner: str) -> JsonOb
         for variant in variants
     ]
     if combiner == "allOf":
-        # `allOf` exige todos os ramos, por isso a união não estreita a aceitação.
+        # `allOf` requires every branch, so the union does not narrow acceptance.
         combined_required: list[str] = []
         for required in branch_required:
             for name in required:
                 if name not in combined_required:
                     combined_required.append(name)
     else:
-        # `anyOf`/`oneOf` aceitam um ramo qualquer: só o que TODOS exigem se mantém
-        # obrigatório, senão a projecção rejeitaria instâncias que o original aceita.
+        # `anyOf`/`oneOf` accept any one branch: only what ALL of them require stays
+        # required, otherwise the projection would reject instances the original accepts.
         intersection: list[str] | None = None
         for required in branch_required:
             if intersection is None:
@@ -726,12 +728,12 @@ def _merge_object_combiner_variants(schema: JsonObject, combiner: str) -> JsonOb
 
 # omp: utils/schema/normalize.ts :: collapseMixedTypeCombinerVariants
 def _collapse_mixed_type_combiner_variants(schema: JsonObject, combiner: str) -> JsonObject:
-    """União de tipos diferentes (``string`` ou ``number``) colapsa para um só tipo.
+    """A union of different types (``string`` or ``number``) collapses to a single type.
 
-    O proto do CCA tem um campo ``type`` escalar: não há forma de exprimir a união. Só se
-    colapsa quando os ramos não se contradizem em mais nada, senão perder-se-ia restrição
-    sem aviso — nesse caso devolve-se o schema intacto e o teste de resíduos manda-o para
-    o fallback.
+    The CCA proto has a scalar ``type`` field: there is no way to express the union. It only
+    collapses when the branches contradict each other in nothing else, otherwise constraint
+    would be lost without warning — in that case the schema is returned intact and the
+    residual test sends it to the fallback.
     """
     variants_raw = schema.get(combiner)
     if not isinstance(variants_raw, list) or not variants_raw:
@@ -759,7 +761,7 @@ def _collapse_mixed_type_combiner_variants(schema: JsonObject, combiner: str) ->
             if key in merged_variant_fields and not _json_equal(existing, variant_value):
                 if key != "description":
                     return schema
-                # Descrições são anotação, não estrutura: juntar não muda a aceitação.
+                # Descriptions are annotation, not structure: merging does not change acceptance.
                 merged_variant_fields[key] = _merge_descriptions(existing, variant_value)
                 continue
             merged_variant_fields[key] = variant_value
@@ -775,8 +777,8 @@ def _collapse_mixed_type_combiner_variants(schema: JsonObject, combiner: str) ->
     next_schema["type"] = chosen_type
     chosen_allowed = CLOUD_CODE_ASSIST_TYPE_SPECIFIC_KEYS.get(chosen_type, frozenset())
 
-    # Um `items` herdado do pai num nó agora tipado `string` é um campo que o proto não
-    # aceita naquela posição — protojson 400a mesmo sendo ele próprio válido.
+    # An `items` inherited from the parent on a node now typed `string` is a field the proto
+    # does not accept in that position — protojson 400s even though it is valid in itself.
     for key in list(next_schema):
         if key == "type":
             continue
@@ -803,7 +805,7 @@ def _collapse_mixed_type_combiner_variants(schema: JsonObject, combiner: str) ->
 
 # omp: utils/schema/normalize.ts :: collapseSameTypeCombinerVariants
 def _collapse_same_type_combiner_variants(schema: JsonObject, combiner: str) -> JsonObject:
-    """Ramos todos do mesmo ``type`` colapsam num só nó."""
+    """Branches that are all of the same ``type`` collapse into a single node."""
     variants_raw = schema.get(combiner)
     if not isinstance(variants_raw, list) or not variants_raw:
         return schema
@@ -823,8 +825,8 @@ def _collapse_same_type_combiner_variants(schema: JsonObject, combiner: str) -> 
 
     collapsed: JsonObject
     if enum_variant_count == len(variants):
-        # Ficar-se pelo primeiro ramo apagaria os membros dos outros: um `anyOf` de dois
-        # enums de string colapsava para metade dos valores legais.
+        # Stopping at the first branch would erase the other branches' members: an `anyOf` of
+        # two string enums collapsed to half the legal values.
         merged: JsonObject | None = first_entry
         for variant in variants[1:]:
             if merged is None:
@@ -834,8 +836,8 @@ def _collapse_same_type_combiner_variants(schema: JsonObject, combiner: str) -> 
             return schema
         collapsed = merged
     elif enum_variant_count > 0:
-        # Há um ramo sem `enum`, logo mais lato. Colapsar para ele mantém a aceitação;
-        # colapsar para um ramo enum estreitaria aos seus membros.
+        # There is a branch with no `enum`, hence wider. Collapsing to it preserves
+        # acceptance; collapsing to an enum branch would narrow to its members.
         collapsed = next((v for v in variants if not isinstance(v.get("enum"), list)), first_entry)
     else:
         collapsed = first_entry
@@ -848,13 +850,13 @@ def _collapse_same_type_combiner_variants(schema: JsonObject, combiner: str) -> 
 
 
 class _Seen:
-    """Conjunto de visitados por identidade, que **retém** cada objecto marcado.
+    """Identity-keyed visited set that **retains** every object it marks.
 
-    ``id()`` do CPython é o endereço: um dicionário temporário libertado a meio da travessia
-    devolve o mesmo ``id`` ao seguinte, e um ``set[int]`` cru declarava-o já visitado. Na
-    prática isso truncava propriedades para ``{}`` de forma dependente do alocador — a
-    diferenciação contra o TS apanhou 18 casos em 600 antes desta retenção. O
-    ``WeakMap`` do original não tem o problema porque a chave é o objecto vivo.
+    CPython's ``id()`` is the address: a temporary dict freed mid-traversal hands the same
+    ``id`` to the next one, and a bare ``set[int]`` declared it already visited. In practice
+    that truncated properties to ``{}`` in an allocator-dependent way — differential testing
+    against the TS caught 18 cases out of 600 before this retention. The original's
+    ``WeakMap`` does not have the problem because the key is the live object.
     """
 
     __slots__ = ("_ids", "_keep")
@@ -864,7 +866,7 @@ class _Seen:
         self._keep: list[object] = []
 
     def first(self, value: object) -> bool:
-        """True na primeira vez que ``value`` é visto nesta travessia."""
+        """True the first time ``value`` is seen in this traversal."""
         key = id(value)
         if key in self._ids:
             return False
@@ -912,24 +914,24 @@ def _strip_residual_combiners_node(value: object, seen: _Seen, inside_schema_map
 
 # omp: utils/schema/normalize.ts :: stripResidualCombiners
 def strip_residual_combiners(value: object) -> object:
-    """Ponto fixo. Fundir combinadores de objecto pode sintetizar um ``anyOf`` novo numa
-    propriedade partilhada (ver ``_merge_property_schemas``) depois de a recursão sobre os
-    filhos já ter corrido — uma só passagem deixava-o escapar para o fio."""
+    """Fixed point. Merging object combiners can synthesize a new ``anyOf`` on a shared
+    property (see ``_merge_property_schemas``) after the recursion over the children has
+    already run — a single pass let it escape to the wire."""
     return _strip_residual_combiners_node(value, _Seen(), False)
 
 
 # ---------------------------------------------------------------------------
-# Nullable e incompatibilidades residuais
+# Nullable and residual incompatibilities
 # ---------------------------------------------------------------------------
 
 
 # omp: utils/schema/normalize.ts :: extractNullableUnionSchema
 def _extract_nullable_union_schema(schema: object) -> tuple[object, bool]:
-    """Devolve ``(schema_sem_null, era_nullable)``.
+    """Returns ``(schema_without_null, was_nullable)``.
 
-    O CCA não tem ``nullable`` nem união com ``null``. A nulabilidade sobrevive ao ser
-    traduzida para *opcional*: o chamador tira o campo do ``required``. Apagá-la sem mais
-    tornaria obrigatório um campo que o cliente declarou poder faltar.
+    The CCA has neither ``nullable`` nor a union with ``null``. Nullability survives by
+    being translated into *optional*: the caller drops the field from ``required``. Erasing
+    it outright would make required a field the client declared could be absent.
     """
     if not isinstance(schema, dict):
         return schema, False
@@ -953,8 +955,8 @@ def _extract_nullable_union_schema(schema: object) -> tuple[object, bool]:
         has_null_variant = False
         non_null_variants: list[Any] = []
         for variant in variants_raw:
-            # Só um `{type: "null"}` pelado conta: `{type: "null", description: …}` leva
-            # informação que se perderia ao descartar o ramo.
+            # Only a bare `{type: "null"}` counts: `{type: "null", description: …}` carries
+            # information that would be lost by discarding the branch.
             if isinstance(variant, dict) and variant.get("type") == "null" and len(variant) == 1:
                 has_null_variant = True
                 continue
@@ -970,7 +972,7 @@ def _extract_nullable_union_schema(schema: object) -> tuple[object, bool]:
         next_schema = _copy_without(schema, combiner)
         for key, value in non_null_variants[0].items():
             if key in next_schema and not _json_equal(next_schema[key], value):
-                # Pai e ramo discordam: fundir escolheria arbitrariamente um deles.
+                # Parent and branch disagree: merging would arbitrarily pick one of them.
                 return schema, False
             if key not in next_schema:
                 next_schema[key] = value
@@ -1032,8 +1034,8 @@ def _normalize_nullable_properties(
 
 
 # omp: utils/schema/normalize.ts :: createResidualIncompatibilityChecks
-#: Os cinco resíduos que o CCA rejeita com 400. Verificados depois de todo o saneamento:
-#: o que ainda cá estiver não tem representação possível, logo o schema vai para fallback.
+#: The five residues the CCA rejects with 400. Checked after all sanitization: whatever is
+#: still here has no possible representation, so the schema goes to the fallback.
 RESIDUAL_INCOMPATIBILITIES: Final[frozenset[str]] = frozenset(
     {
         "type-array",
@@ -1077,14 +1079,14 @@ def has_residual_incompatibilities(
 
 
 # ---------------------------------------------------------------------------
-# Passagem principal (utils/schema/normalize.ts)
+# Main pass (utils/schema/normalize.ts)
 # ---------------------------------------------------------------------------
 
 
 # omp: utils/schema/normalize.ts :: applySnakeCaseRenames
 def _apply_snake_case_renames(obj: JsonObject) -> JsonObject:
-    """Colisão resolve-se a favor do snake_case (``pop(from)`` → ``set(to)`` do
-    python-genai), que é a forma que o cliente escreveu de propósito."""
+    """A collision resolves in favour of the snake_case one (python-genai's ``pop(from)`` →
+    ``set(to)``), which is the form the client wrote on purpose."""
     if not any(k in SNAKE_TO_CAMEL_RENAMES for k in obj):
         return obj
     out: JsonObject = {}
@@ -1146,16 +1148,16 @@ def _normalize_schema_node(
         finally:
             path.discard(id(value))
     if isinstance(value, bool):
-        # Um booleano só é subschema numa posição de subschema; em `nullable: true` ou num
-        # membro de `enum` é valor literal e coagi-lo destruiria o schema.
+        # A boolean is only a subschema in a subschema position; in `nullable: true` or in an
+        # `enum` member it is a literal value and coercing it would destroy the schema.
         if not boolean_is_subschema:
             return value
-        # Modo "standard": `false` é o schema impossível, que só `not: {}` exprime.
+        # "Standard" mode: `false` is the impossible schema, which only `not: {}` expresses.
         return {} if value else {"not": {}}
     if not isinstance(value, dict):
         return value
-    # Rasto do caminho, não conjunto de visitados: subárvores partilhadas num DAG são
-    # normalizadas em cada ocorrência; só ciclos verdadeiros curto-circuitam.
+    # Path trail, not a visited set: subtrees shared in a DAG are normalized at each
+    # occurrence; only true cycles short-circuit.
     if id(value) in path:
         return {}
     path.add(id(value))
@@ -1181,7 +1183,7 @@ def _normalize_schema_object_node(
     spill: list[tuple[str, Any]] = []
 
     def strip_or_keep(key: str, entry: object) -> bool:
-        """True quando a chave foi removida (e talvez despejada na descrição)."""
+        """True when the key was removed (and possibly spilled into the description)."""
         if not inside_schema_map and key in UNSUPPORTED_SCHEMA_FIELDS:
             if key in LIFTABLE_TO_DESCRIPTION_FIELDS:
                 spill.append((key, entry))
@@ -1195,8 +1197,8 @@ def _normalize_schema_object_node(
         if not all(isinstance(v, dict) and "const" in v for v in variants):
             continue
 
-        # Um `anyOf` de `const` é um `enum` escrito por extenso; o CCA tem `enum` mas não
-        # `const` nem combinadores, por isso esta é a tradução que não perde nada.
+        # An `anyOf` of `const` is an `enum` spelled out; the CCA has `enum` but neither
+        # `const` nor combiners, so this is the translation that loses nothing.
         deduped_enum: list[Any] = []
         for variant in variants:
             _push_enum_value(deduped_enum, variant["const"])
@@ -1251,15 +1253,15 @@ def _normalize_schema_object_node(
         and isinstance(result.get("enum"), list)
         and result["enum"]
     ):
-        # Sem `type` o proto não sabe desserializar os membros; inferir do enum é a única
-        # fonte disponível e só se aplica quando todos concordam.
+        # Without `type` the proto cannot deserialize the members; inferring from the enum is
+        # the only source available and only applies when they all agree.
         enum_types = [_infer_type_from_value(v) for v in result["enum"]]
         if all(t is not None for t in enum_types) and len(set(enum_types)) == 1:
             result["type"] = enum_types[0]
 
     if result.get("type") == "object" and "properties" not in result:
-        # O proto exige o campo; um `type: object` sem ele é lido como objecto opaco e a
-        # ferramenta recebe argumentos que nunca validou.
+        # The proto requires the field; a `type: object` without it is read as an opaque
+        # object and the tool receives arguments it never validated.
         result["properties"] = {}
 
     _spill_to_description(result, spill)
@@ -1268,11 +1270,11 @@ def _normalize_schema_object_node(
 
 # omp: utils/schema/normalize.ts :: normalizeSchema, normalizeSchemaForCCA
 def normalize_for_cca(schema: object) -> dict[str, Any]:
-    """Saneia um JSON Schema de ferramenta para o Cloud Code Assist.
+    """Sanitizes a tool JSON Schema for Cloud Code Assist.
 
-    Devolve ``{"type": "object", "properties": {}}`` quando o resultado ainda traz uma
-    forma que o backend rejeita ou deixou de ser JSON Schema válido — um pedido com schema
-    inválido falha por inteiro, não só naquela ferramenta.
+    Returns ``{"type": "object", "properties": {}}`` when the result still carries a form
+    the backend rejects or stopped being valid JSON Schema — a request with an invalid
+    schema fails in its entirety, not just on that tool.
     """
     upgraded = upgrade_to_2020_12(schema)
     dereferenced = dereference_schema(upgraded)
@@ -1287,7 +1289,7 @@ def normalize_for_cca(schema: object) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Meta-validador (utils/schema/meta-validator.ts)
+# Meta-validator (utils/schema/meta-validator.ts)
 # ---------------------------------------------------------------------------
 
 _TYPE_NAMES: Final[frozenset[str]] = frozenset(
@@ -1335,8 +1337,8 @@ def _check_type_keyword(value: object) -> bool:
 
 # omp: utils/schema/meta-validator.ts :: checkNode
 def _check_node(node: object, seen: _Seen) -> bool:
-    """Palavras-chave desconhecidas passam (compatibilidade futura); as conhecidas são
-    verificadas para que uma carga malformada caia no fallback em vez de ir para o fio."""
+    """Unknown keywords pass (forward compatibility); the known ones are checked so that a
+    malformed payload lands on the fallback instead of going to the wire."""
     if node is True or node is False:
         return True
     if not isinstance(node, dict):
@@ -1373,8 +1375,8 @@ def _check_node(node: object, seen: _Seen) -> bool:
         items = node["items"]
         if isinstance(items, list) or not _check_node(items, seen):
             return False
-    # Formas de draft-07 que o upgrade devia ter eliminado: sobreviverem significa que a
-    # passagem falhou, e mandá-las na mesma seria um 400 mais difícil de diagnosticar.
+    # Draft-07 forms the upgrade should have eliminated: their survival means the pass
+    # failed, and sending them anyway would be a 400 that is harder to diagnose.
     if "additionalItems" in node or "dependencies" in node:
         return False
 

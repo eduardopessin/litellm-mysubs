@@ -5,18 +5,34 @@ build-backend = "hatchling.build"
 [project]
 name = "litellm-mysubs"
 version = "0.1.0"
-description = "Ligar subscrições (Claude Max, ChatGPT Plus, Google Antigravity) ao LiteLLM como modelos"
+description = "Serve Claude Max, ChatGPT Plus/Codex and Google Antigravity subscriptions as OpenAI-compatible models through a LiteLLM proxy"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
-keywords = ["litellm", "oauth", "claude", "codex", "gemini", "subscription"]
+keywords = [
+  "litellm",
+  "oauth",
+  "claude",
+  "codex",
+  "gemini",
+  "antigravity",
+  "subscription",
+  "proxy",
+  "llm",
+  "openai-compatible",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
+  "Framework :: FastAPI",
   "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Topic :: Internet :: Proxy Servers",
   "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
 ]
 dependencies = [
   "fastapi>=0.110",
@@ -26,6 +42,7 @@ dependencies = [
 
 [project.scripts]
 mysubs-setup = "litellm_mysubs.setup_cli:main"
+mysubs-login = "litellm_mysubs.login_cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -38,15 +55,30 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/eduardopessin/litellm-mysubs"
+Source = "https://github.com/eduardopessin/litellm-mysubs"
 Issues = "https://github.com/eduardopessin/litellm-mysubs/issues"
+Changelog = "https://github.com/eduardopessin/litellm-mysubs/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/litellm_mysubs"]
 
+[tool.hatch.build.targets.sdist]
+# The sdist carries what makes the gate reproducible, not just the code.
+include = [
+  "src/litellm_mysubs",
+  "tests",
+  "tools",
+  "docs",
+  "README.md",
+  "CHANGELOG.md",
+  "LICENSE",
+  "pyproject.toml",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-# Um teste que não afirma nada passa em silêncio. Isto torna-o um erro.
+# A test that asserts nothing passes silently. This makes it an error.
 addopts = "--strict-markers --strict-config"
 
 [tool.coverage.run]
@@ -54,7 +86,7 @@ branch = true
 source = ["litellm_mysubs"]
 
 [tool.coverage.report]
-# Cobertura sem gate é decoração; ver docs/ENGINEERING.md.
+# Coverage without a gate is decoration.
 fail_under = 85
 show_missing = true
 exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]
@@ -67,15 +99,15 @@ src = ["src", "tests"]
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
 
 [tool.mypy]
-# O `numpy` que o LiteLLM arrasta tem stubs com sintaxe de 3.12 (`type X = …`). Fixar 3.11
-# aqui fazia o mypy abortar a análise no primeiro ficheiro dele, antes de chegar ao nosso
-# código — um gate que falha por uma dependência não diz nada sobre o pacote.
+# The `numpy` that LiteLLM drags in ships stubs with 3.12 syntax (`type X = …`). Pinning
+# 3.11 here made mypy abort analysis on its first file, before reaching our own code — a
+# gate that fails because of a dependency says nothing about the package.
 #
-# O suporte a 3.11 continua declarado em `requires-python` e é o que a matriz do CI mede.
+# 3.11 support stays declared in `requires-python`, and that is what the CI matrix measures.
 python_version = "3.12"
 strict = true
 files = ["src/litellm_mysubs"]
-# Nem o LiteLLM nem o numpy publicam stubs utilizáveis.
+# Neither LiteLLM nor numpy publish usable stubs.
 [[tool.mypy.overrides]]
 module = ["litellm.*", "numpy.*", "yaml"]
 ignore_missing_imports = true

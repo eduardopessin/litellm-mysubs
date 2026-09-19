@@ -1,12 +1,13 @@
-"""Wire protocol da Anthropic sobre OAuth de subscrição (Claude Max).
+"""Anthropic wire protocol over subscription OAuth (Claude Max).
 
-Extraído sem alteração de comportamento do ``sitecustomize.py`` original. As medições
-nos comentários são o que justifica cada decisão e vêm do serviço real, não de
-documentação — são a parte mais valiosa deste módulo e não devem ser apagadas.
+Extracted from the original ``sitecustomize.py`` with no behaviour change. The
+measurements in the comments are what justifies each decision, and they come from the
+real service, not from documentation — they are the most valuable part of this module and
+must not be deleted.
 
-Divisão interna: as funções de cache e de parâmetros são puras e testáveis sozinhas;
-``build_request`` é a única que precisa de um token, e recebe-o como argumento em vez de
-ir buscá-lo a estado global.
+Internal split: the cache and parameter functions are pure and testable on their own;
+``build_request`` is the only one that needs a token, and it takes it as an argument
+instead of reaching into global state.
 """
 
 from __future__ import annotations
@@ -15,14 +16,15 @@ import re
 from typing import Any, Final
 
 # omp: providers/claude-code-fingerprint.ts :: claudeCodeSystemInstruction
-#: Bloco de identidade que o runtime do Claude Code antepõe. A medição que existia antes
-#: comparava *identidade vs ausência de identidade*, não *esta string vs a do Claude Code*
-#: — e a string herdada do intermediário não era a que o CLI real põe no fio.
+#: Identity block that the Claude Code runtime prepends. The measurement that existed
+#: before compared *identity vs no identity*, not *this string vs Claude Code's string* —
+#: and the string inherited from the intermediary was not the one the real CLI puts on the
+#: wire.
 CLAUDE_CODE_PROMPT: Final = "You are Claude Code, Anthropic's official CLI for Claude."
 
 # omp: stream.ts :: ANTHROPIC_THINKING
-# Efeito -> orçamento de thinking. Os degraus são os do OMP; só o topo é que difere, e a
-# razão está em `THINKING_CEILING`.
+# Effort -> thinking budget. The steps are OMP's; only the top differs, and the reason is
+# in `THINKING_CEILING`.
 EFFORT_BUDGET: Final[dict[str, int]] = {
     "minimal": 1024,
     "low": 4096,
@@ -32,23 +34,23 @@ EFFORT_BUDGET: Final[dict[str, int]] = {
     "max": 32768,
 }
 
-#: A janela TPM curta da subscrição Max não aguenta os 32768 do OMP: pedidos acima disto
-#: devolvem 429. O tecto aplica-se depois de escolher o degrau, para que a escala do OMP
-#: seja preservada em vez de ser achatada na tabela.
+#: The short TPM window of the Max subscription cannot take OMP's 32768: requests above
+#: this return 429. The ceiling is applied after picking the step, so that OMP's scale is
+#: preserved instead of being flattened in the table.
 THINKING_CEILING: Final = 8192
 
 # omp: stream.ts :: OUTPUT_FALLBACK_BUFFER
-#: Margem de output reservada para lá do orçamento de raciocínio. Um pedido cujo
-#: `max_tokens` fique abaixo de `budget + isto` não tem espaço para responder depois de
-#: pensar, e a resposta sai truncada.
+#: Output margin reserved beyond the reasoning budget. A request whose `max_tokens` falls
+#: below `budget + this` has no room to answer after thinking, and the response comes back
+#: truncated.
 OUTPUT_FALLBACK_BUFFER: Final = 4000
 
 # omp: providers/claude-code-fingerprint.ts :: CLAUDE_CODE_MAX_OUTPUT_TOKENS
 MAX_OUTPUT_TOKENS: Final = 64000
 
-# Medido no upstream (max_tokens=2048, display="summarized", pergunta que exige
-# raciocínio): xhigh e max são aceites e rendem mais output que high (out=164 em high,
-# 273 em xhigh, 275 em max), logo colapsá-los em "high" escondia dois degraus reais.
+# Measured against upstream (max_tokens=2048, display="summarized", a question that
+# demands reasoning): xhigh and max are accepted and yield more output than high (out=164
+# at high, 273 at xhigh, 275 at max), so collapsing them into "high" hid two real steps.
 ADAPTIVE_EFFORT: Final[dict[str, str]] = {
     "minimal": "low",
     "low": "low",
@@ -58,22 +60,22 @@ ADAPTIVE_EFFORT: Final[dict[str, str]] = {
     "max": "max",
 }
 
-# O default é adaptive, e esta lista enumera quem o *rejeita*, não quem o aceita.
-# Medido modelo a modelo (max_tokens 1024/4096, display="summarized"), chars de thinking
-# devolvidos com cada forma:
-#   opus-5       adaptive  82 | budget    0   <- adaptive obrigatório
-#   fable-5      adaptive  83 | budget    0   <- adaptive obrigatório
+# The default is adaptive, and this list enumerates who *rejects* it, not who accepts it.
+# Measured model by model (max_tokens 1024/4096, display="summarized"), thinking chars
+# returned with each form:
+#   opus-5       adaptive  82 | budget    0   <- adaptive mandatory
+#   fable-5      adaptive  83 | budget    0   <- adaptive mandatory
 #   sonnet-5     adaptive  58 | budget   59
 #   opus-4-8     adaptive  61 | budget   62
 #   opus-4-6     adaptive 101 | budget  101
 #   sonnet-4-6   adaptive 104 | budget  105
-#   opus-4-5     adaptive 400 | budget  233   <- adaptive rejeitado
-#   sonnet-4-5   adaptive 400 | budget  367   <- adaptive rejeitado
-#   haiku-4-5    adaptive 400 | budget  413   <- adaptive rejeitado
-# A assimetria é o que decide o default: errar para adaptive dá 400 "adaptive thinking is
-# not supported on this model"; errar para budget dá 200 com 0 chars de raciocínio. Assim
-# um alias (claude-opus -> opus-4-8) ou um modelo novo ainda não enumerado cai no lado que
-# se detecta.
+#   opus-4-5     adaptive 400 | budget  233   <- adaptive rejected
+#   sonnet-4-5   adaptive 400 | budget  367   <- adaptive rejected
+#   haiku-4-5    adaptive 400 | budget  413   <- adaptive rejected
+# The asymmetry is what decides the default: erring towards adaptive gives 400 "adaptive
+# thinking is not supported on this model"; erring towards budget gives 200 with 0 chars
+# of reasoning. That way an alias (claude-opus -> opus-4-8) or a new model not yet
+# enumerated falls on the side that is detectable.
 BUDGET_ONLY_MODELS: Final[tuple[str, ...]] = (
     "opus-4-5",
     "sonnet-4-5",
@@ -90,51 +92,52 @@ BUDGET_ONLY_MODELS: Final[tuple[str, ...]] = (
     "opus-3",
 )
 
-# A Anthropic faz cache de tudo *até* um breakpoint, e a ordem canónica no fio é
-# tools -> system -> messages. Dois marcadores adjacentes na cauda (não um) mantêm uma
-# entrada válida para estender à medida que a conversa cresce.
+# Anthropic caches everything *up to* a breakpoint, and the canonical order on the wire is
+# tools -> system -> messages. Two adjacent markers in the tail (not one) keep a valid
+# entry to extend as the conversation grows.
 CACHE_BREAKPOINT_MESSAGES: Final = 2
 
 # omp: providers/anthropic.ts :: ANTHROPIC_DECIMATION_INTERVAL
-# Checkpoint histórico estável a cada 15 turnos de utilizador (15.º, 30.º, 45.º...). As
-# duas âncoras de cauda movem-se a cada turno, logo quando a janela de 5 min expira não
-# há nenhuma entrada viva que cubra o prefixo antigo e ele é relido a preço cheio. Um
-# marcador em posição fixa sobrevive ao churn da cauda e apanha esse prefixo.
+# Stable historical checkpoint every 15 user turns (15th, 30th, 45th...). The two tail
+# anchors move on every turn, so when the 5 min window expires there is no live entry
+# covering the old prefix and it is re-read at full price. A marker at a fixed position
+# survives the tail churn and catches that prefix.
 DECIMATION_INTERVAL: Final = 15
 
 # omp: providers/anthropic.ts :: VOLATILE_SYSTEM_SEGMENT_MARKERS
-#: Segmentos de system que mudam a cada turno. A âncora de system fica no último bloco
-#: *antes* deles, para que um refresh de memória re-facture só o sufixo em vez do head
-#: inteiro. A detecção é pela nossa própria marcação, e só conta em início de bloco: um
-#: `<memories>` citado a meio de um bloco estável não o torna volátil.
+#: System segments that change on every turn. The system anchor sits on the last block
+#: *before* them, so that a memory refresh re-bills only the suffix instead of the whole
+#: head. Detection is by our own marking, and only counts at the start of a block: a
+#: `<memories>` quoted in the middle of a stable block does not make it volatile.
 VOLATILE_SYSTEM_MARKERS: Final[tuple[str, ...]] = ("<memories>",)
 
-# Um cliente que faça o seu próprio caching chega aqui com marcadores postos. Medido com
-# claude-sonnet-4-6: 4 marcadores -> 200, 5 -> 400 "A maximum of 4 blocks with
-# cache_control may be provided. Found 5." Três marcadores do cliente fora da nossa janela
-# de cauda mais os nossos dois davam exactamente esse 400.
+# A client that does its own caching arrives here with markers already set. Measured with
+# claude-sonnet-4-6: 4 markers -> 200, 5 -> 400 "A maximum of 4 blocks with cache_control
+# may be provided. Found 5." Three client markers outside our tail window plus our two
+# gave exactly that 400.
 CACHE_BREAKPOINT_CEILING: Final = 4
 
-#: Blocos que carregam raciocínio nunca são âncoras válidas.
+#: Blocks carrying reasoning are never valid anchors.
 UNCACHEABLE_BLOCKS: Final[tuple[str, ...]] = ("thinking", "redacted_thinking", "fallback")
 
-# Ferramentas hospedadas: o LiteLLM emite `server_tool_use` sem cache_control
-# (factory.py:1971), logo uma chamada destas não serve de âncora.
+# Hosted tools: LiteLLM emits `server_tool_use` without cache_control (factory.py:1971),
+# so such a call cannot serve as an anchor.
 SERVER_TOOL_PREFIX: Final = "srvtoolu_"
 
 # omp: providers/anthropic.ts :: claudeCodeAgentBetaDefaults
-# Ordem e conteúdo da fonte. Notas sobre o que **não** está aqui:
-#  - `context-1m-2025-08-07`: credenciais OAuth não têm saldo de contexto longo, e a
-#    Anthropic devolve 429 duro em qualquer modelo com a beta, independentemente do
-#    tamanho do prompt. O OMP também nunca a anuncia.
-#  - `redact-thinking-2026-02-12`: faz devolver blocos thinking assinados mas sem texto
-#    (medido em sonnet-4-6: 74 chars sem a beta, 0 com ela). O OMP também não a envia na
-#    inferência — só no cabeçalho da rota de usage.
-#  - `structured-outputs-2025-12-15`: é da lista de utilitário, não da de agente.
+# Order and content from the source. Notes on what is **not** here:
+#  - `context-1m-2025-08-07`: OAuth credentials have no long-context balance, and Anthropic
+#    returns a hard 429 on any model with the beta, regardless of prompt size. OMP never
+#    advertises it either.
+#  - `redact-thinking-2026-02-12`: makes thinking blocks come back signed but with no text
+#    (measured on sonnet-4-6: 74 chars without the beta, 0 with it). OMP does not send it
+#    on inference either — only on the header of the usage route.
+#  - `structured-outputs-2025-12-15`: belongs to the utility list, not the agent one.
 AGENT_BETAS: Final[tuple[str, ...]] = (
     "claude-code-20250219",
-    # A única específica de credencial OAuth. Sem ela o servidor classifica o pedido
-    # como sendo de API key — faltava por ter sido portada do intermediário.
+    # The only one specific to an OAuth credential. Without it the server classifies the
+    # request as coming from an API key — it was missing because the port came from the
+    # intermediary.
     "oauth-2025-04-20",
     "interleaved-thinking-2025-05-14",
     "thinking-token-count-2026-05-13",
@@ -143,34 +146,36 @@ AGENT_BETAS: Final[tuple[str, ...]] = (
     "mid-conversation-system-2026-04-07",
 )
 
-#: Acrescentada só quando o pedido pede raciocínio.
+#: Added only when the request asks for reasoning.
 EFFORT_BETA: Final = "effort-2025-11-24"
-#: Acrescentada a todos os pedidos de agente.
+#: Added to every agent request.
 FALLBACK_CREDIT_BETA: Final = "fallback-credit-2026-06-01"
-#: Acrescentada quando alguma âncora leva `ttl: "1h"`.
+#: Added when some anchor carries `ttl: "1h"`.
 EXTENDED_CACHE_TTL_BETA: Final = "extended-cache-ttl-2025-04-11"
 
 
 # omp: providers/anthropic.ts :: buildClaudeCodeBetas
 def build_betas(*, thinking: bool) -> str:
-    """Cabeçalho ``anthropic-beta`` para um pedido de agente."""
+    """``anthropic-beta`` header for an agent request."""
     betas = [*AGENT_BETAS]
     if thinking:
         betas.append(EFFORT_BETA)
     betas.append(FALLBACK_CREDIT_BETA)
-    # A beta NÃO viaja no caminho OAuth. O OMP só a junta quando `!isOAuth`
-    # (`providers/anthropic.ts`), e `getCacheControl` mostra porquê: para OAuth o default
-    # já é `ttl: "1h"` em modelos que o suportam, sem beta nenhuma.
+    # The extended-cache-TTL beta does NOT travel on the OAuth path. OMP only adds it when
+    # `!isOAuth` (`providers/anthropic.ts`), and `getCacheControl` shows why: for OAuth the
+    # default is already `ttl: "1h"` on models that support it, with no beta at all.
     #
-    # O cabeçalho de `usage/claude.ts` traz esta beta e podia parecer o contra-exemplo,
-    # mas é da rota de *usage* e traz também `redact-thinking-2026-02-12` — que medimos a
-    # devolver blocos de thinking vazios. Copiá-lo para a inferência partia o raciocínio.
+    # The header in `usage/claude.ts` carries this beta and might look like the
+    # counter-example, but it belongs to the *usage* route and also carries
+    # `redact-thinking-2026-02-12` — which we measured returning empty thinking blocks.
+    # Copying it into inference would break reasoning.
     return ",".join(betas)
 
 
 # omp: providers/claude-code-fingerprint.ts :: claudeCodeUserAgent
 CLAUDE_CODE_VERSION: Final = "2.1.257"
-#: O entrypoint tem de ser `cli` para ser coerente com o `x-app` que segue no mesmo pedido.
+#: The entrypoint has to be `cli` to be consistent with the `x-app` that travels on the
+#: same request.
 CLAUDE_CODE_USER_AGENT: Final = f"claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"
 
 CLIENT_HEADERS: Final[dict[str, str]] = {
@@ -186,16 +191,16 @@ def is_anthropic_model(model: str) -> bool:
 
 
 def is_adaptive(model: str) -> bool:
-    """Se o modelo usa ``thinking: adaptive`` em vez de ``budget_tokens``."""
+    """Whether the model uses ``thinking: adaptive`` instead of ``budget_tokens``."""
     lowered = str(model).lower()
     return not any(marker in lowered for marker in BUDGET_ONLY_MODELS)
 
 
-#: Modelos que aceitam ``thinking.display``, por ordem de especificidade.
+#: Models that accept ``thinking.display``, in order of specificity.
 #:
-#: A regra da fonte é geracional, não uma lista: opus a partir de 4.7, e
-#: sonnet/fable/mythos a partir de 5. Não coincide com ``is_adaptive`` — opus-4-6 e
-#: sonnet-4-6 são adaptativos mas **não** aceitam ``display``, e mandá-lo dá 400.
+#: The rule in the source is generational, not a list: opus from 4.7 up, and
+#: sonnet/fable/mythos from 5 up. It does not coincide with ``is_adaptive`` — opus-4-6 and
+#: sonnet-4-6 are adaptive but do **not** accept ``display``, and sending it gives 400.
 _DISPLAY_FLOORS: Final[tuple[tuple[str, float], ...]] = (
     ("opus", 4.7),
     ("sonnet", 5.0),
@@ -206,12 +211,12 @@ _DISPLAY_FLOORS: Final[tuple[tuple[str, float], ...]] = (
 
 # omp: compat/resolve.ts :: defaultSupportsDisplay
 def supports_display(model: str) -> bool:
-    """Se o modelo aceita ``thinking.display``.
+    """Whether the model accepts ``thinking.display``.
 
-    ``display: "summarized"`` é o que faz o raciocínio voltar em texto legível: a partir
-    do Opus 4.7 o conteúdo é omitido da resposta por default. O campo é estritamente
-    fechado por modelo — quem não o suporta responde 400 — por isso não basta ser
-    adaptativo.
+    ``display: "summarized"`` is what makes reasoning come back as readable text: from Opus
+    4.7 on, the content is omitted from the response by default. The field is strictly
+    gated per model — anything that does not support it answers 400 — so being adaptive is
+    not enough.
     """
     lowered = str(model).lower()
     for family, floor in _DISPLAY_FLOORS:
@@ -227,11 +232,11 @@ def supports_display(model: str) -> bool:
 
 
 def normalize_effort(value: object) -> tuple[str | None, str | None]:
-    """Devolve ``(effort, summary)`` a partir de ``reasoning_effort``.
+    """Return ``(effort, summary)`` from ``reasoning_effort``.
 
-    A rota ``/v1/responses`` entrega ``reasoning: {effort, summary}`` e o tradutor do
-    LiteLLM reencaminha o objecto inteiro. Tratá-lo como string punha
-    ``"{'effort': 'medium', …}"`` no fio, o que dá 400 Invalid value.
+    The ``/v1/responses`` route delivers ``reasoning: {effort, summary}`` and LiteLLM's
+    translator forwards the whole object. Treating it as a string put
+    ``"{'effort': 'medium', …}"`` on the wire, which gives 400 Invalid value.
     """
     if isinstance(value, dict):
         effort = value.get("effort")
@@ -245,34 +250,35 @@ def normalize_effort(value: object) -> tuple[str | None, str | None]:
     )
 
 
-#: Retenção default. O OMP defaulta a "long" para OAuth em modelo com
-#: `supportsLongCacheRetention`, "matching Claude Code's native policy"; este módulo só
-#: serve o caminho OAuth do Claude Code, logo a condição colapsa no default.
+#: Default retention. OMP defaults to "long" for OAuth on a model with
+#: `supportsLongCacheRetention`, "matching Claude Code's native policy"; this module only
+#: serves the Claude Code OAuth path, so the condition collapses into the default.
 LONG_CACHE_TTL: Final = "1h"
 
 
 # omp: providers/anthropic.ts :: getCacheControl
 def cache_control(ttl: str | None = LONG_CACHE_TTL) -> dict[str, str]:
-    """Marcador de cache, com ``ttl`` de 1 h por default e ``None`` para os 5 min base.
+    """Cache marker, with ``ttl`` of 1 h by default and ``None`` for the base 5 min.
 
-    O trade-off é de custo contra frequência de reescrita: uma escrita de 1 h factura 2x o
-    preço base do token contra 1.25x para os 5 min. Numa sessão de agente o prefixo é
-    relido dezenas de vezes e as pausas entre turnos passam facilmente dos 5 min, logo
-    pagar 2x uma vez sai mais barato do que pagar 1.25x a cada reescrita a frio — que é
-    exactamente a razão pela qual o Claude Code nativo defaulta a 1 h.
+    The trade-off is cost against rewrite frequency: a 1 h write bills 2x the base token
+    price against 1.25x for the 5 min one. In an agent session the prefix is re-read dozens
+    of times and the pauses between turns easily exceed 5 min, so paying 2x once comes out
+    cheaper than paying 1.25x on every cold rewrite — which is exactly why native Claude
+    Code defaults to 1 h.
     """
     if not ttl:
         return {"type": "ephemeral"}
     return {"type": "ephemeral", "ttl": ttl}
 
 
-# -- âncoras de cache ----------------------------------------------------------
+# -- cache anchors -------------------------------------------------------------
 
 
 def tool_call_anchor(message: dict[str, Any]) -> int | None:
-    """Índice do último tool call que o LiteLLM aceita marcar.
+    """Index of the last tool call that LiteLLM accepts marking.
 
-    ``convert_to_anthropic_tool_invoke:1952`` salta o que não é ``type: "function"``.
+    ``convert_to_anthropic_tool_invoke:1952`` skips anything that is not
+    ``type: "function"``.
     """
     calls = message.get("tool_calls")
     if not isinstance(calls, list):
@@ -288,22 +294,22 @@ def tool_call_anchor(message: dict[str, Any]) -> int | None:
 
 
 def is_markable(message: object) -> bool:
-    """Se um breakpoint pode ser preso a esta mensagem.
+    """Whether a breakpoint can be pinned to this message.
 
-    O omp marca o wire da Anthropic, onde um tool result é um bloco ``tool_result`` dentro
-    de um turno ``user``, logo a janela rolante dele cai sempre nos dois últimos turnos.
-    Aqui vê-se a forma OpenAI: o tool result é uma mensagem ``role: "tool"`` própria e o
-    tool call do assistant traz ``content: None``. O LiteLLM propaga o breakpoint em
-    ambos, mas lê-o de níveis diferentes
+    omp marks the Anthropic wire, where a tool result is a ``tool_result`` block inside a
+    ``user`` turn, so its rolling window always lands on the last two turns. Here we see
+    the OpenAI form: the tool result is a message of its own with ``role: "tool"`` and the
+    assistant's tool call carries ``content: None``. LiteLLM propagates the breakpoint in
+    both, but reads it from different levels
     (``litellm_core_utils/prompt_templates/factory.py``):
 
-      - ``role: "tool"``  -> nível-mensagem, ``convert_to_anthropic_tool_result:1844``
-      - ``tool_calls[i]`` -> dentro da chamada, ``convert_to_anthropic_tool_invoke:2003``
-      - blocos de texto   -> no próprio bloco
+      - ``role: "tool"``  -> message level, ``convert_to_anthropic_tool_result:1844``
+      - ``tool_calls[i]`` -> inside the call, ``convert_to_anthropic_tool_invoke:2003``
+      - text blocks       -> on the block itself
 
-    Recusar os dois primeiros prendia a janela à cabeça da conversa: num turno terminado
-    em tool result, 67% do prompt era relido a preço cheio (medido: opus-5 pt=8697,
-    read=2876).
+    Refusing the first two pinned the window to the head of the conversation: on a turn
+    ending in a tool result, 67% of the prompt was re-read at full price (measured: opus-5
+    pt=8697, read=2876).
     """
     if not isinstance(message, dict):
         return False
@@ -328,7 +334,7 @@ def is_markable(message: object) -> bool:
 
 
 def count_breakpoints(messages: list[Any]) -> int:
-    """Marcadores já presentes, venham de onde vierem."""
+    """Markers already present, wherever they came from."""
     total = 0
     for message in messages:
         if not isinstance(message, dict):
@@ -347,7 +353,7 @@ def count_breakpoints(messages: list[Any]) -> int:
 
 
 def mark_breakpoint(message: dict[str, Any]) -> bool:
-    """Marca a última âncora não-raciocínio; desiste se já houver uma."""
+    """Mark the last non-reasoning anchor; give up if there is one already."""
     control = cache_control()
     if message.get("role") == "tool" or message.get("tool_call_id"):
         if message.get("cache_control") is not None:
@@ -355,8 +361,8 @@ def mark_breakpoint(message: dict[str, Any]) -> bool:
         message["cache_control"] = control
         return True
 
-    # Um assistant pode trazer texto e tool calls; no wire da Anthropic o `tool_use` vem
-    # depois do texto, logo é ele a âncora que cobre mais prefixo.
+    # An assistant message can carry both text and tool calls; on the Anthropic wire the
+    # `tool_use` comes after the text, so it is the anchor covering the most prefix.
     call_index = tool_call_anchor(message)
     if call_index is not None:
         call = message["tool_calls"][call_index]
@@ -386,7 +392,7 @@ def mark_breakpoint(message: dict[str, Any]) -> bool:
 
 # omp: providers/anthropic.ts :: stableSystemSuffixStart
 def stable_system_suffix_start(blocks: list[Any]) -> int:
-    """Índice onde começa o sufixo volátil de system; ``len(blocks)`` se não houver."""
+    """Index where the volatile system suffix starts; ``len(blocks)`` if there is none."""
     start = len(blocks)
     while start > 0:
         block = blocks[start - 1]
@@ -398,8 +404,8 @@ def stable_system_suffix_start(blocks: list[Any]) -> int:
 
 
 def _is_deferred_tool(tool: Any) -> bool:
-    """O LiteLLM aceita ``defer_loading`` no topo ou dentro de ``function``
-    (``transformation.py:843``), logo os dois sítios contam."""
+    """LiteLLM accepts ``defer_loading`` at the top level or inside ``function``
+    (``transformation.py:843``), so both places count."""
     if not isinstance(tool, dict):
         return False
     if tool.get("defer_loading"):
@@ -410,7 +416,7 @@ def _is_deferred_tool(tool: Any) -> bool:
 
 # omp: providers/anthropic.ts :: countHeadBreakpoints
 def count_head_breakpoints(system_blocks: list[Any] | None, tools: list[Any] | None) -> int:
-    """Marcadores presentes em system e em tools."""
+    """Markers present in system and in tools."""
     total = 0
     for block in system_blocks or ():
         if isinstance(block, dict) and block.get("cache_control") is not None:
@@ -423,19 +429,19 @@ def count_head_breakpoints(system_blocks: list[Any] | None, tools: list[Any] | N
 
 # omp: providers/anthropic.ts :: applyHeadCaching
 def apply_head_cache(system_blocks: list[Any] | None, tools: list[Any] | None) -> int:
-    """Ancora o head estável — última tool não-deferred e último bloco estável de system.
+    """Anchor the stable head — last non-deferred tool and last stable system block.
 
-    Devolve quantos marcadores ficaram no head. A ordem no fio é tools -> system ->
-    messages, logo um marcador no último bloco estável de system faz cache do prefixo
-    tools+system inteiro; o marcador nas tools mantém as definições em cache mesmo quando
-    o texto de system muda. Sem isto o head só era coberto pela âncora de cauda, que se
-    move a cada turno, e portanto era reescrito a preço cheio a cada pedido.
+    Returns how many markers ended up in the head. The order on the wire is tools ->
+    system -> messages, so a marker on the last stable system block caches the whole
+    tools+system prefix; the marker on the tools keeps the definitions cached even when the
+    system text changes. Without this the head was only covered by the tail anchor, which
+    moves on every turn, and was therefore rewritten at full price on every request.
     """
     if tools and not any(
         isinstance(tool, dict) and tool.get("cache_control") is not None for tool in tools
     ):
-        # Uma tool deferred não entra no prefixo verificado enquanto não for referida, por
-        # isso ancorar nela deixaria de fora tudo o que vem antes.
+        # A deferred tool does not enter the checked prefix until it is referenced, so
+        # anchoring on it would leave out everything that comes before.
         for tool in reversed(tools):
             if not isinstance(tool, dict) or _is_deferred_tool(tool):
                 continue
@@ -452,9 +458,9 @@ def apply_head_cache(system_blocks: list[Any] | None, tools: list[Any] | None) -
                 if isinstance(last, dict):
                     last["cache_control"] = cache_control()
         else:
-            # Com sufixo volátil o marcador de fronteira entra mesmo que já haja um mais
-            # atrás: caso contrário o único marcador de system fica antes do prompt
-            # estável e um refresh de memória re-factura-o.
+            # With a volatile suffix the boundary marker goes in even if there is one
+            # further back: otherwise the only system marker sits before the stable prompt
+            # and a memory refresh re-bills it.
             anchor_index = len(system_blocks) - 1 if suffix_start == 0 else suffix_start - 1
             anchor = system_blocks[anchor_index]
             if isinstance(anchor, dict) and anchor.get("cache_control") is None:
@@ -464,15 +470,15 @@ def apply_head_cache(system_blocks: list[Any] | None, tools: list[Any] | None) -
 
 
 def _decimation_indices(messages: list[Any], end: int) -> list[int]:
-    """Índices dos turnos de utilizador cujo ordinal é múltiplo de ``DECIMATION_INTERVAL``.
+    """Indices of user turns whose ordinal is a multiple of ``DECIMATION_INTERVAL``.
 
-    Limitação face à fonte: o OMP conta turnos por `isConversationalUser`, um marcador de
-    proveniência que distingue um turno humano de um `developer` serializado ou de um
-    "Continue." interior. Recebemos kwargs em forma OpenAI e esse marcador não existe no
-    fio, logo a aproximação é ``role == "user"`` — uma mensagem `user` sintetizada conta
-    como turno onde o OMP não a contaria, o que desloca os checkpoints para posições mais
-    recentes do que as canónicas. Eles continuam a cair em posições fixas ao longo da
-    conversa, que é o que lhes dá valor.
+    Limitation against the source: OMP counts turns by `isConversationalUser`, a
+    provenance marker that distinguishes a human turn from a serialized `developer` one or
+    from an internal "Continue.". We receive kwargs in OpenAI form and that marker does not
+    exist on the wire, so the approximation is ``role == "user"`` — a synthesized `user`
+    message counts as a turn where OMP would not count it, which shifts the checkpoints to
+    more recent positions than the canonical ones. They still land at fixed positions along
+    the conversation, which is what makes them worth having.
     """
     indices: list[int] = []
     ordinal = 0
@@ -488,21 +494,21 @@ def _decimation_indices(messages: list[Any], end: int) -> list[int]:
 # omp: providers/anthropic.ts :: applyPromptCaching
 # omp: providers/anthropic.ts :: cloneAnthropicCacheControl
 def apply_conversation_cache(messages: list[Any], head_breakpoints: int = 0) -> int:
-    """Ancora os breakpoints nas mensagens. Muta ``messages``.
+    """Anchor the breakpoints in the messages. Mutates ``messages``.
 
-    ``head_breakpoints`` é o que `apply_head_cache` já gastou em tools e system: sai do
-    orçamento porque o tecto de 4 é por pedido, não por secção.
+    ``head_breakpoints`` is what `apply_head_cache` already spent on tools and system: it
+    comes out of the budget because the ceiling of 4 is per request, not per section.
     """
     anchors = [i for i, m in enumerate(messages) if is_markable(m)]
     if not anchors:
         return 0
 
-    # Um "Continue." sintético no fim não é uma âncora útil.
+    # A synthetic "Continue." at the end is not a useful anchor.
     last = messages[anchors[-1]]
     if last.get("role") == "user" and last.get("content") == "Continue." and len(anchors) > 1:
         anchors = anchors[:-1]
 
-    # O que o cliente já gastou e o que o head consumiu saem ambos do nosso orçamento.
+    # What the client already spent and what the head consumed both come out of our budget.
     budget = CACHE_BREAKPOINT_CEILING - head_breakpoints - count_breakpoints(messages)
     if budget <= 0:
         return 0
@@ -511,9 +517,9 @@ def apply_conversation_cache(messages: list[Any], head_breakpoints: int = 0) -> 
     markable = set(anchors)
     decimation = [i for i in _decimation_indices(messages, anchors[-1]) if i in markable]
 
-    # Prioridade da fonte: cauda mais recente, depois os checkpoints de decimação do mais
-    # novo para o mais velho, e só então a segunda âncora de cauda. Com orçamento curto é
-    # o checkpoint estável que sobrevive, não a redundância da cauda.
+    # Priority from the source: most recent tail, then the decimation checkpoints from
+    # newest to oldest, and only then the second tail anchor. On a short budget it is the
+    # stable checkpoint that survives, not the tail's redundancy.
     candidates: list[int] = []
     for index in (*trailing[:1], *reversed(decimation), *trailing[1:]):
         if index not in candidates:
@@ -538,16 +544,16 @@ def apply_conversation_cache(messages: list[Any], head_breakpoints: int = 0) -> 
     return marked
 
 
-# -- parâmetros de thinking ----------------------------------------------------
+# -- thinking parameters -------------------------------------------------------
 
 
 # omp: providers/anthropic.ts :: disableThinkingIfToolChoiceForced
 def _forced_tool_choice(choice: object) -> bool:
-    """Se a escolha de ferramenta força o modelo a chamar uma.
+    """Whether the tool choice forces the model to call one.
 
-    Só `any` e `tool` contam: são os dois valores do wire da Anthropic que forçam. A forma
-    OpenAI ``{"type": "function", ...}`` é uma *selecção* de ferramenta, não uma
-    imposição, e tratá-la como forçada desligava o raciocínio sem razão de wire.
+    Only `any` and `tool` count: they are the two values on the Anthropic wire that force.
+    The OpenAI form ``{"type": "function", ...}`` is a tool *selection*, not an imposition,
+    and treating it as forced disabled reasoning with no wire-level reason.
     """
     if isinstance(choice, dict):
         return choice.get("type") in ("any", "tool")
@@ -558,9 +564,10 @@ def _forced_tool_choice(choice: object) -> bool:
 # omp: providers/anthropic.ts :: supportsSamplingParams
 # omp: providers/anthropic.ts :: disableThinkingIfToolChoiceForced
 def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
-    """Normaliza thinking, temperatura, top_p e tectos de tokens. Muta ``kwargs``.
+    """Normalize thinking, temperature, top_p and token ceilings. Mutates ``kwargs``.
 
-    Separado de ``build_request`` porque é pura: não toca em credenciais nem em mensagens.
+    Kept apart from ``build_request`` because it is pure: it touches neither credentials
+    nor messages.
     """
     reasoning, _summary = normalize_effort(kwargs.get("reasoning_effort"))
     thinking = kwargs.get("thinking")
@@ -574,8 +581,8 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
 
     thinking_active = bool(thinking or reasoning in EFFORT_BUDGET)
 
-    # Medido: com thinking activo a Anthropic devolve 400 para temperature != 1 ("may only
-    # be set to 1 when thinking is enabled") e para top_p < 0.95 ("`top_p` must be greater
+    # Measured: with thinking active Anthropic returns 400 for temperature != 1 ("may only
+    # be set to 1 when thinking is enabled") and for top_p < 0.95 ("`top_p` must be greater
     # than or equal to 0.95 or unset").
     temperature = kwargs.get("temperature")
     if temperature is not None and float(temperature) != 1.0:
@@ -590,15 +597,15 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
         if top_p is not None and float(top_p) < 0.95:
             kwargs.pop("top_p", None)
 
-    # Uma tool_choice que força ferramenta é incompatível com budget thinking: medido em
+    # A tool_choice that forces a tool is incompatible with budget thinking: measured on
     # claude-sonnet-4-6 -> 400 "Thinking may not be enabled when tool_choice forces tool
     # use".
     forced = _forced_tool_choice(kwargs.get("tool_choice"))
     forced_adaptive = False
     if thinking_active and forced:
         if is_adaptive(model):
-            # Omitir thinking num modelo adaptive não o desliga — a API volta a ligá-lo
-            # por default. A única forma de o baixar é fixar o effort.
+            # Omitting thinking on an adaptive model does not disable it — the API turns
+            # it back on by default. The only way to lower it is to pin the effort.
             forced_adaptive = True
         else:
             kwargs.pop("thinking", None)
@@ -609,10 +616,10 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
     if not thinking_active:
         return kwargs
 
-    # `display: "summarized"` é o que faz o raciocínio voltar em texto legível: a partir
-    # do Opus 4.7 o conteúdo é omitido por default, e sem o campo os deltas de thinking
-    # chegam vazios. Respeita-se o que o cliente mandou; o gate é por modelo porque quem
-    # não o suporta responde 400.
+    # `display: "summarized"` is what makes reasoning come back as readable text: from Opus
+    # 4.7 on the content is omitted by default, and without the field the thinking deltas
+    # arrive empty. What the client sent is respected; the gate is per model because
+    # anything that does not support it answers 400.
     display = thinking.get("display") if isinstance(thinking, dict) else None
     show = str(display or "summarized")
 
@@ -626,8 +633,8 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
     kwargs.pop("reasoning_effort", None)
 
     if is_adaptive(model):
-        # budget_tokens é rejeitado/ignorado nestes modelos; o par adaptive +
-        # output_config.effort é a única forma suportada.
+        # budget_tokens is rejected/ignored on these models; the adaptive +
+        # output_config.effort pair is the only supported form.
         adaptive: dict[str, Any] = {"type": "adaptive"}
         if supports_display(model):
             adaptive["display"] = show
@@ -637,13 +644,13 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
     elif isinstance(kwargs.get("thinking"), dict) and supports_display(model):
         kwargs["thinking"]["display"] = show
 
-    # Mexe-se só na chave que o cliente mandou: preencher as duas fazia a cópia de baixo
-    # sobrepor o valor do cliente com o default.
+    # Only the key the client sent is touched: filling both made the copy below override
+    # the client's value with the default.
     token_key = "max_completion_tokens" if "max_completion_tokens" in kwargs else "max_tokens"
     token_value = kwargs.get(token_key)
     if token_value is None or int(token_value) < budget + OUTPUT_FALLBACK_BUFFER:
-        # Sobe-se até haver margem de output para lá do raciocínio; nunca se baixa o que o
-        # cliente pediu, a não ser pelo tecto do Claude Code.
+        # Raised until there is output room beyond the reasoning; what the client asked
+        # for is never lowered, except by the Claude Code ceiling.
         kwargs[token_key] = min(budget + OUTPUT_FALLBACK_BUFFER, MAX_OUTPUT_TOKENS)
     else:
         kwargs[token_key] = min(int(token_value), MAX_OUTPUT_TOKENS)
@@ -653,7 +660,7 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
 
 
 def split_system_messages(messages: list[Any]) -> tuple[str, list[Any]]:
-    """Separa as instruções de system do resto da conversa."""
+    """Split the system instructions from the rest of the conversation."""
     system_parts: list[str] = []
     rest: list[Any] = []
     for message in messages:
@@ -678,19 +685,19 @@ def split_system_messages(messages: list[Any]) -> tuple[str, list[Any]]:
 
 
 def build_system_blocks(client_prompt: str) -> list[dict[str, Any]]:
-    """Identidade do Agent SDK primeiro, instruções do cliente a seguir.
+    """Agent SDK identity first, client instructions after.
 
-    Medido no upstream com token OAuth (opus-5/sonnet-4-6/opus-4-8/opus-4-6,
+    Measured against upstream with an OAuth token (opus-5/sonnet-4-6/opus-4-8/opus-4-6,
     max_tokens=64)::
 
-        system=[identidade]          -> 200
-        system=[identidade, cliente] -> 200, e a instrução do cliente é obedecida
-                                        (marcador ZX9-ACK nos quatro modelos)
-        system=[cliente]             -> 429 rate_limit_error
+        system=[identity]         -> 200
+        system=[identity, client] -> 200, and the client instruction is obeyed
+                                     (ZX9-ACK marker on all four models)
+        system=[client]           -> 429 rate_limit_error
 
-    Ou seja, a rejeição do OAuth depende de a identidade ser o **primeiro** bloco, não de
-    haver só um bloco. Enfiar o prompt do cliente no primeiro turno user tirava-lhe a
-    autoridade de system sem necessidade alguma.
+    That is, the OAuth rejection depends on the identity being the **first** block, not on
+    there being only one block. Stuffing the client prompt into the first user turn stripped
+    it of system authority for no reason at all.
     """
     blocks: list[dict[str, Any]] = [{"type": "text", "text": CLAUDE_CODE_PROMPT}]
     if client_prompt:
@@ -699,10 +706,10 @@ def build_system_blocks(client_prompt: str) -> list[dict[str, Any]]:
 
 
 def _wants_thinking(kwargs: dict[str, Any]) -> bool:
-    """Se o pedido pede raciocínio, antes de qualquer normalização.
+    """Whether the request asks for reasoning, before any normalization.
 
-    A beta de effort só viaja quando há raciocínio — enviá-la sempre é ruído de
-    fingerprint face ao que o Claude Code real emite.
+    The effort beta only travels when there is reasoning — sending it always is fingerprint
+    noise against what the real Claude Code emits.
     """
     effort, _ = normalize_effort(kwargs.get("reasoning_effort"))
     if effort == "none":
@@ -714,10 +721,10 @@ def _wants_thinking(kwargs: dict[str, Any]) -> bool:
 
 
 def build_request(kwargs: dict[str, Any], model: str, access_token: str = "") -> dict[str, Any]:
-    """Prepara os kwargs de um pedido Claude. Muta e devolve ``kwargs``.
+    """Prepare the kwargs of a Claude request. Mutates and returns ``kwargs``.
 
-    O token entra por argumento: manter a leitura de credenciais fora deste módulo é o que
-    o torna testável sem estado global.
+    The token comes in as an argument: keeping credential reading out of this module is
+    what makes it testable without global state.
     """
     if not is_anthropic_model(model):
         return kwargs
@@ -728,8 +735,9 @@ def build_request(kwargs: dict[str, Any], model: str, access_token: str = "") ->
     headers = kwargs.setdefault("extra_headers", {})
     if isinstance(headers, dict):
         headers.update(CLIENT_HEADERS)
-        # A beta de effort só viaja quando o pedido pede raciocínio, como no OMP; a de TTL
-        # estendido acompanha a retenção que as âncoras deste pedido realmente levam.
+        # The effort beta only travels when the request asks for reasoning, as in OMP; the
+        # extended-TTL one follows the retention that this request's anchors actually
+        # carry.
         headers["anthropic-beta"] = build_betas(thinking=_wants_thinking(kwargs))
 
     apply_thinking_params(kwargs, model)
@@ -738,15 +746,15 @@ def build_request(kwargs: dict[str, Any], model: str, access_token: str = "") ->
     if not isinstance(messages, list):
         return kwargs
 
-    # O LiteLLM faz pop de todas as mensagens system e junta-as à frente
-    # (llms/anthropic/chat/transformation.py:1686), por isso a beta
-    # mid-conversation-system-2026-04-07 que enviamos não se consegue honrar por aqui.
+    # LiteLLM pops every system message and joins them at the front
+    # (llms/anthropic/chat/transformation.py:1686), so the
+    # mid-conversation-system-2026-04-07 beta we send cannot be honoured from here.
     client_prompt, rest = split_system_messages(messages)
     system_blocks = build_system_blocks(client_prompt)
     identity = {"role": "system", "content": system_blocks}
 
-    # O head é ancorado primeiro para que o orçamento das mensagens já desconte o que ele
-    # gastou: o tecto de 4 é por pedido, e um quinto marcador dá 400.
+    # The head is anchored first so that the messages budget already discounts what it
+    # spent: the ceiling of 4 is per request, and a fifth marker gives 400.
     tools = kwargs.get("tools")
     head = apply_head_cache(system_blocks, tools if isinstance(tools, list) else None)
     apply_conversation_cache(rest, head)

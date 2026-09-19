@@ -1,11 +1,11 @@
-"""Camada HTTP: o que o transporte faz com cada resposta, sem abrir um socket.
+"""HTTP layer: what the transport does with each response, without opening a socket.
 
-O que interessa aqui não é que um GET devolva 200 — é o contrário: *quantas* vezes se
-repete um pedido rejeitado, *quando* deixa de ser legal repetir, e o que atravessa a
-fronteira quando nada disso resolve. São exactamente os pontos onde a versão original
-divergia entre o caminho síncrono e o assíncrono.
+What matters here is not that a GET returns 200 — it is the opposite: *how many* times a
+rejected request is repeated, *when* repeating it stops being legal, and what crosses the
+boundary when none of that helps. These are exactly the points where the original version
+diverged between the synchronous and the asynchronous path.
 
-Tudo com `httpx.MockTransport`: sem rede, sem relógio, determinístico.
+All of it with `httpx.MockTransport`: no network, no clock, deterministic.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def spec(
     provider: str = "codex",
     *,
     url: str | None = None,
-    token: str = "velho",
+    token: str = "old",
 ) -> RequestSpec:
     return RequestSpec(
         url=url or CODEX_URL,
@@ -48,7 +48,7 @@ def spec(
 
 
 class Recorder:
-    """Handler de `MockTransport` que guarda os pedidos e serve respostas por guião."""
+    """`MockTransport` handler that stores the requests and serves scripted responses."""
 
     def __init__(self, *responses: httpx.Response) -> None:
         self._responses = list(responses)
@@ -57,7 +57,7 @@ class Recorder:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         if not self._responses:
-            raise AssertionError(f"pedido a mais para {request.url}")
+            raise AssertionError(f"one request too many for {request.url}")
         return self._responses.pop(0)
 
     @property
@@ -97,7 +97,7 @@ class TestNonStreaming:
         assert response.headers["x-request-id"] == "abc"
 
     async def test_sends_the_spec_verbatim(self) -> None:
-        """Headers e corpo vêm do `wire/`; o transporte não os edita."""
+        """Headers and body come from `wire/`; the transport does not edit them."""
         recorder = Recorder(ok("{}"))
         async with transport(recorder) as client:
             await client.request(spec())
@@ -115,22 +115,22 @@ class TestTokenRefresh:
 
         async def refresh(provider: str) -> str:
             assert provider == "codex"
-            return "novo"
+            return "new"
 
         async with transport(recorder, refresh=refresh) as client:
             response = await client.request(spec())
 
         assert response.status == 200
-        assert recorder.tokens == ["Bearer velho", "Bearer novo"]
+        assert recorder.tokens == ["Bearer old", "Bearer new"]
 
     async def test_second_401_raises_instead_of_looping(self) -> None:
-        """Renovar em ciclo contra uma credencial recusada é um laço à velocidade da rede."""
-        recorder = Recorder(httpx.Response(401, text="um"), httpx.Response(401, text="dois"))
+        """Refreshing in a cycle against a rejected credential is a loop at network speed."""
+        recorder = Recorder(httpx.Response(401, text="one"), httpx.Response(401, text="two"))
         calls: list[str] = []
 
         async def refresh(provider: str) -> str:
             calls.append(provider)
-            return "novo"
+            return "new"
 
         async with transport(recorder, refresh=refresh) as client:
             with pytest.raises(UpstreamError) as raised:
@@ -139,20 +139,20 @@ class TestTokenRefresh:
         assert len(recorder.requests) == 2
         assert calls == ["codex"]
         assert raised.value.status == 401
-        assert raised.value.body == "dois"
+        assert raised.value.body == "two"
 
     async def test_without_callback_raises_the_real_401(self) -> None:
-        recorder = Recorder(httpx.Response(401, text="sem callback"))
+        recorder = Recorder(httpx.Response(401, text="no callback"))
         async with transport(recorder) as client:
             with pytest.raises(UpstreamError) as raised:
                 await client.request(spec())
 
         assert len(recorder.requests) == 1
-        assert (raised.value.status, raised.value.body) == (401, "sem callback")
+        assert (raised.value.status, raised.value.body) == (401, "no callback")
 
     async def test_callback_returning_none_raises_without_retrying(self) -> None:
-        """Token não renovável: repetir com o mesmo dava o mesmo 401."""
-        recorder = Recorder(httpx.Response(401, text="não renovável"))
+        """Non-refreshable token: repeating with the same one gave the same 401."""
+        recorder = Recorder(httpx.Response(401, text="not refreshable"))
 
         async def refresh(provider: str) -> None:
             return None
@@ -164,9 +164,9 @@ class TestTokenRefresh:
         assert len(recorder.requests) == 1
 
     async def test_an_empty_token_is_not_a_token(self) -> None:
-        """Uma renovação que devolve `""` falhou; usá-la mandava `Bearer ` e gastava a
-        única repetição disponível num pedido garantidamente recusado."""
-        recorder = Recorder(httpx.Response(401, text="vazio"))
+        """A refresh that returns `""` failed; using it sent `Bearer ` and spent the only
+        repetition available on a request guaranteed to be rejected."""
+        recorder = Recorder(httpx.Response(401, text="empty"))
 
         async def refresh(provider: str) -> str:
             return ""
@@ -180,7 +180,7 @@ class TestTokenRefresh:
 
 class TestDecisionsAreNotReimplemented:
     async def test_unsupported_model_raises_remap_without_retrying(self) -> None:
-        """Que modelo usar é do `plugin.py`; o transporte só assinala a possibilidade."""
+        """Which model to use belongs to `plugin.py`; the transport only flags the option."""
         body = "The 'gpt-6' model is not supported when using Codex with a ChatGPT account"
         recorder = Recorder(httpx.Response(400, text=body))
 
@@ -202,12 +202,14 @@ class TestDecisionsAreNotReimplemented:
         assert raised.value.status == 429
 
     async def test_remap_and_redeem_still_carry_the_upstream_error(self) -> None:
-        """Quem não as trate propaga o erro real, não um inventado pelo transporte."""
+        """Whoever does not handle them propagates the real error, not one the transport
+        invented."""
         assert issubclass(RemapRequired, UpstreamError)
         assert issubclass(RedeemRequired, UpstreamError)
 
     async def test_other_400_is_not_a_model_problem(self) -> None:
-        """Um payload inválido não vira `RemapRequired` — trocar de modelo não o resolve."""
+        """An invalid payload does not become `RemapRequired` — switching models does not
+        fix it."""
         recorder = Recorder(httpx.Response(400, text="Invalid value at 'input'"))
         async with transport(recorder) as client:
             with pytest.raises(UpstreamError) as raised:
@@ -216,16 +218,16 @@ class TestDecisionsAreNotReimplemented:
         assert not isinstance(raised.value, RemapRequired | RedeemRequired)
 
     async def test_error_never_invents_a_status(self) -> None:
-        recorder = Recorder(httpx.Response(503, text="upstream em baixo"))
+        recorder = Recorder(httpx.Response(503, text="upstream down"))
         async with transport(recorder) as client:
             with pytest.raises(UpstreamError) as raised:
                 await client.request(spec())
 
         assert raised.value.status == 503
-        assert "upstream em baixo" in str(raised.value)
+        assert "upstream down" in str(raised.value)
 
     async def test_antigravity_429_is_not_redeemable(self) -> None:
-        """A tabela do Antigravity não tem crédito de reset; usar a do Codex inventava um."""
+        """The Antigravity table has no reset credit; using the Codex one invented it."""
         recorder = Recorder(httpx.Response(429, text="rate"))
         async with transport(recorder) as client:
             with pytest.raises(UpstreamError) as raised:
@@ -250,7 +252,8 @@ class TestStreaming:
         assert events == [{"n": 1}, {"n": 2}]
 
     async def test_a_body_cut_mid_event_invents_nothing(self) -> None:
-        """Sem `[DONE]` e com a última linha truncada: entregam-se os eventos completos."""
+        """Without `[DONE]` and with the last line truncated: the complete events are
+        delivered."""
         body = 'data: {"n": 1}\ndata: {"n": 2, "part'
         async with transport(Recorder(ok(body))) as client:
             events = await drain(client, spec())
@@ -261,16 +264,17 @@ class TestStreaming:
         recorder = Recorder(httpx.Response(401, text="x"), ok(sse_body('data: {"n": 1}')))
 
         async def refresh(provider: str) -> str:
-            return "novo"
+            return "new"
 
         async with transport(recorder, refresh=refresh) as client:
             events = await drain(client, spec())
 
         assert events == [{"n": 1}]
-        assert recorder.tokens == ["Bearer velho", "Bearer novo"]
+        assert recorder.tokens == ["Bearer old", "Bearer new"]
 
     async def test_no_reopen_after_an_event_was_delivered(self) -> None:
-        """Depois do primeiro evento entregue, reabrir duplicava o prefixo já consumido."""
+        """After the first event is delivered, reopening duplicated the prefix already
+        consumed."""
         rotation = HostRotation()
         first = ok(sse_body('data: {"n": 1}'))
         recorder = Recorder(first, ok(sse_body('data: {"n": 1}')))
@@ -289,7 +293,7 @@ class TestHostFailover:
 
     async def test_failover_tries_the_next_host(self) -> None:
         rotation = HostRotation()
-        recorder = Recorder(httpx.Response(503, text="capacidade"), ok(sse_body('data: {"n":1}')))
+        recorder = Recorder(httpx.Response(503, text="capacity"), ok(sse_body('data: {"n":1}')))
 
         async with transport(recorder, rotation=rotation) as client:
             events = await drain(client, self._spec())
@@ -299,15 +303,13 @@ class TestHostFailover:
 
     async def test_both_hosts_failing_propagates_the_last_error(self) -> None:
         rotation = HostRotation()
-        recorder = Recorder(
-            httpx.Response(503, text="primeiro"), httpx.Response(404, text="último")
-        )
+        recorder = Recorder(httpx.Response(503, text="first"), httpx.Response(404, text="last"))
 
         async with transport(recorder, rotation=rotation) as client:
             with pytest.raises(UpstreamError) as raised:
                 await drain(client, self._spec())
 
-        assert (raised.value.status, raised.value.body) == (404, "último")
+        assert (raised.value.status, raised.value.body) == (404, "last")
 
     async def test_the_good_host_is_committed_only_after_a_full_stream(self) -> None:
         rotation = HostRotation()
@@ -316,7 +318,7 @@ class TestHostFailover:
         async with transport(recorder, rotation=rotation) as client:
             stream = client.stream(self._spec())
             await anext(stream)
-            # Um evento entregue não é um stream completo: o host ainda não conta.
+            # One delivered event is not a complete stream: the host does not count yet.
             assert rotation.index == 0
             await stream.aclose()
 
@@ -335,11 +337,11 @@ class TestHostFailover:
         assert rotation.current == HOSTS[1]
 
     async def test_a_reused_rotation_still_fails_over_on_the_next_request(self) -> None:
-        """A marca de "já emitiu" é por pedido, não por rotação.
+        """The "already emitted" mark is per request, not per rotation.
 
-        A rotação vive na sessão e sobrevive ao stream. Se o primeiro pedido a deixasse
-        marcada, o segundo perdia o failover — e a falha é silenciosa: vê-se como um erro
-        do upstream, não como um host por tentar.
+        The rotation lives in the session and outlives the stream. If the first request left
+        it marked, the second lost failover — and the failure is silent: it looks like an
+        upstream error, not like a host left untried.
         """
         rotation = HostRotation()
         recorder = Recorder(
@@ -363,7 +365,7 @@ class TestHostFailover:
         assert recorder.urls == [CODEX_URL]
 
     async def test_a_url_outside_the_rotation_is_not_rewritten(self) -> None:
-        """O Codex não tem hosts alternativos; uma rotação presente não o deve desviar."""
+        """Codex has no alternative hosts; a rotation being present must not divert it."""
         rotation = HostRotation()
         recorder = Recorder(httpx.Response(503, text="x"))
 
@@ -376,7 +378,7 @@ class TestHostFailover:
 
 class TestClientOwnership:
     async def test_an_injected_client_survives_the_transport(self) -> None:
-        """Fechá-lo partia o dono, que pode ter pedidos em voo."""
+        """Closing it broke the owner, which may have requests in flight."""
         injected = httpx.AsyncClient(transport=httpx.MockTransport(Recorder(ok("{}"))))
 
         async with Transport(client=injected) as client:

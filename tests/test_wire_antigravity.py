@@ -1,8 +1,8 @@
-"""Contrato de wire do Antigravity.
+"""Antigravity wire contract.
 
-O envelope é o mais rico dos três: mapeamento de modelo por effort, thinking por budget ou
-por nível, assinaturas de raciocínio entre turnos e media dentro de tool results. Cada
-campo omitido é um comportamento que desaparece em silêncio.
+The envelope is the richest of the three: model mapping by effort, thinking by budget or
+by level, reasoning signatures across turns, and media inside tool results. Every omitted
+field is a behaviour that disappears silently.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ def payload(messages: list[Any], model: str = "gemini-3-pro", **kwargs: Any) -> 
 
 class TestEnvelope:
     def test_fixed_envelope_fields(self) -> None:
-        """`labels` e `sessionId` não entram: o endpoint devolve 400 Unknown name."""
+        """`labels` and `sessionId` do not go in: the endpoint returns 400 Unknown name."""
         body = payload([{"role": "user", "content": "x"}])
         assert body["userAgent"] == "antigravity"
         assert body["requestType"] == "agent"
@@ -36,17 +36,17 @@ class TestEnvelope:
         assert set(body) == {"project", "requestId", "model", "userAgent", "requestType", "request"}
 
     def test_system_becomes_native_instruction(self) -> None:
-        """O campo nativo é aceite com role "user"; o splice no primeiro turno deixou de
-        ser necessário."""
-        body = payload([{"role": "system", "content": "regra"}, {"role": "user", "content": "x"}])
+        """The native field is accepted with role "user"; splicing into the first turn is
+        no longer necessary."""
+        body = payload([{"role": "system", "content": "rule"}, {"role": "user", "content": "x"}])
         assert body["request"]["systemInstruction"] == {
             "role": "user",
-            "parts": [{"text": "regra"}],
+            "parts": [{"text": "rule"}],
         }
         assert body["request"]["contents"][0]["role"] == "user"
 
     def test_assistant_becomes_model_role(self) -> None:
-        body = payload([{"role": "assistant", "content": "resposta"}])
+        body = payload([{"role": "assistant", "content": "answer"}])
         assert body["request"]["contents"][0]["role"] == "model"
 
     def test_default_output_ceiling(self) -> None:
@@ -54,14 +54,14 @@ class TestEnvelope:
         assert body["request"]["generationConfig"]["maxOutputTokens"] == 64000
 
     def test_accepts_openai_spelling_of_max_tokens(self) -> None:
-        """O OMP envia max_completion_tokens; ignorá-lo substituía o tecto do cliente."""
+        """OMP sends max_completion_tokens; ignoring it overrode the client's ceiling."""
         body = payload([{"role": "user", "content": "x"}], extra={"max_completion_tokens": 1234})
         assert body["request"]["generationConfig"]["maxOutputTokens"] == 1234
 
 
 class TestThinkingConfig:
     def test_always_present(self) -> None:
-        """Omitir faz o CCA reaplicar defaults e facturar thinking sem devolver texto."""
+        """Omitting it makes the CCA reapply defaults and bill thinking without returning text."""
         body = payload([{"role": "user", "content": "x"}])
         assert "thinkingConfig" in body["request"]["generationConfig"]
 
@@ -71,10 +71,10 @@ class TestThinkingConfig:
         assert config["includeThoughts"] is False
 
     def test_minimal_is_served_as_minimal(self) -> None:
-        """O OMP tem MINIMAL no tipo e manda-o; não há clamp para LOW.
+        """OMP has MINIMAL in the type and sends it; there is no clamp to LOW.
 
-        Servir `minimal` como `LOW` custava mais latência e mais tokens do que o cliente
-        pediu, em modelos que aceitam MINIMAL.
+        Serving `minimal` as `LOW` cost more latency and more tokens than the client asked
+        for, on models that accept MINIMAL.
         """
         body = payload(
             [{"role": "user", "content": "x"}],
@@ -84,7 +84,7 @@ class TestThinkingConfig:
         assert body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "MINIMAL"
 
     def test_catalog_budget_wins_over_level(self) -> None:
-        """Com catálogo usa-se o budget anunciado para a variante."""
+        """With a catalog, the budget announced for the variant is used."""
         catalog = ModelCatalog(
             ids=("gemini-3-pro-low",),
             info={"gemini-3-pro-low": {"thinkingBudget": 1000}},
@@ -96,8 +96,8 @@ class TestThinkingConfig:
         assert "thinkingLevel" not in config
 
     def test_suppression_is_zero_budget_not_the_catalog_minimum(self) -> None:
-        """Com `includeThoughts: False`, um orçamento positivo é facturado sem devolver
-        texto nenhum. O `minThinkingBudget` do catálogo não é zero em várias variantes."""
+        """With `includeThoughts: False`, a positive budget is billed without returning any
+        text at all. The catalog's `minThinkingBudget` is not zero on several variants."""
         catalog = ModelCatalog(
             ids=("gemini-3-pro-low",),
             info={"gemini-3-pro-low": {"thinkingBudget": 1000, "minThinkingBudget": 128}},
@@ -120,7 +120,7 @@ class TestThinkingConfig:
 
 class TestModelMapping:
     def test_explicit_variant_is_respected(self) -> None:
-        """Pedir -tiered não pode acabar em -low porque o effort assim decidiu."""
+        """Asking for -tiered cannot end up as -low because the effort decided so."""
         catalog = ModelCatalog(
             ids=("gemini-3.8-flash-tiered", "gemini-3.8-flash-low"), fetched_at=1.0
         )
@@ -133,17 +133,17 @@ class TestModelMapping:
         assert map_model("gemini-3.8-flash", "high", catalog) == "gemini-3.8-flash-high"
 
     def test_broken_variant_never_chosen(self) -> None:
-        """gemini-3.1-pro-high está no catálogo e devolve 400 INVALID_ARGUMENT."""
+        """gemini-3.1-pro-high is in the catalog and returns 400 INVALID_ARGUMENT."""
         catalog = ModelCatalog(ids=("gemini-3.1-pro-high", "gemini-pro-agent"), fetched_at=1.0)
         assert map_model("gemini-3.1-pro", "high", catalog) == "gemini-pro-agent"
 
     def test_unknown_name_raises_instead_of_substituting(self) -> None:
-        """O wildcard gemini-* faria um nome inventado responder como 2.5-flash."""
+        """The gemini-* wildcard would make a made-up name answer as 2.5-flash."""
         with pytest.raises(ModelNotServedError):
-            map_model("gemini-inventado-9")
+            map_model("gemini-made-up-9")
 
     def test_thinking_suffix_not_peeled(self) -> None:
-        """gemini-3.8-flash-thinking não existe; descascá-lo servia -low em silêncio."""
+        """gemini-3.8-flash-thinking does not exist; peeling it served -low silently."""
         with pytest.raises(ModelNotServedError):
             map_model("gemini-3.8-flash-thinking")
 
@@ -164,7 +164,7 @@ class TestModelMapping:
 
 class TestMultimodal:
     def test_data_uri_becomes_bare_base64(self) -> None:
-        """O prefixo data: dá 400 "Invalid value at ... inline_data.data"."""
+        """The data: prefix gives 400 "Invalid value at ... inline_data.data"."""
         part = ag.media_from_url(PNG)
         assert part is not None
         assert part["inlineData"]["mimeType"] == "image/png"
@@ -175,7 +175,7 @@ class TestMultimodal:
         assert part == {"fileData": {"mimeType": "application/pdf", "fileUri": "gs://bucket/x.pdf"}}
 
     def test_web_url_needs_a_fetcher(self) -> None:
-        """fileData com um URL da web dá 404 Requested entity was not found."""
+        """fileData with a web URL gives 404 Requested entity was not found."""
         with pytest.raises(ag.MediaFetchError):
             ag.media_from_url("https://example.com/a.png")
 
@@ -192,7 +192,7 @@ class TestMultimodal:
 
     def test_text_and_media_keep_input_order(self) -> None:
         parts = ag.content_parts(
-            [{"type": "text", "text": "cor?"}, {"type": "image_url", "image_url": {"url": PNG}}]
+            [{"type": "text", "text": "colour?"}, {"type": "image_url", "image_url": {"url": PNG}}]
         )
         assert "text" in parts[0] and "inlineData" in parts[1]
 
@@ -201,16 +201,17 @@ class TestMultimodal:
         assert part is not None
 
     def test_image_replaced_by_placeholder_without_vision(self) -> None:
-        """Um modelo sem vision devolve 400 à imagem; descartá-la calada fazia o modelo
-        responder sobre conteúdo que não recebeu."""
+        """A model without vision returns 400 for the image; dropping it silently made the
+        model answer about content it never received."""
         parts = ag.content_parts(
-            [{"type": "text", "text": "cor?"}, {"type": "image_url", "image_url": {"url": PNG}}],
+            [{"type": "text", "text": "colour?"}, {"type": "image_url", "image_url": {"url": PNG}}],
             supports_images=False,
         )
-        assert parts == [{"text": "cor?"}, {"text": ag.NON_VISION_IMAGE_PLACEHOLDER}]
+        assert parts == [{"text": "colour?"}, {"text": ag.NON_VISION_IMAGE_PLACEHOLDER}]
 
     def test_non_image_media_survives_without_vision(self) -> None:
-        """A guarda é de vision, não de anexos: um PDF não passa pelo caminho de imagem."""
+        """The guard is about vision, not attachments: a PDF does not go through the image
+        path."""
         parts = ag.content_parts(
             [{"type": "file", "file": {"file_data": PNG, "filename": "doc.pdf"}}],
             supports_images=False,
@@ -218,39 +219,39 @@ class TestMultimodal:
         assert len(parts) == 1 and "inlineData" in parts[0]
 
     def test_blank_text_block_produces_no_part(self) -> None:
-        """Um `{"text": "   "}` não transporta informação e parte alguns modelos servidos
-        por esta API (o Claude, entre eles)."""
+        """A `{"text": "   "}` carries no information and breaks some models served by this
+        API (Claude among them)."""
         assert ag.content_parts([{"type": "text", "text": "   "}]) == []
         assert ag.content_parts("   ") == []
 
     def test_lone_surrogate_never_reaches_the_wire(self) -> None:
-        """Um surrogate órfão não codifica em UTF-8: o payload rebentava a serialização
-        em vez de ser enviado."""
+        """A lone surrogate does not encode as UTF-8: the payload blew up serialisation
+        instead of being sent."""
         parts = ag.content_parts([{"type": "text", "text": "a\ud800b"}])
         json.dumps(parts)
         assert parts == [{"text": "a\ufffdb"}]
 
     def test_real_emoji_survives(self) -> None:
-        """Substituir por posição destruía emoji legítimo vindo do cliente.
+        """Replacing by position destroyed legitimate emoji coming from the client.
 
-        Um emoji num `str` de Python é **um** code point, não um par de surrogates.
+        An emoji in a Python `str` is **one** code point, not a surrogate pair.
         """
-        assert ag.well_formed("olá 😀") == "olá 😀"
+        assert ag.well_formed("hello 😀") == "hello 😀"
 
     def test_surrogate_pair_is_also_replaced(self) -> None:
-        """Onde o OMP preserva o par, aqui ele tem de sair.
+        """Where OMP preserves the pair, here it has to go.
 
-        Em JavaScript `\\ud83d\\ude00` é um caractere e o `toWellFormed()` mantém-no. Em
-        Python são dois code points que não codificam: preservá-los rebenta
-        `str.encode("utf-8")` e o `json.dumps(..., ensure_ascii=False)` que muitos
-        clientes HTTP usam para montar o corpo.
+        In JavaScript `\\ud83d\\ude00` is one character and `toWellFormed()` keeps it. In
+        Python they are two code points that do not encode: preserving them blows up
+        `str.encode("utf-8")` and the `json.dumps(..., ensure_ascii=False)` that many HTTP
+        clients use to build the body.
         """
-        cleaned = ag.well_formed("par \ud83d\ude00 aqui")
+        cleaned = ag.well_formed("pair \ud83d\ude00 here")
         cleaned.encode("utf-8")
         assert "\ud83d" not in cleaned
 
     def test_every_text_on_the_wire_is_encodable(self) -> None:
-        """A garantia que interessa não é "sem órfãos", é "serializa"."""
+        """The guarantee that matters is not "no lone surrogates", it is "it serialises"."""
         payload = ag.build_payload(
             "gemini-3-pro",
             [{"role": "user", "content": "a\ud800b \ud83d\ude00 c"}],
@@ -276,7 +277,7 @@ class TestToolCalls:
         assert "id" not in legacy[0]["parts"][0]["functionCall"]
 
     def test_sentinel_used_once_per_request(self) -> None:
-        """O CCA valida a assinatura do primeiro functionCall do turno."""
+        """The CCA validates the signature of the turn's first functionCall."""
         body = payload(
             [
                 {
@@ -322,20 +323,20 @@ class TestToolCalls:
         assert body["request"]["contents"][0]["parts"][0]["thoughtSignature"] == "c2lnLWxlbWJyYWRh"
 
     def test_invalid_arguments_preserved_as_raw(self) -> None:
-        """Deitar fora os argumentos perdia a intenção da chamada."""
+        """Throwing the arguments away lost the intent of the call."""
         body = payload(
             [
                 {
                     "role": "assistant",
                     "tool_calls": [
-                        {"id": "c1", "function": {"name": "f", "arguments": "nao-json"}}
+                        {"id": "c1", "function": {"name": "f", "arguments": "not-json"}}
                     ],
                 },
                 {"role": "tool", "tool_call_id": "c1", "content": "r"},
             ]
         )
         assert body["request"]["contents"][0]["parts"][0]["functionCall"]["args"] == {
-            "__raw": "nao-json"
+            "__raw": "not-json"
         }
 
     def test_tool_results_are_grouped_in_one_turn(self) -> None:
@@ -356,20 +357,20 @@ class TestToolCalls:
         assert responses["role"] == "user" and len(responses["parts"]) == 2
 
     def test_tool_name_recovered_from_the_call(self) -> None:
-        """O formato OpenAI não traz o nome no resultado."""
+        """The OpenAI format does not carry the name in the result."""
         body = payload(
             [
                 {
                     "role": "assistant",
-                    "tool_calls": [{"id": "c1", "function": {"name": "ler", "arguments": "{}"}}],
+                    "tool_calls": [{"id": "c1", "function": {"name": "read", "arguments": "{}"}}],
                 },
                 {"role": "tool", "tool_call_id": "c1", "content": "r"},
             ]
         )
-        assert body["request"]["contents"][1]["parts"][0]["functionResponse"]["name"] == "ler"
+        assert body["request"]["contents"][1]["parts"][0]["functionResponse"]["name"] == "read"
 
     def test_media_travels_inside_function_response(self) -> None:
-        """Medido: a imagem em functionResponse.parts é vista em todas as gerações."""
+        """Measured: the image in functionResponse.parts is seen on every generation."""
         body = payload(
             [
                 {
@@ -380,21 +381,21 @@ class TestToolCalls:
                     "role": "tool",
                     "tool_call_id": "c1",
                     "content": [
-                        {"type": "text", "text": "captura"},
+                        {"type": "text", "text": "capture"},
                         {"type": "image_url", "image_url": {"url": PNG}},
                     ],
                 },
             ]
         )
         response = body["request"]["contents"][1]["parts"][0]["functionResponse"]
-        assert response["response"] == {"output": "captura"}
+        assert response["response"] == {"output": "capture"}
         assert "inlineData" in response["parts"][0]
 
     def test_sentinel_is_per_turn_not_per_request(self) -> None:
-        """O CCA exige a sentinela na primeira chamada de **cada** turno assistant.
+        """The CCA requires the sentinel on the first call of **every** assistant turn.
 
-        Marcá-la uma vez por pedido deixava os turnos seguintes com chamadas nuas, e o
-        backend respondia 400 na validação de assinatura.
+        Marking it once per request left the following turns with bare calls, and the
+        backend answered 400 on signature validation.
         """
         body = payload(
             [
@@ -416,7 +417,7 @@ class TestToolCalls:
             assert turn["parts"][0]["thoughtSignature"] == ag.SIGNATURE_SENTINEL
 
     def test_invalid_signature_is_replaced_by_the_sentinel(self) -> None:
-        """Uma assinatura não-base64 dá 400 e, por ser truthy, bloqueava a sentinela."""
+        """A non-base64 signature gives 400 and, being truthy, blocked the sentinel."""
         body = payload(
             [
                 {
@@ -424,7 +425,7 @@ class TestToolCalls:
                     "tool_calls": [
                         {
                             "id": "c1",
-                            "thoughtSignature": "isto nao e base64!",
+                            "thoughtSignature": "this is not base64!",
                             "function": {"name": "f", "arguments": "{}"},
                         }
                     ],
@@ -437,7 +438,7 @@ class TestToolCalls:
         )
 
     def test_secondary_calls_stay_bare_when_first_is_signed(self) -> None:
-        """Turno com primeira chamada assinada: as seguintes não levam sentinela."""
+        """Turn whose first call is signed: the following ones carry no sentinel."""
         body = payload(
             [
                 {
@@ -456,14 +457,14 @@ class TestToolCalls:
         assert "thoughtSignature" not in parts[1]
 
     def test_multipart_text_keeps_a_separator(self) -> None:
-        """Sem separador, a última palavra de uma parte cola-se à primeira da seguinte."""
+        """Without a separator, the last word of one part sticks to the first of the next."""
         value, _ = ag.tool_result_value(
-            {"content": [{"type": "text", "text": "primeira"}, {"type": "text", "text": "segunda"}]}
+            {"content": [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}]}
         )
-        assert value == {"output": "primeira\nsegunda"}
+        assert value == {"output": "first\nsecond"}
 
     def test_image_only_result_is_announced(self) -> None:
-        """`output: ""` é lido como tool sem resultado e o modelo repete a chamada."""
+        """`output: ""` is read as a tool with no result and the model repeats the call."""
         value, media = ag.tool_result_value(
             {"content": [{"type": "image_url", "image_url": {"url": PNG}}]}
         )
@@ -471,27 +472,27 @@ class TestToolCalls:
         assert len(media) == 1
 
     def test_error_result_uses_error_key(self) -> None:
-        value, _ = ag.tool_result_value({"content": "falhou", "is_error": True})
-        assert value == {"error": "falhou"}
+        value, _ = ag.tool_result_value({"content": "failed", "is_error": True})
+        assert value == {"error": "failed"}
 
     def test_tool_result_image_replaced_by_placeholder_without_vision(self) -> None:
-        """A imagem que a tool devolveu não pode sair do resultado sem deixar rasto: o
-        modelo lia um texto que a calava."""
+        """The image the tool returned cannot leave the result without a trace: the model
+        read a text that silenced it."""
         value, media = ag.tool_result_value(
             {
                 "content": [
-                    {"type": "text", "text": "captura"},
+                    {"type": "text", "text": "capture"},
                     {"type": "image_url", "image_url": {"url": PNG}},
                 ]
             },
             supports_images=False,
         )
         assert media == []
-        assert value == {"output": f"captura\n{ag.NON_VISION_IMAGE_PLACEHOLDER}"}
+        assert value == {"output": f"capture\n{ag.NON_VISION_IMAGE_PLACEHOLDER}"}
 
     def test_payload_carries_the_placeholder_not_the_image(self) -> None:
-        """A capacidade tem de atravessar o envelope: filtrar só em `content_parts` não
-        salvava o pedido que o proxy envia."""
+        """The capability has to cross the envelope: filtering only in `content_parts` did
+        not save the request the proxy sends."""
         body = payload(
             [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": PNG}}]}],
             supports_images=False,
@@ -502,10 +503,10 @@ class TestToolCalls:
 
 class TestTools:
     def test_schema_always_travels_as_parameters(self) -> None:
-        """`parametersJsonSchema` nunca chega ao fio deste backend.
+        """`parametersJsonSchema` never reaches this backend's wire.
 
-        O OMP converte **todas** as declarações no caminho Antigravity; o campo do JSON
-        Schema completo era uma leitura errada da API pública do Gemini.
+        OMP converts **every** declaration on the Antigravity path; the full JSON Schema
+        field was a misreading of the public Gemini API.
         """
         tools, _ = ag.tools_to_declarations(
             "gemini-3-pro",
@@ -517,7 +518,7 @@ class TestTools:
         assert "parametersJsonSchema" not in declaration
 
     def test_unsupported_constructs_are_sanitised(self) -> None:
-        """`anyOf`/`$ref`/`not` dão 400 no CCA; mandá-los crus fazia o pedido falhar."""
+        """`anyOf`/`$ref`/`not` give 400 on the CCA; sending them raw made the request fail."""
         tools, _ = ag.tools_to_declarations(
             "gemini-3-pro",
             [
@@ -538,7 +539,7 @@ class TestTools:
         assert "anyOf" not in serialised
 
     def test_every_model_uses_the_same_field(self) -> None:
-        """A escolha por família era invenção local: o OMP não distingue aqui."""
+        """Choosing by family was a local invention: OMP does not distinguish here."""
         for model in ("gemini-3-pro", "claude-sonnet-4-6", "gemini-2.5-flash"):
             tools, _ = ag.tools_to_declarations(
                 model, [{"type": "function", "function": {"name": "f", "parameters": {}}}]
@@ -562,9 +563,9 @@ class TestTools:
         assert config["functionCallingConfig"]["allowedFunctionNames"] == ["read"]
 
     def test_unknown_named_choice_falls_back(self) -> None:
-        """Um nome que não foi declarado não pode restringir a nada."""
+        """A name that was not declared cannot restrict to anything."""
         config = ag.tool_config(
-            {"type": "function", "function": {"name": "inexistente"}}, [{"name": "read"}]
+            {"type": "function", "function": {"name": "nonexistent"}}, [{"name": "read"}]
         )
         assert config["functionCallingConfig"]["mode"] == "VALIDATED"
 

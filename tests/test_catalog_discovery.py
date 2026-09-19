@@ -1,15 +1,15 @@
-"""Descoberta de modelos: o que a lista diz sobre a conta, e o que não pode dizer.
+"""Model discovery: what the list says about the account, and what it must not say.
 
-O que se testa aqui não é que um POST devolva 200. É a fronteira entre facto e hipótese —
-`verified` — e as duas maneiras de a atravessar por engano:
+What is tested here is not that a POST returns 200. It is the boundary between fact and
+hypothesis — `verified` — and the two ways of crossing it by mistake:
 
-* marcar como servido um nome que ninguém confirmou;
-* marcar como não servido um nome que a rede desta máquina não deixou perguntar.
+* marking as served a name nobody confirmed;
+* marking as not served a name this machine's network did not allow asking about.
 
-As duas produzem uma lista plausível e errada, que é exactamente o modo de falha que o
-resto do pacote existe para evitar.
+Both produce a plausible, wrong list, which is exactly the failure mode the rest of the
+package exists to avoid.
 
-Tudo com `httpx.MockTransport`: sem rede, sem relógio.
+All of it with `httpx.MockTransport`: no network, no clock.
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ from litellm_mysubs.wire.codex import resolve_model
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
-#: JWT sem assinatura com a claim de conta que o `codex.build_headers` lê. O corpo é
-#: `{"https://api.openai.com/auth": {"chatgpt_account_id": "acc-1"}}` em base64url.
+#: Unsigned JWT carrying the account claim that `codex.build_headers` reads. The body is
+#: `{"https://api.openai.com/auth": {"chatgpt_account_id": "acc-1"}}` in base64url.
 CODEX_TOKEN = (
     "eyJhbGciOiJub25lIn0."
     "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjLTEifX0."
@@ -65,14 +65,15 @@ def catalog_payload(*ids: str, deprecated: tuple[str, ...] = ()) -> dict[str, ob
 
 
 class TestGoogleCatalog:
-    """O único provedor com catálogo real. A verdade é a resposta, não uma lista nossa."""
+    """The only provider with a real catalogue. The truth is the response, not a list of
+    ours."""
 
     async def test_deprecated_model_never_reaches_the_user(self) -> None:
-        """Um id em `deprecatedModelIds` está no payload e não pode sair na lista.
+        """An id in `deprecatedModelIds` is in the payload and must not come out in the list.
 
-        É a razão de ser do desconto: o catálogo anuncia variantes que o
-        `streamGenerateContent` recusa com 400, e oferecê-las produz um deployment que só
-        sabe falhar.
+        That is the reason the subtraction exists: the catalogue advertises variants that
+        `streamGenerateContent` refuses with 400, and offering them produces a deployment
+        that only knows how to fail.
         """
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -89,7 +90,7 @@ class TestGoogleCatalog:
         assert [m.wire_name for m in models] == ["gemini-3.1-pro"]
 
     async def test_catalog_ids_are_verified_without_probing(self) -> None:
-        """O catálogo é a resposta do próprio upstream: não precisa de confirmação."""
+        """The catalogue is the upstream's own answer: it needs no confirmation."""
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=catalog_payload("gemini-3.1-pro"))
@@ -104,10 +105,10 @@ class TestGoogleCatalog:
         ]
 
     async def test_broken_wire_variant_is_listed_unverified(self) -> None:
-        """`gemini-3.1-pro-high` está no catálogo e dá 400 no fio.
+        """`gemini-3.1-pro-high` is in the catalogue and gives 400 on the wire.
 
-        Escondê-lo perdia informação que a conta deu; anunciá-lo como servido repetia o
-        defeito. Fica listado, com `verified=False` e a razão.
+        Hiding it lost information the account gave; advertising it as served repeated the
+        defect. It stays listed, with `verified=False` and the reason.
         """
         broken = BROKEN_WIRE[0]
 
@@ -122,11 +123,12 @@ class TestGoogleCatalog:
         assert found["gemini-3.1-pro"].verified is True
 
     async def test_empty_catalog_keeps_previous_snapshot_labelled_with_age(self) -> None:
-        """Uma resposta sem modelos não apaga o que já se sabia, e não passa por actual.
+        """A response with no models does not erase what was already known, and does not pass
+        as current.
 
-        `ModelCatalog.update` ignora um payload vazio de propósito. Devolver o
-        instantâneo é honesto; devolvê-lo sem idade seria apresentar dados velhos como
-        frescos — o "número plausível fabricado" que o projecto proíbe.
+        `ModelCatalog.update` ignores an empty payload on purpose. Returning the snapshot is
+        honest; returning it without its age would present old data as fresh — the
+        "fabricated plausible number" the project forbids.
         """
         catalog = ModelCatalog()
         catalog.update(catalog_payload("gemini-3.1-pro"), now=1000.0)
@@ -141,17 +143,17 @@ class TestGoogleCatalog:
         assert "300 s" in models[0].note
 
     async def test_all_deprecated_payload_is_treated_as_stale_not_fresh(self) -> None:
-        """200 cujos modelos estão todos deprecados não renova nada.
+        """A 200 whose models are all deprecated refreshes nothing.
 
-        Bastava olhar para "houve resposta" para etiquetar isto como fresco e servir um
-        catálogo velho como actual.
+        Looking only at "there was a response" was enough to label this fresh and serve an
+        old catalogue as current.
         """
         catalog = ModelCatalog()
         catalog.update(catalog_payload("gemini-3.1-pro"), now=1000.0)
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
-                200, json=catalog_payload("gemini-9-novo", deprecated=("gemini-9-novo",))
+                200, json=catalog_payload("gemini-9-new", deprecated=("gemini-9-new",))
             )
 
         async with client(handler) as http:
@@ -161,9 +163,9 @@ class TestGoogleCatalog:
         assert "42 s" in models[0].note
 
     async def test_fresh_catalog_carries_no_age_note(self) -> None:
-        """A etiqueta de idade só aparece quando há idade: caso contrário é ruído."""
+        """The age label only shows up when there is an age: otherwise it is noise."""
         catalog = ModelCatalog()
-        catalog.update(catalog_payload("gemini-antigo"), now=1000.0)
+        catalog.update(catalog_payload("gemini-old"), now=1000.0)
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=catalog_payload("gemini-3.1-pro"))
@@ -175,23 +177,23 @@ class TestGoogleCatalog:
         assert models[0].note == ""
 
     async def test_unreachable_catalog_without_snapshot_raises(self) -> None:
-        """Sem catálogo e sem instantâneo não há resposta honesta em forma de lista."""
+        """With no catalogue and no snapshot there is no honest answer shaped like a list."""
 
         def handler(request: httpx.Request) -> httpx.Response:
-            raise httpx.ConnectError("sem rota", request=request)
+            raise httpx.ConnectError("no route", request=request)
 
         async with client(handler) as http:
             with pytest.raises(DiscoveryError):
                 await discover(GOOGLE, client=http)
 
     async def test_second_host_is_tried_when_the_first_fails(self) -> None:
-        """Um host em baixo não é uma conta sem modelos."""
+        """A host that is down is not an account with no models."""
         seen: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             seen.append(str(request.url))
             if str(request.url).startswith(HOSTS[0]):
-                return httpx.Response(503, text="indisponível")
+                return httpx.Response(503, text="unavailable")
             return httpx.Response(200, json=catalog_payload("gemini-3.1-pro"))
 
         async with client(handler) as http:
@@ -201,50 +203,274 @@ class TestGoogleCatalog:
         assert [m.wire_name for m in models] == ["gemini-3.1-pro"]
 
 
+def sse_stream(*, text: str = "", usage: dict[str, object] | None = None) -> str:
+    """SSE body of one CCA turn, in the shape `:streamGenerateContent` returns."""
+    event: dict[str, object] = {
+        "response": {
+            "candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": "STOP"}],
+            "usageMetadata": usage if usage is not None else {"totalTokenCount": 12},
+        }
+    }
+    return f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n"
+
+
+#: The text measured on the real account for `gemini-3.5-flash-low` and `-extra-low`:
+#: HTTP 200, `finishReason: STOP`, and zero tokens billed.
+RETIREMENT_NOTICE = (
+    "Gemini 3.5 Flash is no longer available. Please switch to Gemini 3.7 Flash in the "
+    "latest version of Antigravity."
+)
+
+
+class TestGoogleProbe:
+    """Being in the catalogue is not being served, and the name does not predict which is
+    which.
+
+    Measured on the same account: `gemini-3.5-flash-lite` answers and `-low` is dead;
+    `tab_flash_lite_preview` answers and `tab_jump_flash_lite_preview` gives 400. Each test
+    here pins one of the verdicts that tell those pairs apart, and the last one pins the
+    rule that makes them safe — none of them leaves the list.
+    """
+
+    async def test_answering_model_is_verified(self) -> None:
+        """200 with content and tokens billed: `gemini-3.5-flash-lite`, measured."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(200, json=catalog_payload("gemini-3.5-flash-lite"))
+            return httpx.Response(200, text=sse_stream(text="2 + 2 = 4"))
+
+        async with client(handler) as http:
+            models = await discover(GOOGLE, client=http, probe=True)
+
+        assert [(m.wire_name, m.verified, m.note) for m in models] == [
+            ("gemini-3.5-flash-lite", True, "")
+        ]
+
+    async def test_refused_model_is_unverified_citing_the_400(self) -> None:
+        """`chat_23310` gives 400 "Request contains an invalid argument"; its `tab_*` sibling
+        does not.
+
+        The note cites the status because the status is what the user can check; a generic
+        note left the 400 indistinguishable from a network failure.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(
+                    200, json=catalog_payload("chat_23310", "tab_flash_lite_preview")
+                )
+            if '"chat_23310"' in request.read().decode():
+                return httpx.Response(400, json={"error": {"message": "invalid argument"}})
+            return httpx.Response(200, text=sse_stream(text="Hello!"))
+
+        async with client(handler) as http:
+            found = by_name(await discover(GOOGLE, client=http, probe=True))
+
+        assert found["chat_23310"].verified is False
+        assert "400" in found["chat_23310"].note
+        assert found["tab_flash_lite_preview"].verified is True
+
+    async def test_retirement_notice_is_not_an_answer(self) -> None:
+        """200 + notice + usage 0 is a dead model passing for a live one.
+
+        This is the defect that hurts most: without it the notice enters the history as if
+        the model had spoken. The note is its own — merging it with the 400 one erased the
+        difference between "the upstream refused the request" and "the model no longer
+        exists".
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(200, json=catalog_payload("gemini-3.5-flash-low"))
+            return httpx.Response(
+                200, text=sse_stream(text=RETIREMENT_NOTICE, usage={"totalTokenCount": 0})
+            )
+
+        async with client(handler) as http:
+            found = by_name(await discover(GOOGLE, client=http, probe=True))
+
+        dead = found["gemini-3.5-flash-low"]
+        assert dead.verified is False
+        assert dead.note == "model retired by upstream"
+        assert "400" not in dead.note
+
+    async def test_unreachable_probe_keeps_the_model_listed(self) -> None:
+        """A timeout is a fact about this network, not about the account.
+
+        Discarding the model here was lying about the subscription, so the proof is the
+        length of the list: both catalogue names are still there.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(200, json=catalog_payload("gemini-3.1-pro", "gemini-2.5-pro"))
+            raise httpx.ReadTimeout("took too long", request=request)
+
+        async with client(handler) as http:
+            models = await discover(GOOGLE, client=http, probe=True)
+
+        assert [m.wire_name for m in models] == ["gemini-3.1-pro", "gemini-2.5-pro"]
+        assert not any(m.verified for m in models)
+        assert all("could not probe" in m.note for m in models)
+
+    async def test_transient_capacity_is_not_a_denial(self) -> None:
+        """503 "No capacity available" is Google capacity, measured on `gemini-2.5-pro`.
+
+        Treating it as a refusal disabled a good model until the next discovery, and the
+        note has to say so without promising anything — `verified` stays false because
+        nobody measured.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(200, json=catalog_payload("gemini-2.5-pro"))
+            return httpx.Response(503, text="No capacity available")
+
+        async with client(handler) as http:
+            found = by_name(await discover(GOOGLE, client=http, probe=True))
+
+        note = found["gemini-2.5-pro"].note
+        assert found["gemini-2.5-pro"].verified is False
+        assert "could not probe" in note
+        assert "503" in note
+
+    async def test_in_band_error_inside_a_200_is_a_denial(self) -> None:
+        """The CCA returns errors inside the stream with HTTP 200.
+
+        The status alone said "served": it is exactly the failure mode that
+        `plugin.py :: _raise_in_band` exists to catch on the real path.
+        """
+        event = {"error": {"code": 400, "message": "Request contains an invalid argument."}}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(200, json=catalog_payload("chat_20706"))
+            return httpx.Response(200, text=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n")
+
+        async with client(handler) as http:
+            found = by_name(await discover(GOOGLE, client=http, probe=True))
+
+        assert found["chat_20706"].verified is False
+        assert "400" in found["chat_20706"].note
+
+    async def test_probe_is_off_by_default(self) -> None:
+        """The probe spends quota: one billed turn per catalogue name.
+
+        Without `probe`, the transport can only see the catalogue request. One extra probe
+        request here meant that connecting the subscription billed 32 turns without the user
+        having asked for anything.
+        """
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            return httpx.Response(200, json=catalog_payload("gemini-3.1-pro", "chat_23310"))
+
+        async with client(handler) as http:
+            models = await discover(GOOGLE, client=http)
+
+        assert paths == [MODELS_PATH]
+        assert [m.wire_name for m in models] == ["gemini-3.1-pro", "chat_23310"]
+
+    async def test_probes_respect_the_concurrency_ceiling(self) -> None:
+        """The real catalogue has 32 names; without a ceiling that would be 32 connections at
+        once.
+
+        The backend itself answers that with 503, which would turn the spike into a whole
+        list of "could not probe".
+        """
+        names = tuple(f"gemini-probe-{n}" for n in range(PROBE_CONCURRENCY * 3))
+        in_flight = 0
+        peak = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal in_flight, peak
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(200, json=catalog_payload(*names))
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                # Two turns through the scheduler: without them each probe runs to completion
+                # before the next starts, and the peak was 1 even with no semaphore at all.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                return httpx.Response(200, text=sse_stream(text="4"))
+            finally:
+                in_flight -= 1
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            models = await discover(GOOGLE, client=http, probe=True)
+
+        assert len(models) == len(names)
+        assert peak > 1, "the probes have to run in parallel"
+        assert peak <= PROBE_CONCURRENCY
+
+    async def test_measurement_overrides_the_static_broken_list(self) -> None:
+        """`BROKEN_WIRE` is a stored guess; the probe is the measurement of now.
+
+        If the upstream serves a name from that list again, keeping it unverified would be
+        preferring the table to the response — the opposite of what this module defends.
+        """
+        broken = BROKEN_WIRE[0]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(200, json=catalog_payload(broken))
+            return httpx.Response(200, text=sse_stream(text="2 + 2 = 4"))
+
+        async with client(handler) as http:
+            found = by_name(await discover(GOOGLE, client=http, probe=True))
+
+        assert found[broken].verified is True
+        assert found[broken].note == ""
+
+
 class TestProbedProviders:
-    """Anthropic e Codex: lista curada e sonda. Só o upstream decide."""
+    """Anthropic and Codex: curated list plus probe. Only the upstream decides."""
 
     async def test_upstream_not_found_removes_the_model(self) -> None:
-        """404 com `not_found_error` é "esta conta não serve": sai da lista."""
-        recusado = CURATED_ANTHROPIC[0]
+        """404 with `not_found_error` means "this account does not serve it": out of the
+        list."""
+        refused = CURATED_ANTHROPIC[0]
 
         def handler(request: httpx.Request) -> httpx.Response:
             body = request.read().decode()
-            if f'"{recusado}"' in body:
+            if f'"{refused}"' in body:
                 return httpx.Response(404, json={"error": {"type": "not_found_error"}})
             return httpx.Response(200, json={})
 
         async with client(handler) as http:
             models = await discover(ANTHROPIC, client=http)
 
-        assert recusado not in by_name(models)
+        assert refused not in by_name(models)
         assert len(models) == len(CURATED_ANTHROPIC) - 1
 
     async def test_network_failure_keeps_the_model_unverified_with_reason(self) -> None:
-        """Uma sonda que não chegou ao upstream não é um facto sobre a conta.
+        """A probe that never reached the upstream is not a fact about the account.
 
-        Esta é a asserção central do módulo: tratar `ConnectError` como recusa apagava
-        modelos servidos sempre que a máquina do utilizador tivesse a rede instável.
+        This is the module's central assertion: treating `ConnectError` as a refusal deleted
+        served models whenever the user's machine had a flaky network.
         """
-        inalcancavel = CURATED_ANTHROPIC[1]
+        unreachable = CURATED_ANTHROPIC[1]
 
         def handler(request: httpx.Request) -> httpx.Response:
-            if f'"{inalcancavel}"' in request.read().decode():
-                raise httpx.ConnectError("sem rota", request=request)
+            if f'"{unreachable}"' in request.read().decode():
+                raise httpx.ConnectError("no route", request=request)
             return httpx.Response(200, json={})
 
         async with client(handler) as http:
             found = by_name(await discover(ANTHROPIC, client=http))
 
-        assert inalcancavel in found
-        assert found[inalcancavel].verified is False
-        assert "não chegou ao upstream" in found[inalcancavel].note
+        assert unreachable in found
+        assert found[unreachable].verified is False
+        assert "did not reach the upstream" in found[unreachable].note
 
     async def test_verified_is_never_true_without_a_real_answer(self) -> None:
-        """Nenhum caminho que não seja um 200 pode produzir `verified=True`."""
+        """No path other than a 200 may produce `verified=True`."""
 
         def handler(request: httpx.Request) -> httpx.Response:
-            raise httpx.ReadTimeout("demorou", request=request)
+            raise httpx.ReadTimeout("took too long", request=request)
 
         async with client(handler) as http:
             models = await discover(ANTHROPIC, client=http)
@@ -254,10 +480,10 @@ class TestProbedProviders:
         assert all(m.note for m in models)
 
     async def test_ambiguous_status_neither_confirms_nor_denies(self) -> None:
-        """429 é quota, não inexistência.
+        """429 is quota, not non-existence.
 
-        Tratá-lo como recusa desligava um modelo bom por causa de um pico de uso; tratá-lo
-        como confirmação prometia um modelo que nunca respondeu.
+        Treating it as a refusal disabled a good model over a usage spike; treating it as a
+        confirmation promised a model that never answered.
         """
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -271,10 +497,10 @@ class TestProbedProviders:
         assert all("429" in m.note for m in models)
 
     async def test_404_without_the_marker_is_not_a_denial(self) -> None:
-        """Um 404 de rota errada não é o upstream a recusar o modelo.
+        """A 404 from a wrong route is not the upstream refusing the model.
 
-        O corpo é que nomeia o motivo; só o estado faria uma mudança de caminho na API
-        apagar a lista curada inteira.
+        It is the body that names the reason; the status alone would let an API path change
+        delete the entire curated list.
         """
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -287,7 +513,7 @@ class TestProbedProviders:
         assert not any(m.verified for m in models)
 
     async def test_served_model_is_verified(self) -> None:
-        """200 é a única fonte de `verified=True`, e não deixa nota."""
+        """200 is the only source of `verified=True`, and it leaves no note."""
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={})
@@ -299,16 +525,16 @@ class TestProbedProviders:
         assert all(m.note == "" for m in models)
 
     async def test_codex_unsupported_marker_removes_the_model(self) -> None:
-        """A recusa do Codex é um 400 com marca própria, não um 404."""
-        recusado = CURATED_CODEX[0]
+        """The Codex refusal is a 400 with its own marker, not a 404."""
+        refused = CURATED_CODEX[0]
 
         def handler(request: httpx.Request) -> httpx.Response:
-            if f'"{recusado}"' in request.read().decode():
+            if f'"{refused}"' in request.read().decode():
                 return httpx.Response(
                     400,
                     json={
                         "error": {
-                            "message": f"The '{recusado}' model is not supported when "
+                            "message": f"The '{refused}' model is not supported when "
                             f"using Codex with a ChatGPT account"
                         }
                     },
@@ -318,11 +544,11 @@ class TestProbedProviders:
         async with client(handler) as http:
             models = await discover(CODEX, client=http)
 
-        assert recusado not in by_name(models)
+        assert refused not in by_name(models)
         assert len(models) == len(CURATED_CODEX) - 1
 
     async def test_codex_generic_400_is_not_a_denial(self) -> None:
-        """Um 400 sem a marca é um pedido malformado nosso, não um modelo inexistente."""
+        """A 400 without the marker is a malformed request of ours, not a missing model."""
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(400, json={"error": {"message": "invalid_request"}})
@@ -334,80 +560,82 @@ class TestProbedProviders:
         assert not any(m.verified for m in models)
 
     async def test_probe_asks_for_the_curated_name_itself(self) -> None:
-        """A sonda tem de perguntar pelo nome curado, não por um alias resolvido.
+        """The probe has to ask for the curated name itself, not for a resolved alias.
 
-        Duas metades da mesma invariante, e nenhuma chega sozinha:
+        Two halves of the same invariant, and neither is enough alone:
 
-        1. O nome curado é o que viaja no corpo. Um alias substituído pelo caminho faria a
-           lista afirmar servido um nome que nunca foi perguntado.
-        2. Nenhuma entrada curada *é* um alias. `codex.resolve_model` mapeia
-           `gpt-5` -> `gpt-5.5`; pôr `gpt-5` na lista fazia a sonda de `gpt-5` confirmar
-           `gpt-5.5`, e o utilizador ficava com um deployment que nomeia um modelo e
-           corre outro. A primeira asserção passa na mesma nesse caso — é esta que apanha.
+        1. The curated name is what travels in the body. An alias substituted along the way
+           would make the list claim as served a name that was never asked about.
+        2. No curated entry *is* an alias. `codex.resolve_model` maps `gpt-5` -> `gpt-5.5`;
+           putting `gpt-5` in the list made the `gpt-5` probe confirm `gpt-5.5`, and the user
+           ended up with a deployment that names one model and runs another. The first
+           assertion still passes in that case — this is the one that catches it.
         """
-        pedidos: list[str] = []
+        requested: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            pedidos.append(str(json.loads(request.read())["model"]))
+            requested.append(str(json.loads(request.read())["model"]))
             return httpx.Response(200, json={})
 
         async with client(handler) as http:
             await discover(CODEX, client=http)
 
-        assert sorted(pedidos) == sorted(CURATED_CODEX)
+        assert sorted(requested) == sorted(CURATED_CODEX)
         assert [resolve_model(w) for w in CURATED_CODEX] == list(CURATED_CODEX)
 
     async def test_probes_respect_the_concurrency_ceiling(self) -> None:
-        """Mais sondas que o tecto nunca estão em voo ao mesmo tempo.
+        """More probes than the ceiling are never in flight at the same time.
 
-        Sem tecto, ligar uma subscrição abria uma ligação por nome curado de uma vez só
-        contra o mesmo backend.
+        Without a ceiling, connecting a subscription opened one connection per curated name
+        at once against the same backend.
         """
-        assert len(CURATED_ANTHROPIC) > PROBE_CONCURRENCY, "a lista tem de exceder o tecto"
-        em_voo = 0
-        pico = 0
+        assert len(CURATED_ANTHROPIC) > PROBE_CONCURRENCY, "the list has to exceed the ceiling"
+        in_flight = 0
+        peak = 0
 
         async def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal em_voo, pico
-            em_voo += 1
-            pico = max(pico, em_voo)
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
             try:
-                # Uma volta pelo escalonador: sem ela cada sonda corre até ao fim antes de
-                # a seguinte começar e o pico seria 1 mesmo sem semáforo nenhum.
+                # One turn through the scheduler: without it each probe runs to completion
+                # before the next starts and the peak would be 1 even with no semaphore.
                 await asyncio.sleep(0)
                 await asyncio.sleep(0)
                 return httpx.Response(200, json={})
             finally:
-                em_voo -= 1
+                in_flight -= 1
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
             models = await discover(ANTHROPIC, client=http)
 
         assert len(models) == len(CURATED_ANTHROPIC)
-        assert pico > 1, "as sondas têm de correr em paralelo"
-        assert pico <= PROBE_CONCURRENCY
+        assert peak > 1, "the probes have to run in parallel"
+        assert peak <= PROBE_CONCURRENCY
 
     async def test_anthropic_probe_leads_with_the_identity_block(self) -> None:
-        """Medido: `system` só com o prompt do cliente devolve 429 no caminho OAuth.
+        """Measured: a `system` carrying only the client prompt returns 429 on the OAuth
+        path.
 
-        Uma sonda que caísse nisso reportava toda a lista curada como "por verificar" por
-        uma razão nossa, não da conta.
+        A probe that fell into that reported the whole curated list as "unverified" for a
+        reason of ours, not of the account.
         """
-        capturado: list[object] = []
+        captured: list[object] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            capturado.append(json.loads(request.read())["system"])
+            captured.append(json.loads(request.read())["system"])
             return httpx.Response(200, json={})
 
         async with client(handler) as http:
             await discover(ANTHROPIC, client=http)
 
-        primeiro = capturado[0]
-        assert isinstance(primeiro, list)
-        assert "Claude Code" in primeiro[0]["text"]
+        first = captured[0]
+        assert isinstance(first, list)
+        assert "Claude Code" in first[0]["text"]
 
     async def test_probe_carries_the_subscription_credential(self) -> None:
-        """Sem o token a sonda mede a rejeição do anónimo, não o que a conta serve."""
+        """Without the token the probe measures the anonymous rejection, not what the account
+        serves."""
         tokens: set[str] = set()
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -421,17 +649,18 @@ class TestProbedProviders:
 
 
 class TestSuggestedName:
-    """O nome público que vai para o `model_name` do deployment."""
+    """The public name that goes into the deployment's `model_name`."""
 
     def test_provider_prefix_is_stripped(self) -> None:
-        """O prefixo pertence a `litellm_params["model"]`, nunca ao `model_name`.
+        """The prefix belongs in `litellm_params["model"]`, never in `model_name`.
 
-        É o `model_name` que ecoa no spend log. Um `anthropic/claude-opus-5` aí nomeia
-        algo que nenhum cliente pediu, e o `registry.is_declared` compara-o com o
-        `model_info["id"]` — um prefixo a mais fazia a entrada gerida parecer declarada.
+        It is `model_name` that echoes in the spend log. An `anthropic/claude-opus-5` there
+        names something no client asked for, and `registry.is_declared` compares it against
+        `model_info["id"]` — one extra prefix made the managed entry look declared.
         """
         assert suggested_name("anthropic/claude-opus-5") == "claude-opus-5"
 
     def test_bare_name_survives_intact(self) -> None:
-        """O caso normal: o wire name do catálogo já vem nu e não pode ser mexido."""
+        """The normal case: the catalogue's wire name already comes bare and must not be
+        touched."""
         assert suggested_name("gemini-3.1-pro") == "gemini-3.1-pro"

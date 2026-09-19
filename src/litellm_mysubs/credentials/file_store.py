@@ -1,9 +1,9 @@
-"""Store em ficheiro — o default de qualquer instalação.
+"""File store — the default for any installation.
 
-Guarda em ``~/.litellm/mysubs/credentials.json`` com permissões ``0600``. O ficheiro
-contém refresh tokens de subscrições pessoais: permissões largas são recusadas em vez de
-corrigidas em silêncio, porque um ficheiro que já esteve legível por outros pode ter sido
-lido, e apertar os bits depois disso não desfaz nada.
+Stores in ``~/.litellm/mysubs/credentials.json`` with ``0600`` permissions. The file holds
+refresh tokens for personal subscriptions: loose permissions are refused instead of
+silently corrected, because a file that was readable by others may already have been read,
+and tightening the bits afterwards undoes nothing.
 """
 
 from __future__ import annotations
@@ -19,12 +19,12 @@ from .store import Credential, CredentialStore, ProviderId
 
 DEFAULT_PATH = Path.home() / ".litellm" / "mysubs" / "credentials.json"
 
-#: Bits de grupo/outros. Qualquer um destes torna o ficheiro suspeito.
+#: Group/other bits. Any one of them makes the file suspect.
 _UNSAFE_BITS = stat.S_IRWXG | stat.S_IRWXO
 
 
 class InsecurePermissionsError(RuntimeError):
-    """O ficheiro de credenciais é legível por mais alguém além do dono."""
+    """The credentials file is readable by someone other than its owner."""
 
 
 class FileCredentialStore(CredentialStore):
@@ -36,15 +36,15 @@ class FileCredentialStore(CredentialStore):
         self._mtime: float = -1.0
         self.reload()
 
-    # -- leitura ---------------------------------------------------------------
+    # -- reading ---------------------------------------------------------------
 
     def _check_permissions(self) -> None:
         mode = self.path.stat().st_mode
         if mode & _UNSAFE_BITS:
             raise InsecurePermissionsError(
-                f"{self.path} tem permissões {stat.filemode(mode)}; "
-                f"contém refresh tokens e deve ser 0600. "
-                f"Corrige com: chmod 600 {self.path}"
+                f"{self.path} has permissions {stat.filemode(mode)}; "
+                f"it holds refresh tokens and must be 0600. "
+                f"Fix it with: chmod 600 {self.path}"
             )
 
     def reload(self) -> bool:
@@ -77,7 +77,7 @@ class FileCredentialStore(CredentialStore):
         self.reload()
         return self._cache.get(provider)
 
-    # -- escrita ---------------------------------------------------------------
+    # -- writing ---------------------------------------------------------------
 
     def _write(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -90,8 +90,8 @@ class FileCredentialStore(CredentialStore):
             }
             for provider, c in self._cache.items()
         }
-        # Escrita atómica: um crash a meio deixaria o ficheiro truncado, e um
-        # ficheiro de credenciais truncado desliga todas as subscrições de uma vez.
+        # Atomic write: a crash halfway would leave the file truncated, and a truncated
+        # credentials file disconnects every subscription at once.
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".credentials-")
         try:
             os.fchmod(fd, 0o600)

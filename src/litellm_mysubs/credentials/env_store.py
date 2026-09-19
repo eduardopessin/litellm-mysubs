@@ -1,11 +1,11 @@
-"""Store de variáveis de ambiente — só leitura.
+"""Environment variable store — read-only.
 
-Serve dois casos: um token colado à mão para experimentar sem correr o fluxo OAuth, e a
-compatibilidade com instalações que já injectam os tokens por ``env`` (é assim que o
-plugin original lê hoje).
+It covers two cases: a token pasted by hand to try things out without running the OAuth
+flow, and compatibility with installations that already inject the tokens through ``env``
+(which is how the original plugin reads them today).
 
-Só de leitura de propósito. As variáveis de um processo são um instantâneo do arranque:
-escrever nelas não persiste nada e daria a ilusão de ter guardado uma credencial.
+Read-only on purpose. A process's variables are a snapshot of startup: writing to them
+persists nothing and would give the illusion of having saved a credential.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Final
 
 from .store import Credential, CredentialStore, ProviderId, ReadOnlyStoreError
 
-#: Nomes herdados do plugin original, para quem já os tem definidos.
+#: Names inherited from the original plugin, for whoever already has them set.
 ENV_NAMES: Final[dict[ProviderId, tuple[str, str, str]]] = {
     "anthropic": (
         "ANTHROPIC_OAUTH_TOKEN",
@@ -56,13 +56,13 @@ class EnvCredentialStore(CredentialStore):
 
     def set(self, provider: ProviderId, credential: Credential) -> None:
         raise ReadOnlyStoreError(
-            "EnvCredentialStore é só de leitura: escrever em os.environ não persiste "
-            "nada e o valor perde-se no próximo arranque. Usa FileCredentialStore."
+            "EnvCredentialStore is read-only: writing to os.environ does not persist "
+            "anything and the value is lost on the next start. Use FileCredentialStore."
         )
 
     def delete(self, provider: ProviderId) -> None:
-        raise ReadOnlyStoreError("EnvCredentialStore é só de leitura.")
+        raise ReadOnlyStoreError("EnvCredentialStore is read-only.")
 
     def reload(self) -> bool:
-        # O ambiente do processo não muda sozinho.
+        # The process environment does not change on its own.
         return False

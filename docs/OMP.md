@@ -1,89 +1,89 @@
-# Rastreabilidade com o OMP
+# Traceability with OMP
 
-O wiring é do [`@oh-my-pi/pi-ai`](https://www.npmjs.com/package/@oh-my-pi/pi-ai)
-(`can1357/oh-my-pi`). Este pacote é uma porta para Python do que o OMP faz no fio, e o OMP
-é a fonte de verdade: quando um provedor muda, a correcção aparece lá primeiro.
+The wiring comes from [`@oh-my-pi/pi-ai`](https://www.npmjs.com/package/@oh-my-pi/pi-ai)
+(`can1357/oh-my-pi`). This package is a Python port of what OMP does on the wire, and OMP
+is the source of truth: when a provider changes, the fix appears there first.
 
-Está repartido por **três** pacotes, e as âncoras podem apontar para qualquer um:
+It is split across **three** packages, and anchors may point at any of them:
 
-| Pacote | O que tem |
+| Package | What it holds |
 |---|---|
-| `@oh-my-pi/pi-ai` | a lógica — `providers/`, `utils/`, `stream.ts` |
-| `@oh-my-pi/pi-catalog` | as constantes de fio — valores de headers, versões de cliente fixadas |
-| `@oh-my-pi/pi-utils` | o que é transversal a todos os provedores — `USER_AGENT`, `VERSION`, caminhos |
+| `@oh-my-pi/pi-ai` | the logic — `providers/`, `utils/`, `stream.ts` |
+| `@oh-my-pi/pi-catalog` | the wire constants — header values, pinned client versions |
+| `@oh-my-pi/pi-utils` | what is shared across every provider — `USER_AGENT`, `VERSION`, paths |
 
-Os dois últimos são fáceis de esquecer, e esquecê-los custou duas vezes:
+The last two are easy to forget, and forgetting them cost twice:
 
-- `providers/openai-codex-responses.ts` importa do `pi-catalog` o `OPENAI_HEADERS`,
-  `OPENAI_HEADER_VALUES` e `CODEX_CLIENT_VERSION`. Sem ele, o `originator` ficou `"pi"` em
-  vez de `"omp"` e o header `version` nem existia — e a auditoria deu-os por
-  "inverificáveis" em vez de os ir buscar.
-- O mesmo ficheiro importa do `pi-utils` o `USER_AGENT`. Sem ele, o valor foi **inventado**
-  por analogia (`codex/0.153.0 (external, cli)`) quando o real é `omp/18.2.6`.
+- `providers/openai-codex-responses.ts` imports `OPENAI_HEADERS`, `OPENAI_HEADER_VALUES`
+  and `CODEX_CLIENT_VERSION` from `pi-catalog`. Without it, `originator` ended up as `"pi"`
+  instead of `"omp"` and the `version` header did not exist at all — and the audit marked
+  them "unverifiable" instead of going to fetch them.
+- The same file imports `USER_AGENT` from `pi-utils`. Without it, the value was **invented**
+  by analogy (`codex/0.153.0 (external, cli)`) when the real one is `omp/18.2.6`.
 
-O padrão é o mesmo nos dois casos: procurar nos pacotes que se tem, não encontrar, e
-escrever um valor plausível em vez de procurar no que falta. Um pacote em falta não produz
-uma âncora falhada — produz uma âncora que **nunca chega a ser escrita**, e portanto nada
-acusa. O `check_omp_drift.py` descarrega os três.
+The pattern is the same in both cases: search the packages at hand, fail to find, and write
+a plausible value instead of searching the one that is missing. A missing package does not
+produce a failed anchor — it produces an anchor that is **never written at all**, and so
+nothing flags it. `check_omp_drift.py` downloads all three.
 
-Isto só é útil se, ao ver uma mudança no OMP, se souber em dez segundos o que actualizar
-aqui. Daí uma convenção única.
+This is only useful if, on seeing a change in OMP, you know in ten seconds what to update
+here. Hence a single convention.
 
-## A convenção
+## The convention
 
-Uma linha por função portada, imediatamente antes do `def`:
+One line per ported function, immediately before the `def`:
 
 ```python
 # omp: providers/anthropic.ts :: ensureMaxTokensForThinking
 def apply_thinking_params(kwargs, model): ...
 ```
 
-Regras:
+Rules:
 
-- caminho relativo a `src/` no tarball do npm;
-- `::` separa ficheiro e símbolo;
-- **sem número de linha** — muda a cada release e o símbolo não;
-- **uma linha, um símbolo**; vários símbolos, várias linhas;
-- sem prosa. A explicação do *porquê* fica no docstring.
+- path relative to `src/` in the npm tarball;
+- `::` separates file and symbol;
+- **no line number** — it changes every release and the symbol does not;
+- **one line, one symbol**; several symbols, several lines;
+- no prose. The *why* belongs in the docstring.
 
-A versão vive num sítio só, `OMP_VERSION` em `tools/check_omp_drift.py`.
+The version lives in one place only, `OMP_VERSION` in `tools/check_omp_drift.py`.
 
-## Verificar
+## Checking
 
 ```bash
 python tools/check_omp_drift.py
 ```
 
-Descarrega a versão fixada, confirma que cada símbolo anotado ainda existe e compara com a
-`latest` do npm. Corre no CI: um rename do lado do OMP fica vermelho em vez de derivar em
-silêncio.
+Downloads the pinned version, confirms that every annotated symbol still exists, and
+compares against npm's `latest`. It runs in CI: a rename on the OMP side goes red instead
+of drifting silently.
 
-Actualizar: subir `OMP_VERSION`, correr o script, tratar o que acusar.
+To update: raise `OMP_VERSION`, run the script, handle whatever it flags.
 
-## Divergências deliberadas
+## Deliberate divergences
 
-Onde não seguimos o OMP, e porquê. Cada uma foi medida contra o serviço real.
+Where we do not follow OMP, and why. Each one was measured against the real service.
 
-| Onde | OMP | Aqui | Porquê |
+| Where | OMP | Here | Why |
 |---|---|---|---|
-| Betas da Anthropic | inclui `redact-thinking-2026-02-12` (`usage/claude.ts`) | omitida | Com ela a Anthropic devolve blocos thinking assinados mas vazios: medido em sonnet-4-6, 74 chars sem a beta, 0 com ela. |
-| Betas da Anthropic | inclui `context-1m-2025-08-07` | omitida | Dá 429 de crédito em tokens de subscrição. |
-| Orçamento de thinking | até 32768 | tecto 8192 | Janela TPM curta da subscrição Max; 32768 dá 429. |
-| Loop de raciocínio | erro *retryable*, a camada de retry volta a pedir | levanta | Não há janela replay-safe aqui: o `reasoning_content` já foi despejado ao cliente antes da detecção, e retentar duplicava-o no mesmo stream. |
-| Variantes `-thinking` | descascáveis | só `gemini-2.5-flash-thinking` | `gemini-3.7/3.8-flash-thinking` não existem no upstream; descascá-los servia `-low` em silêncio para um nome inventado. |
-| Nome não servido | fallback para modelo próximo | levanta | Responder com outro modelo faz a facturação e as comparações mentirem, e o cliente nunca sabe. |
+| Anthropic betas | includes `redact-thinking-2026-02-12` (`usage/claude.ts`) | omitted | With it, Anthropic returns signed but empty thinking blocks: measured on sonnet-4-6, 74 chars without the beta, 0 with it. |
+| Anthropic betas | includes `context-1m-2025-08-07` | omitted | Returns a credit 429 on subscription tokens. |
+| Thinking budget | up to 32768 | ceiling 8192 | Short TPM window on the Max subscription; 32768 gives a 429. |
+| Reasoning loop | *retryable* error, the retry layer asks again | raises | There is no replay-safe window here: `reasoning_content` has already been flushed to the client before detection, and retrying duplicated it in the same stream. |
+| `-thinking` variants | strippable | only `gemini-2.5-flash-thinking` | `gemini-3.7/3.8-flash-thinking` do not exist upstream; stripping them silently served `-low` for an invented name. |
+| Unserved name | falls back to a nearby model | raises | Answering with a different model makes billing and comparisons lie, and the client never knows. |
 
-## Divergências corrigidas ao comparar com a fonte
+## Divergences corrected by comparing against the source
 
-Estas não eram decisões: eram erros de terem sido portadas de uma cópia intermédia em vez
-da fonte. Ficam registadas porque o modo de falha é instrutivo.
+These were not decisions: they were errors from having been ported from an intermediate
+copy instead of the source. They are recorded because the failure mode is instructive.
 
-| Onde | Estava | Corrigido para | Como se notou |
+| Where | Was | Corrected to | How it was noticed |
 |---|---|---|---|
-| `google_finish_reason` | enumerava as razões de **erro** | enumera as **normais** (`STOP`, `MAX_TOKENS`) e trata o resto como erro, como `mapStopReasonString` | Cinco razões (`FINISH_REASON_UNSPECIFIED`, `LANGUAGE`, `IMAGE_OTHER`, `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION`) passavam por `stop`: uma resposta bloqueada pelo servidor chegava ao cliente como se estivesse completa. |
-| `thinking_loop` | trigramas de **caracteres**, aglomerado de 2, sem aquecimento | trigramas de **palavras**, `SEGMENT_MIN_CLUSTER=4`, `SEGMENT_MIN_COUNT=8`, dois regimes de ciclo exacto, âncoras canonicalizadas | Trigramas de caracteres dão semelhança alta a textos sem relação; disparar a 2 segmentos matava raciocínio legítimo que o OMP deixa passar. |
+| `google_finish_reason` | enumerated the **error** reasons | enumerates the **normal** ones (`STOP`, `MAX_TOKENS`) and treats the rest as an error, like `mapStopReasonString` | Five reasons (`FINISH_REASON_UNSPECIFIED`, `LANGUAGE`, `IMAGE_OTHER`, `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION`) passed as `stop`: a server-blocked response reached the client as if it were complete. |
+| `thinking_loop` | **character** trigrams, cluster of 2, no warm-up | **word** trigrams, `SEGMENT_MIN_CLUSTER=4`, `SEGMENT_MIN_COUNT=8`, two exact-cycle regimes, canonicalized anchors | Character trigrams give high similarity to unrelated texts; firing at 2 segments killed legitimate reasoning that OMP lets through. |
 
-**Lição de método:** portar da fonte e verificar contra o intermediário — nunca o inverso.
-Uma cópia de segunda mão herda os erros da primeira sem os assinalar.
+**Method lesson:** port from the source and verify against the intermediate — never the
+reverse. A second-hand copy inherits the first one's errors without flagging them.
 
-Uma divergência sem medição não é uma divergência: é um bug por corrigir.
+A divergence without a measurement is not a divergence: it is an unfixed bug.

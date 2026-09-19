@@ -1,16 +1,17 @@
-"""Filtro do leak de planeamento dos modelos flash.
+"""Planning leak filter for the flash models.
 
-Porte de ``providers/google-gemini-cli.ts``. Os modelos flash do Antigravity vertem por
-vezes o objecto de planeamento interno para o texto visível — um JSON com ``thought``,
-``call``, ``paths`` ou ``path``+``content`` que nunca deveria chegar ao cliente.
+Port of ``providers/google-gemini-cli.ts``. Antigravity's flash models sometimes spill the
+internal planning object into the visible text — a JSON object with ``thought``, ``call``,
+``paths`` or ``path``+``content`` that should never reach the client.
 
-Duas coisas tornam isto mais difícil do que parece:
+Two things make this harder than it looks:
 
-1. **O objecto atravessa chunks.** Um delta pode trazer `{"thou` e o seguinte `ght": …}`.
-   Decidir por chunk deixava passar tudo o que não coubesse num só; daí o buffering.
-2. **Nem todo o JSON é leak.** Um modelo que responda legitimamente `{"command": "ls"}`
-   não pode ver a resposta apagada — por isso o filtro só se aplica à família que de facto
-   verte, e exige assinatura de leak.
+1. **The object spans chunks.** One delta can carry `{"thou` and the next `ght": …}`.
+   Deciding per chunk let through everything that did not fit in a single one; hence the
+   buffering.
+2. **Not every JSON object is a leak.** A model legitimately answering `{"command": "ls"}`
+   must not have its answer erased — so the filter only applies to the family that does
+   spill, and it requires a leak signature.
 """
 
 from __future__ import annotations
@@ -19,30 +20,30 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
-#: Chaves cuja presença marca o objecto como planeamento interno.
+#: Keys whose presence marks the object as internal planning.
 LEAK_MARKERS: Final[tuple[str, ...]] = ("thought", "_i", "call", "paths", "command")
 
-#: Comprimento máximo de um prefixo ainda incompleto que se aceita como possível leak.
-#: Acima disto é texto legítimo que por acaso começa por chaveta.
+#: Maximum length of a still incomplete prefix accepted as a possible leak. Above this it
+#: is legitimate text that happens to start with a brace.
 MAX_PREFIX_CHARS: Final = 100
 
 
 # omp: providers/google-gemini-cli.ts :: isFlashLeakModel
 def is_flash_leak_model(model: str) -> bool:
-    """Só a família flash verte planeamento para o texto visível.
+    """Only the flash family spills planning into the visible text.
 
-    Aplicar o filtro a todos os modelos faria um `pro` que responda legitimamente
-    ``{"command": "ls"}`` ver a resposta apagada.
+    Applying the filter to every model would make a `pro` legitimately answering
+    ``{"command": "ls"}`` have its answer erased.
     """
     return "flash" in str(model).split("/")[-1].lower()
 
 
 # omp: providers/google-gemini-cli.ts :: isPlanningLeakPrefix
 def is_leak_prefix(text: str) -> bool:
-    """Se o texto **pode** vir a ser um objecto de planeamento.
+    """Whether the text **may** turn into a planning object.
 
-    Reconhece um prefixo incompleto: `{`, `{"tho`, `{"thought"`. É o que permite reter o
-    buffer em vez de emitir metade de um leak.
+    It recognizes an incomplete prefix: `{`, `{"tho`, `{"thought"`. That is what allows
+    holding the buffer instead of emitting half a leak.
     """
     trimmed = text.lstrip()
     if not trimmed.startswith("{"):
@@ -68,7 +69,7 @@ def is_leak_prefix(text: str) -> bool:
 
 # omp: providers/google-gemini-cli.ts :: isPlanningLeakObject
 def is_leak_object(parsed: object, tool_names: frozenset[str] = frozenset()) -> bool:
-    """Se o objecto já decodificado tem assinatura de planeamento."""
+    """Whether the already decoded object has a planning signature."""
     if not isinstance(parsed, dict):
         return False
     if isinstance(parsed.get("thought"), str):
@@ -82,10 +83,10 @@ def is_leak_object(parsed: object, tool_names: frozenset[str] = frozenset()) -> 
 
 
 def _split_leading_object(text: str, *, honour_strings: bool = True) -> tuple[str, str] | None:
-    """Primeiro objecto JSON equilibrado em chavetas, e o que sobra.
+    """First brace-balanced JSON object, and whatever is left over.
 
-    ``honour_strings=False`` é o plano B: um leak com aspas desequilibradas nunca fecharia
-    o objecto pela via normal, e deixá-lo passar era o pior resultado.
+    ``honour_strings=False`` is the fallback: a leak with unbalanced quotes would never
+    close the object by the normal route, and letting it through was the worst outcome.
     """
     prefix = len(text) - len(text.lstrip())
     trimmed = text[prefix:]
@@ -121,11 +122,11 @@ Outcome = Literal["incomplete", "plain", "leak"]
 
 @dataclass(slots=True)
 class PlanningLeakFilter:
-    """Filtra o texto visível de um stream, retendo o que pode ser um leak.
+    """Filter the visible text of a stream, holding back what may be a leak.
 
-    Uso: ``feed`` por cada delta, ``flush`` no fim. ``stripped`` diz se alguma coisa foi
-    descartada — o OMP usa esse sinal para não aceitar como "silêncio válido" uma resposta
-    cujo conteúdo foi todo deitado fora.
+    Usage: ``feed`` for each delta, ``flush`` at the end. ``stripped`` tells whether
+    anything was discarded — OMP uses that signal so as not to accept as "valid silence" a
+    response whose content was thrown away entirely.
     """
 
     tool_names: frozenset[str] = frozenset()
@@ -135,7 +136,7 @@ class PlanningLeakFilter:
     _emitted: list[str] = field(default_factory=list, repr=False)
 
     def feed(self, text: str) -> str:
-        """Texto a entregar ao cliente por causa deste delta. Pode ser vazio."""
+        """Text to hand the client because of this delta. May be empty."""
         if not text:
             return ""
         if not self.buffering and not self.buffer:
@@ -146,10 +147,10 @@ class PlanningLeakFilter:
         return self._drain()
 
     def flush(self) -> str:
-        """O que sobra no fim do stream.
+        """Whatever is left at the end of the stream.
 
-        Um buffer com assinatura de leak mas sem chaveta a fechar é descartado por
-        inteiro: entregá-lo seria mostrar metade do planeamento interno.
+        A buffer with a leak signature but no closing brace is discarded entirely: handing
+        it over would mean showing half of the internal planning.
         """
         if not self.buffer:
             return ""
@@ -166,10 +167,10 @@ class PlanningLeakFilter:
         split = _split_leading_object(text) or _split_leading_object(text, honour_strings=False)
         if split is None:
             if not final:
-                # Objecto ainda por fechar: retém-se à espera do próximo delta.
+                # Object not closed yet: held back waiting for the next delta.
                 self.buffer = text
                 return ""
-            # No fim do stream, um prefixo com assinatura de leak nunca chega a ser texto.
+            # At the end of the stream, a prefix with a leak signature never becomes text.
             if is_leak_prefix(text):
                 self.stripped = True
                 return ""
@@ -184,9 +185,9 @@ class PlanningLeakFilter:
         if parsed is not None:
             leaked = is_leak_object(parsed, self.tool_names)
         else:
-            # JSON malformado — tipicamente aspas desequilibradas dentro do leak. Sem
-            # objecto para inspeccionar, decide-se pela assinatura do prefixo; deixá-lo
-            # passar por não decodificar era o pior resultado possível.
+            # Malformed JSON — typically unbalanced quotes inside the leak. With no object
+            # to inspect, the decision falls to the prefix signature; letting it through
+            # because it failed to decode was the worst possible outcome.
             leaked = is_leak_prefix(json_text)
 
         if leaked:

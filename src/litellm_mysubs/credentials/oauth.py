@@ -1,28 +1,27 @@
-"""Fluxo OAuth com paste e renovação de token, para os três provedores.
+"""Paste-based OAuth flow and token renewal, for the three providers.
 
-Porque é que o paste é a via principal, e não o plano B: o fluxo nativo destes clientes
-prende um servidor de callback em ``localhost:1455`` (Codex), ``:54545`` (Anthropic) ou
-``:51121`` (Antigravity). Num LiteLLM em container ou em cluster o browser do utilizador
-não alcança nenhum desses portos. O que ele alcança é a caixa de texto da página. Portanto
-o redirect URI continua a ser o que o provedor tem registado — muda-se onde o código é
-lido, não para onde ele é enviado.
+Why paste is the main route and not the fallback: these clients' native flow pins a
+callback server to ``localhost:1455`` (Codex), ``:54545`` (Anthropic) or ``:51121``
+(Antigravity). On a containerized or clustered LiteLLM the user's browser reaches none of
+those ports. What it does reach is the page's text box. So the redirect URI stays whatever
+the provider has registered — what changes is where the code is read, not where it is sent.
 
-O que este módulo **não** faz: não abre sockets à espera de callbacks, não abre browsers e
-não decide quando renovar. Recebe o que o utilizador colou, ou uma credencial a expirar, e
-devolve uma ``Credential``.
+What this module does **not** do: it opens no sockets waiting for callbacks, opens no
+browsers and decides nothing about when to renew. It takes what the user pasted, or an
+expiring credential, and returns a ``Credential``.
 
-Duas regras herdadas de incidentes medidos:
+Two rules inherited from measured incidents:
 
-* **Um só dono do refresh** (ver ``store.py``). ``refresh()`` aceita um ``CredentialStore``
-  opcional; se ele existir e não for dono, recusa-se a trocar em vez de correr a corrida.
-* **Rotação substitui.** Anthropic e OpenAI emitem refresh tokens de uso único. Guardar o
-  antigo depois de o provedor devolver um novo é garantir ``invalid_grant`` na renovação
-  seguinte — por isso o token novo substitui, e só quando o provedor não roda é que o
-  anterior é preservado.
+* **A single refresh owner** (see ``store.py``). ``refresh()`` accepts an optional
+  ``CredentialStore``; if one is given and it is not the owner, it refuses to exchange
+  instead of running the race.
+* **Rotation replaces.** Anthropic and OpenAI issue single-use refresh tokens. Keeping the
+  old one after the provider returns a new one guarantees ``invalid_grant`` on the next
+  renewal — so the new token replaces it, and only when the provider does not rotate is the
+  previous one preserved.
 
-Erros do provedor sobem com o corpo real. Um ``error_description`` do upstream é a única
-coisa que diz ao utilizador o que fazer a seguir; trocá-lo por uma mensagem genérica
-apaga-a.
+Provider errors surface with the real body. An upstream ``error_description`` is the only
+thing that tells the user what to do next; swapping it for a generic message erases it.
 """
 
 from __future__ import annotations
@@ -47,16 +46,17 @@ __all__ = [
     "NotRefreshOwnerError",
     "OAuthError",
     "begin",
+    "callback_origin",
     "complete",
     "refresh",
 ]
 
 
 class OAuthError(RuntimeError):
-    """Falha do fluxo OAuth, com o estado e o corpo **reais** do upstream.
+    """An OAuth flow failure, carrying the **real** upstream status and body.
 
-    ``status`` é zero quando a falha é local (paste inválido, ``state`` trocado) e não
-    houve resposta do provedor.
+    ``status`` is zero when the failure is local (invalid paste, mismatched ``state``) and
+    there was no provider response.
     """
 
     __slots__ = ("body", "provider", "status")
@@ -69,25 +69,27 @@ class OAuthError(RuntimeError):
 
 
 class NotRefreshOwnerError(OAuthError):
-    """Renovação pedida a partir de um store que não é dono do refresh."""
+    """A renewal requested from a store that does not own the refresh."""
 
 
 # omp: registry/oauth/anthropic-constants.ts :: ANTHROPIC_OAUTH_GRANT_TTL_MS
-#: Vida absoluta do grant da Anthropic, ancorada no login interactivo. A rotação **não** a
-#: estende: ~30 dias depois o endpoint devolve ``invalid_grant`` para o token mais recente
-#: e só um login novo recupera a conta. É heurística de aviso, não contrato de fio.
+#: Absolute lifetime of the Anthropic grant, anchored at the interactive login. Rotation
+#: does **not** extend it: ~30 days later the endpoint returns ``invalid_grant`` for even
+#: the most recent token and only a fresh login recovers the account. It is a warning
+#: heuristic, not a wire contract.
 ANTHROPIC_GRANT_TTL_S: Final = 30 * 24 * 60 * 60.0
 
 # omp: providers/claude-code-fingerprint.ts :: claudeCodeSdkVersion
-#: Vai no ``User-Agent`` da renovação da Anthropic. O Claude Code manda estes cabeçalhos na
-#: renovação mas não na troca inicial do código.
+# omp= providers/claude-code-fingerprint.ts :: claudeCodeSdkVersion = "0.112.1"
+#: Goes in the ``User-Agent`` of the Anthropic renewal. Claude Code sends these headers on
+#: the renewal but not on the initial code exchange.
 CLAUDE_CODE_SDK_VERSION: Final = "0.112.1"
 
 # omp: wire/gemini-headers.ts :: getAntigravityUserAgent
-#: ``User-Agent`` do plano de controlo do Antigravity (``loadCodeAssist``/``onboardUser``).
-#: O backend não valida o ``cl``; só a versão faz gating. Repetido aqui em vez de importado
-#: de ``plugin.py`` porque esse módulo arrasta o LiteLLM inteiro, e descobrir um projecto
-#: não precisa dele.
+#: ``User-Agent`` for the Antigravity control plane (``loadCodeAssist``/``onboardUser``).
+#: The backend does not validate ``cl``; only the version gates. Repeated here instead of
+#: imported from ``plugin.py`` because that module drags in the whole of LiteLLM, and
+#: discovering a project does not need it.
 ANTIGRAVITY_USER_AGENT: Final = (
     "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
 )
@@ -102,6 +104,7 @@ _ONBOARD_USER_URL: Final = f"{_CLOUD_CODE_ENDPOINT}/v1internal:onboardUser"
 _OPERATIONS_URL: Final = f"{_CLOUD_CODE_ENDPOINT}/v1internal"
 
 # omp: registry/oauth/google-antigravity.ts :: FREE_TIER_ID
+# omp= registry/oauth/google-antigravity.ts :: FREE_TIER_ID = "free-tier"
 _FREE_TIER_ID: Final = "free-tier"
 
 # omp: registry/oauth/google-antigravity.ts :: ONBOARD_TIMEOUT_MS, ONBOARD_POLL_INTERVAL_MS
@@ -111,7 +114,7 @@ _ONBOARD_POLL_INTERVAL_S: Final = 1.0
 
 @dataclass(frozen=True, slots=True)
 class _Provider:
-    """O que distingue um provedor do outro no fluxo de código de autorização."""
+    """What distinguishes one provider from another in the authorization code flow."""
 
     client_id: str
     authorize_url: str
@@ -121,21 +124,24 @@ class _Provider:
     pkce: bool
     authorize_params: tuple[tuple[str, str], ...]
     token_body: Literal["json", "form"]
-    #: Parâmetros extra na troca do código. ``{state}`` é substituído pelo state validado.
+    #: Extra parameters on the code exchange. ``{state}`` is replaced by the validated
+    #: state.
     exchange_params: tuple[tuple[str, str], ...] = ()
     refresh_headers: tuple[tuple[str, str], ...] = ()
     client_secret: str = ""
-    #: Margem subtraída ao ``expires_in``, para renovar antes de o token morrer.
+    #: Margin subtracted from ``expires_in``, to renew before the token dies.
     expiry_skew_s: float = 0.0
 
 
-# As três fichas vêm das regras declarativas do OMP (`compat/rules/auth/<provedor>.kdl`),
-# que é onde os client ids, URLs e parâmetros extra vivem de facto. Os nós KDL citados nos
-# comentários — `authorize-url`, `token url`, `authorize-params`, `callback` — não cabem
-# numa âncora (o verificador não aceita hífens em símbolos), por isso a âncora aponta para
-# um símbolo literal do mesmo ficheiro e o nó fica nomeado aqui.
+# The three provider records come from the OMP declarative rules
+# (`compat/rules/auth/<provider>.kdl`), which is where the client ids, URLs and extra
+# parameters actually live. The KDL nodes quoted in the comments — `authorize-url`,
+# `token url`, `authorize-params`, `callback` — do not fit in an anchor (the checker does
+# not accept hyphens in symbols), so the anchor points at a literal symbol from the same
+# file and the node is named here.
 
 # omp: registry/oauth/openai-codex.ts :: CLIENT_ID, AUTHORIZE_URL, TOKEN_URL, SCOPE
+# omp= registry/oauth/openai-codex.ts :: CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 # omp: compat/rules/auth/openai-codex.kdl :: callback, token, credential
 _CODEX: Final = _Provider(
     client_id="app_EMoamEEZ73f0CkXaXp7hrann",
@@ -149,9 +155,9 @@ _CODEX: Final = _Provider(
         "api.connectors.read",
         "api.connectors.invoke",
     ),
-    # A OpenAI só autoriza este URI exacto. Um porto ocupado tem de falhar, não cair para
-    # outro: o `port-fallback=#false` da regra diz isso, e no paste traduz-se em o URI ser
-    # fixo em vez de derivado do servidor que não chegámos a abrir.
+    # OpenAI only authorizes this exact URI. An occupied port has to fail, not fall back to
+    # another: the rule's `port-fallback=#false` says so, and in the paste flow that becomes
+    # a fixed URI instead of one derived from a server we never opened.
     redirect_uri="http://localhost:1455/auth/callback",
     pkce=True,
     authorize_params=(
@@ -166,14 +172,14 @@ _CODEX: Final = _Provider(
 # omp: compat/rules/auth/anthropic.kdl :: OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl
 # omp: compat/rules/auth/anthropic.kdl :: scopes, pkce, callback, credential
 _ANTHROPIC: Final = _Provider(
-    # Client id público, guardado em base64 na regra para os scanners de segredos não
-    # dispararem. Descodificado aqui porque um literal base64 no código seria pior: uma
-    # divergência passaria despercebida.
+    # Public client id, kept as base64 in the rule so that secret scanners do not fire.
+    # Decoded here because a base64 literal in the code would be worse: a divergence would
+    # go unnoticed.
     client_id=base64.b64decode("OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl").decode(),
     authorize_url="https://claude.ai/oauth/authorize",
     token_url="https://api.anthropic.com/v1/oauth/token",
-    # `user:inference` é o que dá inferência directa com token OAuth. O endpoint da
-    # `platform.claude.com` só emite tokens de consola; tem de ser o `claude.ai`.
+    # `user:inference` is what grants direct inference with an OAuth token. The
+    # `platform.claude.com` endpoint only issues console tokens; it has to be `claude.ai`.
     scopes=(
         "org:create_api_key",
         "user:profile",
@@ -184,9 +190,9 @@ _ANTHROPIC: Final = _Provider(
     ),
     redirect_uri="http://localhost:54545/callback",
     pkce=True,
-    # `code=true` é o que torna o paste viável: em vez de redireccionar, a página mostra um
-    # código copiável (no formato `codigo#state`). Sem isto o utilizador ficava dependente
-    # de o browser alcançar o porto local.
+    # `code=true` is what makes the paste viable: instead of redirecting, the page shows a
+    # copyable code (in the `code#state` format). Without it the user would depend on the
+    # browser reaching the local port.
     authorize_params=(("code", "true"),),
     token_body="json",
     exchange_params=(("state", "{state}"),),
@@ -200,12 +206,13 @@ _ANTHROPIC: Final = _Provider(
     expiry_skew_s=300.0,
 )
 
-# O client id e o segredo estão em base64 na regra do OMP; as âncoras apontam para um
-# prefixo de cada um, que é o que cabe numa linha sem partir a verificação por substring.
+# The client id and the secret are base64 in the OMP rule; the anchors point at a prefix of
+# each, which is what fits on one line without breaking the substring check.
 # omp: compat/rules/auth/google-antigravity.kdl :: access_type, prompt, scopes, callback
 # omp: compat/rules/auth/google-antigravity.kdl :: MTA3MTAwNjA2MDU5MS10bWhzc2lu
 # omp: compat/rules/auth/google-antigravity.kdl :: R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNY
 # omp: providers/google-auth.ts :: OAUTH_TOKEN_URL
+# omp= providers/google-auth.ts :: OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _ANTIGRAVITY: Final = _Provider(
     client_id=base64.b64decode(
         "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ=="
@@ -221,11 +228,12 @@ _ANTIGRAVITY: Final = _Provider(
         "https://www.googleapis.com/auth/experimentsandconfigs",
     ),
     redirect_uri="http://127.0.0.1:51121/oauth-callback",
-    # A regra do OMP não activa PKCE aqui; o segredo do cliente faz esse papel.
+    # The OMP rule does not enable PKCE here; the client secret plays that role.
     pkce=False,
-    # Sem estes dois o Google devolve só um access token: `access_type=offline` é o que
-    # pede o refresh token, e `prompt=consent` é o que o volta a emitir numa reautorização
-    # de uma conta que já consentiu — sem ele a segunda ligação fica sem renovação.
+    # Without these two Google returns only an access token: `access_type=offline` is what
+    # asks for the refresh token, and `prompt=consent` is what makes it be issued again on a
+    # reauthorization of an account that already consented — without it the second
+    # connection is left with no renewal.
     authorize_params=(("access_type", "offline"), ("prompt", "consent")),
     token_body="form",
     expiry_skew_s=300.0,
@@ -240,28 +248,29 @@ _PROVIDERS: Final[dict[ProviderId, _Provider]] = {
 
 @dataclass(frozen=True, slots=True)
 class AuthRequest:
-    """O que fica do lado de cá enquanto o utilizador autentica no browser.
+    """What stays on this side while the user authenticates in the browser.
 
-    O ``verifier`` tem de sobreviver até ao paste: sem ele a troca do código falha, porque
-    o provedor só confirma o desafio contra o segredo que nunca viajou.
+    The ``verifier`` has to survive until the paste: without it the code exchange fails,
+    because the provider only confirms the challenge against the secret that never travelled.
     """
 
     url: str
-    """Para onde mandar o utilizador."""
+    """Where to send the user."""
 
     state: str
-    """Opaco, devolvido no retorno; é o que liga o paste a este pedido."""
+    """Opaque, returned on the callback; it is what ties the paste to this request."""
 
     verifier: str
-    """PKCE. Vazio nos provedores que não o usam (Antigravity)."""
+    """PKCE. Empty for providers that do not use it (Antigravity)."""
 
 
 # omp: registry/oauth/pkce.ts :: generatePKCE
 def _pkce() -> tuple[str, str]:
-    """``(verifier, challenge)``. 96 bytes aleatórios em base64url, desafio S256.
+    """``(verifier, challenge)``. 96 random bytes in base64url, S256 challenge.
 
-    O ``base64url`` sem padding não é cosmético: o ``=`` teria de ser escapado no URL de
-    autorização e há servidores que comparam o desafio byte a byte com o que receberam.
+    Unpadded ``base64url`` is not cosmetic: the ``=`` would have to be escaped in the
+    authorization URL and some servers compare the challenge byte for byte with what they
+    received.
     """
     verifier = _b64url(secrets.token_bytes(96))
     challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
@@ -274,15 +283,15 @@ def _b64url(raw: bytes) -> str:
 
 # omp: registry/oauth/callback-server.ts :: generateState
 def _state() -> str:
-    """16 bytes em hexadecimal, como o ``generateState`` do OMP."""
+    """16 bytes in hexadecimal, like OMP's ``generateState``."""
     return secrets.token_bytes(16).hex()
 
 
 # omp: registry/engine/oauth-code.ts :: generateAuthUrl
 def begin(provider: ProviderId) -> AuthRequest:
-    """Monta o URL de autorização e o segredo que o paste vai precisar.
+    """Builds the authorization URL and the secret the paste will need.
 
-    Não abre browser nem servidor: quem chama decide como mostrar o ``url``.
+    It opens neither browser nor server: the caller decides how to show the ``url``.
     """
     spec = _spec(provider)
     verifier, challenge = _pkce() if spec.pkce else ("", "")
@@ -306,45 +315,61 @@ def begin(provider: ProviderId) -> AuthRequest:
 
 def _spec(provider: ProviderId) -> _Provider:
     spec = _PROVIDERS.get(provider)
-    if spec is None:  # pragma: no cover - `ProviderId` é fechado; defesa para chamadas soltas
-        raise OAuthError(provider, f"provedor desconhecido: {provider!r}")
+    if spec is None:  # pragma: no cover - `ProviderId` is closed; guard for loose calls
+        raise OAuthError(provider, f"unknown provider: {provider!r}")
     return spec
+
+
+def callback_origin(provider: ProviderId) -> str:
+    """The origin (`scheme://host:port`) of the redirect registered for this provider.
+
+    It exists so the page does not have to repeat the table in JavaScript. Two lists of the
+    same value diverge silently, and the symptom would be the page probing `localhost` while
+    the Antigravity server sits on `127.0.0.1` — reporting no interceptor when there is one.
+
+    It is not cosmetic: Antigravity registers `127.0.0.1` and the other two `localhost`, and
+    the callback server binds **a single family** for a literal, like the OMP source
+    (`callback-server.ts :: #createServer`).
+    """
+    parsed = urllib.parse.urlparse(_spec(provider).redirect_uri)
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 # omp: registry/oauth/callback-server.ts :: parseNativeCallback
 # omp: registry/engine/oauth-code.ts :: exchangeToken
 def _parse_paste(provider: ProviderId, request: AuthRequest, pasted: str) -> str:
-    """Extrai o código de autorização do que o utilizador colou.
+    """Extracts the authorization code from what the user pasted.
 
-    Três formas, todas aceites porque as três aparecem em produção:
+    Three forms, all accepted because all three show up in production:
 
-    * a URL de retorno inteira — ``https://…/callback?code=abc&state=xyz``. É o que o
-      browser mostra na barra quando o redirect falha por não alcançar o porto local;
-    * ``codigo#state`` — o que a Anthropic mostra na página quando o fluxo é pedido com
-      ``code=true``. O fragmento é o ``state``, não parte do código;
-    * o código nu, para quem só copiou esse pedaço.
+    * the whole callback URL — ``https://…/callback?code=abc&state=xyz``. It is what the
+      browser shows in the address bar when the redirect fails to reach the local port;
+    * ``code#state`` — what Anthropic shows on the page when the flow is requested with
+      ``code=true``. The fragment is the ``state``, not part of the code;
+    * the bare code, for whoever copied only that piece.
 
-    O ``state`` é verificado sempre que vem no paste. Quando não vem (código nu) não há
-    nada para comparar — e recusar aí só empurraria o utilizador a colar outra coisa. O
-    ``state`` do pedido segue na troca de qualquer modo, portanto o servidor continua a ser
-    a autoridade.
+    The ``state`` is checked whenever it comes in the paste. When it does not (bare code)
+    there is nothing to compare against — and refusing there would only push the user to
+    paste something else. The request's ``state`` goes in the exchange anyway, so the server
+    remains the authority.
 
-    Um ``error`` no retorno ganha à ausência de código: o ``error_description`` do provedor
-    diz o que correu mal, e transformá-lo em "código em falta" apagava-o.
+    An ``error`` on the callback wins over a missing code: the provider's
+    ``error_description`` says what went wrong, and turning it into "code missing" would
+    erase it.
     """
     text = pasted.strip()
     if not text:
-        raise OAuthError(provider, "nada colado: esperava a URL de retorno ou o código")
+        raise OAuthError(provider, "nothing pasted: expected the callback URL or the code")
 
     if text.startswith(("http://", "https://")):
         return _parse_callback_url(provider, request, text)
 
-    # `codigo#state`: o fragmento é a autoridade sobre o state, como no OMP.
+    # `code#state`: the fragment is the authority on the state, as in OMP.
     code, separator, fragment = text.partition("#")
     if separator and fragment:
         _check_state(provider, request, fragment)
     if not code:
-        raise OAuthError(provider, "o texto colado não contém um código de autorização")
+        raise OAuthError(provider, "the pasted text does not contain an authorization code")
     return code
 
 
@@ -352,7 +377,7 @@ def _parse_callback_url(provider: ProviderId, request: AuthRequest, text: str) -
     try:
         parsed = urllib.parse.urlparse(text)
     except ValueError as exc:
-        raise OAuthError(provider, f"a URL colada não é válida: {exc}") from exc
+        raise OAuthError(provider, f"the pasted URL is not valid: {exc}") from exc
     query = urllib.parse.parse_qs(parsed.query)
 
     if state := _first(query, "state"):
@@ -360,13 +385,15 @@ def _parse_callback_url(provider: ProviderId, request: AuthRequest, text: str) -
 
     if error := _first(query, "error"):
         description = _first(query, "error_description") or error
-        raise OAuthError(provider, f"autorização recusada: {description}")
+        raise OAuthError(provider, f"authorization denied: {description}")
 
-    # `authCode` é a variante que alguns clientes nativos devolvem em vez de `code`.
+    # `authCode` is the variant some native clients return instead of `code`.
     code = _first(query, "code") or _first(query, "authCode")
     if not code:
-        raise OAuthError(provider, "a URL colada não traz `code`; colaste a página certa?")
-    # A Anthropic chega a devolver `code=abc#state` dentro da própria query.
+        raise OAuthError(
+            provider, "the pasted URL carries no `code`; did you paste the right page?"
+        )
+    # Anthropic does return `code=abc#state` inside the query itself at times.
     return code.partition("#")[0]
 
 
@@ -376,12 +403,12 @@ def _first(query: Mapping[str, list[str]], key: str) -> str:
 
 
 def _check_state(provider: ProviderId, request: AuthRequest, received: str) -> None:
-    """Um ``state`` diferente do emitido é o sinal de CSRF; nunca se ignora."""
+    """A ``state`` different from the one issued is the CSRF signal; never ignored."""
     if received != request.state:
         raise OAuthError(
             provider,
-            f"`state` não corresponde (esperado {request.state!r}, colado {received!r}); "
-            f"o retorno pertence a outro pedido de autenticação — recomeça o fluxo",
+            f"`state` does not match (expected {request.state!r}, pasted {received!r}); "
+            f"the callback belongs to another authentication request — start the flow again",
         )
 
 
@@ -395,14 +422,14 @@ async def _post_token(
     headers: Mapping[str, str] = {},
     what: str,
 ) -> dict[str, Any]:
-    """POST ao endpoint de token; devolve o JSON ou levanta com o corpo real.
+    """POSTs to the token endpoint; returns the JSON or raises with the real body.
 
-    O corpo da resposta sobe intacto mesmo quando o estado é 200 mas o JSON não presta:
-    há provedores que embrulham o erro num envelope de sucesso, e é lá dentro que está a
-    única explicação.
+    The response body surfaces intact even when the status is 200 but the JSON is useless:
+    some providers wrap the error in a success envelope, and the only explanation is inside
+    it.
     """
-    # `json` e `form` não são intermutáveis: a Anthropic recusa o corpo urlencoded e o
-    # Google recusa o JSON. A regra de cada provedor diz qual é.
+    # `json` and `form` are not interchangeable: Anthropic refuses the urlencoded body and
+    # Google refuses the JSON. Each provider's rule says which one it is.
     if spec.token_body == "json":
         response = await client.post(spec.token_url, headers=dict(headers), json=params)
     else:
@@ -419,14 +446,14 @@ async def _post_token(
     if response.status_code >= 400:
         raise OAuthError(
             provider,
-            f"{what} falhou: HTTP {response.status_code}: {_describe(payload, body)}",
+            f"{what} failed: HTTP {response.status_code}: {_describe(payload, body)}",
             status=response.status_code,
             body=body,
         )
     if not isinstance(payload, dict):
         raise OAuthError(
             provider,
-            f"{what}: resposta do token não é um objecto JSON: {body[:500]}",
+            f"{what}: token response is not a JSON object: {body[:500]}",
             status=response.status_code,
             body=body,
         )
@@ -434,10 +461,11 @@ async def _post_token(
 
 
 def _describe(payload: Any, body: str) -> str:
-    """Mensagem do upstream, preferindo o ``error_description`` ao corpo cru.
+    """The upstream message, preferring ``error_description`` over the raw body.
 
-    Nunca substitui: quando não há campo reconhecível devolve o corpo, truncado. O que não
-    acontece é fabricar uma explicação genérica por cima de uma real.
+    It never substitutes: when there is no recognizable field it returns the body,
+    truncated. What does not happen is fabricating a generic explanation on top of a real
+    one.
     """
     if isinstance(payload, dict):
         error = payload.get("error")
@@ -462,15 +490,15 @@ async def complete(
     *,
     client: httpx.AsyncClient,
 ) -> Credential:
-    """Troca o que o utilizador colou por uma credencial utilizável.
+    """Exchanges what the user pasted for a usable credential.
 
-    ``pasted`` aceita a URL de retorno inteira, ``codigo#state`` ou o código nu — extrair e
-    validar é responsabilidade desta função, não do utilizador.
+    ``pasted`` accepts the whole callback URL, ``code#state`` or the bare code — extracting
+    and validating is this function's job, not the user's.
 
-    No Antigravity a credencial só fica completa depois de descobrir o projecto: o
-    ``project_id`` não vem do token nem de uma variável de ambiente, vem do
-    ``loadCodeAssist``. Sem ele nenhum pedido de inferência passa, por isso a descoberta
-    faz parte da ligação e não de um passo posterior.
+    On Antigravity the credential is only complete after discovering the project: the
+    ``project_id`` comes neither from the token nor from an environment variable, it comes
+    from ``loadCodeAssist``. Without it no inference request goes through, so discovery is
+    part of connecting and not of a later step.
     """
     spec = _spec(provider)
     code = _parse_paste(provider, request, pasted)
@@ -489,18 +517,19 @@ async def complete(
         params[key] = value.replace("{state}", request.state)
 
     payload = await _post_token(
-        provider, spec, params, client=client, what="a troca do código de autorização"
+        provider, spec, params, client=client, what="the authorization code exchange"
     )
     credential = _credential(provider, spec, payload, previous=None)
 
     if provider == "google-antigravity":
-        # A regra do OMP recusa aqui um token sem refresh: sem ele a subscrição morre na
-        # primeira expiração e o utilizador teria de refazer tudo sem saber porquê.
+        # The OMP rule refuses a token with no refresh here: without one the subscription
+        # dies at the first expiry and the user would have to redo everything without
+        # knowing why.
         if not credential.refresh_token:
             raise OAuthError(
                 provider,
-                "o Google não devolveu refresh token; repete a autorização "
-                "(é o que `access_type=offline` e `prompt=consent` pedem)",
+                "Google did not return a refresh token; repeat the authorization "
+                "(it is what `access_type=offline` and `prompt=consent` ask for)",
             )
         project_id = await _discover_project(credential.access_token, client=client)
         credential = replace(credential, project_id=project_id)
@@ -516,17 +545,17 @@ def _credential(
     *,
     previous: Credential | None,
 ) -> Credential:
-    """Projecta a resposta do token numa ``Credential``.
+    """Projects the token response onto a ``Credential``.
 
-    A rotação é a parte que importa: se o provedor devolve ``refresh_token``, é esse que
-    fica. Só na ausência dele — provedores que não rodam — se preserva o anterior. Guardar
-    o antigo por cima de um novo é o caminho directo para ``invalid_grant`` na renovação
-    seguinte.
+    Rotation is the part that matters: if the provider returns a ``refresh_token``, that is
+    the one that stays. Only in its absence — providers that do not rotate — is the previous
+    one preserved. Keeping the old one over a new one is the direct route to
+    ``invalid_grant`` on the next renewal.
     """
     access = payload.get("access_token")
     if not isinstance(access, str) or not access:
         excerpt = str(dict(payload))[:500]
-        raise OAuthError(provider, f"resposta do token sem access token: {excerpt}")
+        raise OAuthError(provider, f"token response without an access token: {excerpt}")
 
     rotated = payload.get("refresh_token")
     refresh_token = rotated if isinstance(rotated, str) and rotated else ""
@@ -554,17 +583,18 @@ async def refresh(
     client: httpx.AsyncClient,
     store: CredentialStore | None = None,
 ) -> Credential:
-    """Renova o access token, devolvendo uma ``Credential`` nova.
+    """Renews the access token, returning a new ``Credential``.
 
-    **Dono único.** Se ``store`` for dado e ``store.owns_refresh`` for falso, levanta
-    ``NotRefreshOwnerError`` sem tocar na rede. Não é zelo: os refresh tokens da Anthropic e
-    da OpenAI são de uso único, e dois renovadores sobre a mesma credencial invalidam a
-    cópia um do outro, produzindo ``invalid_grant`` em ciclo até alguém voltar a fazer
-    login à mão. Um store que não é dono lê e nunca troca — quem renova é o processo que
-    possui a fonte de verdade. Sem ``store``, quem chama assume essa responsabilidade.
+    **Single owner.** If ``store`` is given and ``store.owns_refresh`` is false, it raises
+    ``NotRefreshOwnerError`` without touching the network. This is not zeal: Anthropic's and
+    OpenAI's refresh tokens are single-use, and two refreshers over the same credential
+    invalidate each other's copy, producing ``invalid_grant`` in a loop until somebody logs
+    in by hand again. A store that is not the owner reads and never exchanges — the one that
+    renews is the process owning the source of truth. Without ``store``, the caller takes
+    that responsibility.
 
-    O ``project_id`` do Antigravity sobrevive à renovação: é fixado no login e o endpoint de
-    token não o devolve. Perdê-lo aqui partiria todos os pedidos seguintes.
+    Antigravity's ``project_id`` survives the renewal: it is fixed at login and the token
+    endpoint does not return it. Losing it here would break every subsequent request.
     """
     provider = credential.provider
     spec = _spec(provider)
@@ -572,15 +602,18 @@ async def refresh(
     if store is not None and not store.owns_refresh:
         raise NotRefreshOwnerError(
             provider,
-            f"{type(store).__name__} não é dono do refresh ({provider}); "
-            f"renovar daqui invalidaria o token do dono. Renova no processo que o possui.",
+            f"{type(store).__name__} is not the refresh owner ({provider}); "
+            f"refreshing from here would invalidate the owner's token. "
+            f"Refresh in the process that owns it.",
         )
     if not credential.refresh_token:
-        raise OAuthError(provider, f"{provider} não tem refresh token; liga a subscrição de novo")
+        raise OAuthError(
+            provider, f"{provider} has no refresh token; connect the subscription again"
+        )
     if provider == "google-antigravity" and not credential.project_id:
-        # O `require "projectId"` da regra do OMP: uma credencial sem projecto renova mas
-        # não serve para nada, e o erro apareceria muito depois, num 400 de inferência.
-        raise OAuthError(provider, f"{provider} não tem project_id; liga a subscrição de novo")
+        # The OMP rule's `require "projectId"`: a credential with no project renews but is
+        # useless, and the error would show up much later, in an inference 400.
+        raise OAuthError(provider, f"{provider} has no project_id; connect the subscription again")
 
     params: dict[str, str] = {
         "grant_type": "refresh_token",
@@ -596,18 +629,18 @@ async def refresh(
         params,
         client=client,
         headers=dict(spec.refresh_headers),
-        what="a renovação do token",
+        what="the token refresh",
     )
     return _credential(provider, spec, payload, previous=credential)
 
 
 # omp: registry/oauth/google-antigravity.ts :: discoverProject
 async def _discover_project(access_token: str, *, client: httpx.AsyncClient) -> str:
-    """Descobre o ``cloudaicompanionProject`` da conta.
+    """Discovers the account's ``cloudaicompanionProject``.
 
-    Três passos, pela mesma ordem do OMP: perguntar o estado, provisionar o free tier se a
-    conta ainda não tem um, e voltar a perguntar. O segundo ``loadCodeAssist`` não é
-    redundante — é ele que devolve o projecto que o ``onboardUser`` acabou de criar.
+    Three steps, in the same order as OMP: ask for the state, provision the free tier if the
+    account does not have one yet, and ask again. The second ``loadCodeAssist`` is not
+    redundant — it is the one that returns the project ``onboardUser`` just created.
     """
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -624,7 +657,7 @@ async def _discover_project(access_token: str, *, client: httpx.AsyncClient) -> 
     if project_id := _project_of(refreshed):
         return project_id
     raise OAuthError(
-        "google-antigravity", "o `loadCodeAssist` não devolveu um `cloudaicompanionProject`"
+        "google-antigravity", "`loadCodeAssist` did not return a `cloudaicompanionProject`"
     )
 
 
@@ -632,10 +665,11 @@ async def _discover_project(access_token: str, *, client: httpx.AsyncClient) -> 
 async def _load_code_assist(
     headers: Mapping[str, str], *, client: httpx.AsyncClient
 ) -> dict[str, Any]:
-    """Estado da conta no Cloud Code Assist.
+    """The account's state in Cloud Code Assist.
 
-    A segunda chamada com ``cloudaicompanionProject`` explícito é o que faz o backend
-    revelar o ``paidTier``: sem o projecto no corpo ele responde só com o tier corrente.
+    The second call with an explicit ``cloudaicompanionProject`` is what makes the backend
+    reveal the ``paidTier``: without the project in the body it answers with the current tier
+    only.
     """
     payload = await _cloud_code(
         _LOAD_CODE_ASSIST_URL,
@@ -667,11 +701,11 @@ def _project_of(payload: Mapping[str, Any]) -> str:
 
 # omp: registry/oauth/google-antigravity.ts :: assertFreeTierEligible
 def _assert_free_tier_eligible(payload: Mapping[str, Any]) -> None:
-    """Recusa cedo uma conta que o backend marca como inelegível.
+    """Refuses early an account the backend marks as ineligible.
 
-    Silêncio não é inelegibilidade: só quando há um ``ineligibleTiers`` com mensagem para o
-    free tier é que se levanta. O ``validationUrl``, quando vem, é o passo seguinte do
-    utilizador e segue na mensagem.
+    Silence is not ineligibility: it only raises when there is an ``ineligibleTiers`` entry
+    with a message for the free tier. The ``validationUrl``, when present, is the user's next
+    step and goes in the message.
     """
     allowed = payload.get("allowedTiers")
     if isinstance(allowed, list) and any(
@@ -693,16 +727,16 @@ def _assert_free_tier_eligible(payload: Mapping[str, Any]) -> None:
 
 
 async def _sleep(seconds: float) -> None:
-    """Indirecção deliberada: é o único ponto de espera real, e os testes substituem-no."""
+    """Deliberate indirection: it is the only real wait point, and tests replace it."""
     await asyncio.sleep(seconds)
 
 
 # omp: registry/oauth/google-antigravity.ts :: onboardUser
 async def _onboard_user(headers: Mapping[str, str], *, client: httpx.AsyncClient) -> None:
-    """Provisiona o free tier, seguindo a operação de longa duração até ao fim.
+    """Provisions the free tier, following the long-running operation to the end.
 
-    O prazo é absoluto, não por tentativa: uma operação que devolve ``done: false`` para
-    sempre tem de falhar em vez de prender a ligação.
+    The deadline is absolute, not per attempt: an operation that returns ``done: false``
+    forever has to fail instead of pinning the connection.
     """
     deadline = time.monotonic() + _ONBOARD_TIMEOUT_S
     operation = await _cloud_code(
@@ -717,20 +751,22 @@ async def _onboard_user(headers: Mapping[str, str], *, client: httpx.AsyncClient
         if operation.get("done") is True:
             if error := operation.get("error"):
                 raise OAuthError(
-                    "google-antigravity", f"o `onboardUser` falhou: {_describe_operation(error)}"
+                    "google-antigravity", f"`onboardUser` failed: {_describe_operation(error)}"
                 )
             if operation.get("response") is None:
-                raise OAuthError("google-antigravity", "o `onboardUser` terminou sem resposta")
+                raise OAuthError("google-antigravity", "`onboardUser` finished without a response")
             return
 
         if time.monotonic() >= deadline:
             raise OAuthError(
                 "google-antigravity",
-                f"o `onboardUser` não terminou em {_ONBOARD_TIMEOUT_S:.0f}s",
+                f"`onboardUser` did not finish within {_ONBOARD_TIMEOUT_S:.0f}s",
             )
         name = operation.get("name")
         if not isinstance(name, str) or not name:
-            raise OAuthError("google-antigravity", "o `onboardUser` devolveu uma operação sem nome")
+            raise OAuthError(
+                "google-antigravity", "`onboardUser` returned an operation without a name"
+            )
 
         await _sleep(_ONBOARD_POLL_INTERVAL_S)
         operation = await _cloud_code(
@@ -757,7 +793,7 @@ async def _cloud_code(
     client: httpx.AsyncClient,
     body: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Pedido ao plano de controlo. Qualquer estado que não seja 200 é erro, com corpo."""
+    """A control plane request. Any status other than 200 is an error, with a body."""
     response = await client.request(method, url, headers=dict(headers), json=body)
     if response.status_code != 200:
         payload: Any = None
@@ -767,11 +803,11 @@ async def _cloud_code(
             payload = None
         raise OAuthError(
             "google-antigravity",
-            f"{url} devolveu HTTP {response.status_code}: {_describe(payload, response.text)}",
+            f"{url} returned HTTP {response.status_code}: {_describe(payload, response.text)}",
             status=response.status_code,
             body=response.text,
         )
     parsed = response.json()
     if not isinstance(parsed, dict):
-        raise OAuthError("google-antigravity", f"{url} não devolveu um objecto JSON")
+        raise OAuthError("google-antigravity", f"{url} did not return a JSON object")
     return parsed

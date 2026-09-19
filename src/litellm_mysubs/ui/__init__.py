@@ -1,4 +1,4 @@
-"""Sub-app `/mysubs` montada no proxy do LiteLLM."""
+"""The `/mysubs` sub-app mounted on the LiteLLM proxy."""
 
 from __future__ import annotations
 

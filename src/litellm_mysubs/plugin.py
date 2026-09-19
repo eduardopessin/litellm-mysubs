@@ -1,36 +1,38 @@
-"""Ponto de entrada: intercepta o LiteLLM e serve os modelos da subscrição.
+"""Entry point: intercepts LiteLLM and serves the subscription models.
 
-Este módulo é a única parte do pacote que conhece o LiteLLM. Traduz OpenAI ⇄ provedor e
-delega o HTTP no `transport/client.py`; a construção dos corpos é toda de `wire/*`.
+This module is the only part of the package that knows about LiteLLM. It translates
+OpenAI ⇄ provider and delegates the HTTP to `transport/client.py`; body construction lives
+entirely in `wire/*`.
 
-Porquê monkey-patch e não `custom_provider_map`: o mapa oficial exige que o nome do modelo
-traga um prefixo de provedor (``mysubs/gpt-5.5``). Os clientes pedem ``gpt-5.5``, e
-reescrever o nome no caminho faria o spend log registar um modelo que ninguém pediu. O
-patch apanha o nome tal como chega.
+Why monkey-patching and not `custom_provider_map`: the official map requires the model name
+to carry a provider prefix (``mysubs/gpt-5.5``). Clients ask for ``gpt-5.5``, and rewriting
+the name along the way would make the spend log record a model nobody asked for. The patch
+catches the name exactly as it arrives.
 
-Decisões tomadas onde o contrato deixa margem
----------------------------------------------
+Decisions taken where the contract leaves room
+----------------------------------------------
 
-``RemapRequired`` **propaga**. O transporte levanta-a quando a conta recusa o nome do
-modelo e sinaliza que pode haver alias. Mas `codex.resolve_model` já aplicou a tabela de
-aliases *antes* de enviar: se o upstream recusou o resultado, não sobra nome nenhum por
-tentar, e repetir mandaria exactamente o mesmo pedido. Substituir por outro modelo é o que
-o README proíbe — a resposta vinha com o campo ``model`` a ecoar o pedido e a facturação
-passava a mentir. Como `RemapRequired` deriva de `UpstreamError`, o estado e o corpo reais
-chegam ao cliente.
+``RemapRequired`` **propagates**. The transport raises it when the account refuses the
+model name and signals that an alias may exist. But `codex.resolve_model` has already
+applied the alias table *before* sending: if the upstream refused the result, there is no
+name left to try, and retrying would send exactly the same request. Substituting another
+model is what the README forbids — the response would come back with the ``model`` field
+echoing the request and the billing would start lying. Since `RemapRequired` derives from
+`UpstreamError`, the real status and body reach the client.
 
-``RedeemRequired`` **propaga** pela mesma ordem de razões: resgatar um crédito de reset
-gasta saldo do utilizador, e o plugin não tem mandato para o fazer sem lho pedirem. Um 429
-honesto é melhor que um débito silencioso.
+``RedeemRequired`` **propagates** for the same order of reasons: redeeming a reset credit
+spends the user's balance, and the plugin has no mandate to do that unasked. An honest 429
+is better than a silent charge.
 
-O caminho síncrono (`litellm.main.completion`) corre a mesma rotina assíncrona num loop
-privado: o transporte é async nativo por decisão do contrato, e duplicar a lógica em
-versão síncrona foi exactamente o que fez as duas derivarem no original.
+The synchronous path (`litellm.main.completion`) runs the same asynchronous routine in a
+private loop: the transport is natively async by contract, and duplicating the logic in a
+synchronous version is exactly what made the two drift apart in the original.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import json
 import threading
@@ -49,32 +51,33 @@ from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, Strea
 from .credentials.store import CredentialStore, ProviderId
 from .transport import hosts
 from .transport.client import RequestSpec, Transport
-from .wire import anthropic, antigravity, codex, planning_leak, thinking_loop
+from .wire import anthropic, antigravity, antigravity_models, codex, planning_leak, thinking_loop
 from .wire.usage import Usage, codex_finish_reason, codex_usage, google_finish_reason, google_usage
 
-#: Endpoint da Responses API servida pela subscrição ChatGPT.
+#: Responses API endpoint served by the ChatGPT subscription.
 CODEX_URL: Final = "https://chatgpt.com/backend-api/codex/responses"
 
 ANTIGRAVITY_USER_AGENT: Final = (
     "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
 )
 
-#: Assinaturas de raciocínio das tool calls do Gemini, para reenviar no turno seguinte. O
-#: tecto existe porque uma sessão longa acumularia uma entrada por chamada até ao fim do
-#: processo.
+#: Reasoning signatures from Gemini tool calls, to send back on the next turn. The cap
+#: exists because a long session would accumulate one entry per call until the process
+#: ends.
 _SIGNATURE_LIMIT: Final = 512
 
-#: Identidade de transporte desta instância. É por processo, como no cliente real: um
-#: `window_id` novo a cada pedido invalidava o cache de prompt do backend.
+#: This instance's transport identity. Per process, as in the real client: a new
+#: `window_id` on every request invalidated the backend's prompt cache.
 _WINDOW_ID: Final = str(uuid.uuid4())
 _AGENT_ID: Final = uuid.uuid4().hex[:16]
 _TRAJECTORY_ID: Final = uuid.uuid4().hex[:16]
 
 
 class _State:
-    """Estado do módulo, num objecto só para que `uninstall` não deixe pontas soltas."""
+    """Module state, in a single object so that `uninstall` leaves no loose ends."""
 
     __slots__ = (
+        "catalog",
         "original_acompletion",
         "original_completion",
         "original_router_acompletion",
@@ -87,22 +90,28 @@ class _State:
     def __init__(self) -> None:
         self.original_acompletion: Callable[..., Any] | None = None
         self.original_completion: Callable[..., Any] | None = None
-        #: O proxy encaminha por `Router.acompletion`, não pelas funções de módulo.
+        #: The proxy routes through `Router.acompletion`, not the module functions.
         self.original_router_acompletion: Callable[..., Any] | None = None
         self.store: CredentialStore | None = None
         self.transport: Transport | None = None
         self.signatures: OrderedDict[str, str] = OrderedDict()
         self.step = 0
+        #: The Antigravity catalog, with `ModelCatalog`'s own TTL. Without it `map_model`
+        #: falls back to the curated static map, which only knows the Gemini family —
+        #: measured: `claude-sonnet-4-6`, `gpt-oss-120b-medium`, `chat_23310` and eight
+        #: more raised `ModelNotServedError` with the message "is not served by this
+        #: account", when all eleven were in the account's real catalog.
+        self.catalog = antigravity_models.ModelCatalog()
 
 
 _state = _State()
 
 
 def configure(*, store: CredentialStore | None = None, transport: Transport | None = None) -> None:
-    """Liga as dependências. Chamar antes de `install`.
+    """Wires the dependencies. Call before `install`.
 
-    Ambas são injectadas em vez de descobertas: é o que permite exercer o despacho inteiro
-    sem tocar na rede nem no disco.
+    Both are injected rather than discovered: that is what allows the whole dispatch to be
+    exercised without touching the network or the disk.
     """
     if store is not None:
         _state.store = store
@@ -111,26 +120,27 @@ def configure(*, store: CredentialStore | None = None, transport: Transport | No
 
 
 def _transport() -> Transport:
-    """Transporte em uso; cria o de produção à primeira necessidade."""
+    """The transport in use; creates the production one on first need."""
     if _state.transport is None:
         _state.transport = Transport(refresh=_refresh, rotation=hosts.HostRotation())
     return _state.transport
 
 
 async def _refresh(provider: str) -> str | None:
-    """Renova a credencial depois de um 401.
+    """Renews the credential after a 401.
 
-    Duas etapas, por esta ordem:
+    Two steps, in this order:
 
-    1. **Reler a fonte.** Outro processo — outro worker do proxy, o dashboard — pode ter
-       rodado o token entretanto. Se a leitura já trouxer um token diferente do que falhou,
-       está feito, e não se gasta o refresh token.
-    2. **Renovar**, mas só se este store for o dono. Tokens rotativos de uso único não
-       toleram dois renovadores: a regra está no topo de `credentials/store.py`, e um store
-       com `owns_refresh=False` lê e nunca troca.
+    1. **Re-read the source.** Another process — another proxy worker, the dashboard — may
+       have rotated the token in the meantime. If the read already brings a token different
+       from the one that failed, it is done, and the refresh token is not spent.
+    2. **Renew**, but only if this store is the owner. Single-use rotating tokens do not
+       tolerate two renewers: the rule is at the top of `credentials/store.py`, and a store
+       with `owns_refresh=False` reads and never exchanges.
 
-    Uma falha aqui devolve `None`, que o transporte traduz no erro real do upstream. Não se
-    levanta: o 401 original é mais informativo do que "falhei a renovar".
+    A failure here returns `None`, which the transport translates into the upstream's real
+    error. It does not raise: the original 401 is more informative than "I failed to
+    renew".
     """
     store = _state.store
     if store is None:
@@ -142,7 +152,7 @@ async def _refresh(provider: str) -> str | None:
     if credential is None:
         return None
     if not credential.is_expired():
-        # A releitura trouxe algo que ainda serve: outro processo já renovou.
+        # The re-read brought something still usable: another process already renewed.
         return credential.access_token
 
     if not getattr(store, "owns_refresh", False) or not credential.refresh_token:
@@ -168,14 +178,15 @@ _PROVIDER_IDS: Final[dict[str, ProviderId]] = {
 
 
 async def _access_token(provider: str) -> str:
-    """O token a usar no pedido, renovado antes de expirar se for preciso.
+    """The token to use on the request, renewed before it expires if needed.
 
-    Renovar aqui em vez de esperar pelo 401 poupa uma ida ao upstream por cada token que
-    expira, e evita que um pedido em streaming falhe a meio — o transporte só repete o que
-    ainda não entregou, e um 401 depois do primeiro evento não é recuperável.
+    Renewing here instead of waiting for the 401 saves one round trip to the upstream per
+    expiring token, and keeps a streaming request from failing halfway — the transport only
+    retries what it has not yet delivered, and a 401 after the first event is not
+    recoverable.
 
-    O `is_expired` do `Credential` já traz 60 segundos de folga: renova-se enquanto o token
-    ainda serve, para não haver janela entre a verificação e o pedido.
+    `Credential.is_expired` already carries 60 seconds of slack: the token is renewed while
+    it still works, so there is no window between the check and the request.
     """
     store = _state.store
     if store is None:
@@ -191,14 +202,49 @@ async def _access_token(provider: str) -> str:
 
 
 def is_gemini_model(model: str) -> bool:
-    """Modelos servidos pela subscrição Google Antigravity.
+    """Models served by the Google Antigravity subscription.
 
-    Sem âncora ao OMP de propósito: lá a distinção é feita por ``model.provider`` num
-    catálogo tipado (`google-gemini-cli.ts`), não por um predicado sobre o nome. Aqui o
-    nome é tudo o que chega do cliente. A forma vem do original, `sitecustomize.py:1549`.
+    No OMP anchor on purpose: there the distinction is made by ``model.provider`` in a
+    typed catalog (`google-gemini-cli.ts`), not by a predicate over the name. Here the name
+    is all that arrives from the client. The shape comes from the original,
+    `sitecustomize.py:1549`.
     """
     lowered = str(model).lower()
     return "gemini" in lowered or "antigravity" in lowered
+
+
+#: Provider declared on the deployment, when the request comes from the Router.
+#:
+#: Guessing the provider from the name fails on Antigravity, which serves models from
+#: **three** families. Measured on the account's real catalog: of the 32 models served,
+#: seven have no "gemini" in the name — `claude-opus-4-6-thinking`, `claude-sonnet-4-6`,
+#: `chat_23310`, `chat_20706`, `tab_flash_lite_preview`, `tab_jump_flash_lite_preview` fell
+#: through to native LiteLLM (which has no credential and blows up), and
+#: `gpt-oss-120b-medium` was dispatched to **Codex** — another subscription, another wire,
+#: another account being charged.
+#:
+#: `ModelRegistry` already writes `model_info.mysubs_provider` on every entry it injects.
+#: Reading that mark is the difference between knowing and assuming.
+_PROVIDER_KEY: Final = "mysubs_provider"
+
+
+def provider_of_deployment(router: Any, model: str) -> ProviderId | None:
+    """The provider declared for `model`, or `None` if it is not one of our entries.
+
+    Looks up `model_name` in the Router's list. A name that is not there — or that is there
+    without the mark — returns `None`, and dispatch falls back to the name heuristic, which
+    is what serves callers of `litellm.acompletion` directly, without a Router.
+    """
+    for deployment in getattr(router, "model_list", None) or []:
+        if not isinstance(deployment, dict):
+            continue
+        if deployment.get("model_name") != model:
+            continue
+        info = deployment.get("model_info") or {}
+        declared = info.get(_PROVIDER_KEY)
+        if declared in _PROVIDER_IDS.values():
+            return declared
+    return None
 
 
 def _remember_signature(call_id: str, signature: str) -> None:
@@ -210,15 +256,16 @@ def _remember_signature(call_id: str, signature: str) -> None:
 
 
 def _request_id() -> str:
-    """``agent/<id>/<ts>/<traj>/<passo>`` — o formato que o CCA espera."""
+    """``agent/<id>/<ts>/<traj>/<step>`` — the format the CCA expects."""
     _state.step += 1
     return f"agent/{_AGENT_ID}/{int(time.time() * 1000)}/{_TRAJECTORY_ID}/{_state.step}"
 
 
 async def _codex_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> RequestSpec:
-    # Sem tectos de output a remover: `build_request_body` constrói o corpo de raiz e não
-    # lê `max_tokens`/`max_output_tokens`/`max_completion_tokens` dos kwargs. O original
-    # tinha de os apagar porque passava os kwargs adiante; aqui nunca chegam ao fio.
+    # No output caps to strip: `build_request_body` builds the body from scratch and does
+    # not read `max_tokens`/`max_output_tokens`/`max_completion_tokens` from the kwargs. The
+    # original had to delete them because it passed the kwargs on; here they never reach
+    # the wire.
     token = await _access_token("codex")
     body = codex.build_request_body(
         model,
@@ -237,18 +284,47 @@ async def _codex_spec(model: str, messages: list[Any], extra: dict[str, Any]) ->
     return RequestSpec(url=CODEX_URL, headers=headers, body=body, provider="codex", model=model)
 
 
+async def _refresh_catalog(token: str, project_id: str) -> antigravity_models.ModelCatalog:
+    """The Antigravity catalog, with `ModelCatalog`'s own TTL.
+
+    A failure here returns whatever there is — empty the first time. That is deliberate:
+    `map_model` then falls back to the static map, which serves the Gemini family, and the
+    request goes through instead of dying because the catalog did not answer. The opposite
+    would let an outage of the catalog endpoint disable every model at once.
+    """
+    catalog = _state.catalog
+    if catalog.is_fresh():
+        return catalog
+    with contextlib.suppress(Exception):
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                hosts.HOSTS[0] + hosts.MODELS_PATH,
+                json={"project": project_id} if project_id else {},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": ANTIGRAVITY_USER_AGENT,
+                },
+            )
+            if response.status_code == 200:
+                catalog.update(response.json())
+    return catalog
+
+
 async def _antigravity_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> RequestSpec:
     token = await _access_token("antigravity")
     store = _state.store
     credential = store.get("google-antigravity") if store else None
+    project_id = credential.project_id if credential else ""
     body = antigravity.build_payload(
         model,
         messages,
-        project_id=credential.project_id if credential else "",
+        project_id=project_id,
         request_id=_request_id(),
         tools=extra.get("tools"),
         extra=extra,
         thought_signatures=_state.signatures,
+        catalog=await _refresh_catalog(token, project_id),
     )
     headers = {
         "Authorization": f"Bearer {token}",
@@ -265,15 +341,15 @@ async def _antigravity_spec(model: str, messages: list[Any], extra: dict[str, An
     )
 
 
-# -- interpretação dos eventos -------------------------------------------------
+# -- event interpretation ------------------------------------------------------
 
 
 class _Turn:
-    """Acumulador do que um stream de eventos produziu.
+    """Accumulator for what a stream of events produced.
 
-    O mesmo objecto serve os dois caminhos: no não-streaming lê-se no fim, no streaming
-    vai-se emitindo. Ter duas rotinas de interpretação foi o que fez as versões síncrona e
-    assíncrona do original divergirem.
+    The same object serves both paths: in the non-streaming one it is read at the end, in
+    the streaming one it is emitted as it goes. Having two interpretation routines is what
+    made the original's synchronous and asynchronous versions diverge.
     """
 
     __slots__ = ("finish_raw", "reasoning", "terminal", "text", "tool_calls", "usage_meta")
@@ -288,19 +364,19 @@ class _Turn:
 
 
 class StreamError(RuntimeError):
-    """Falha dentro de um stream com HTTP 200.
+    """Failure inside a stream with HTTP 200.
 
-    Tanto o Codex (``response.failed``) como o CCA (``error`` in-band) reportam erros no
-    corpo de uma resposta bem-sucedida. Engoli-los entregava um turno vazio como sucesso.
+    Both Codex (``response.failed``) and the CCA (in-band ``error``) report errors in the
+    body of a successful response. Swallowing them delivered an empty turn as success.
     """
 
 
 class _CodexReader:
-    """Traduz eventos da Responses API para chunks OpenAI, actualizando um `_Turn`.
+    """Translates Responses API events into OpenAI chunks, updating a `_Turn`.
 
-    Interface ``feed``/``close`` em vez de gerador sobre um iterável: o mesmo objecto
-    serve o caminho streaming (emite-se o que ``feed`` devolve) e o não-streaming
-    (descarta-se), sem que um evento que produza vários chunks fique retido.
+    A ``feed``/``close`` interface instead of a generator over an iterable: the same object
+    serves the streaming path (what ``feed`` returns is emitted) and the non-streaming one
+    (it is discarded), without an event that produces several chunks being held back.
     """
 
     __slots__ = ("_active", "_index_of", "_turn", "_ws_bytes", "_ws_events")
@@ -337,13 +413,14 @@ class _CodexReader:
             delta = str(event.get("delta") or "")
             if not delta:
                 return []
-            # O backend entra por vezes num ciclo a emitir só espaços nos argumentos; sem
-            # travão o stream nunca fecha. Limites do OMP: 256 eventos / 16 KB.
+            # The backend sometimes enters a loop emitting only whitespace in the
+            # arguments; with no brake the stream never closes. OMP limits: 256 events /
+            # 16 KB.
             if not delta.strip():
                 self._ws_events += 1
                 self._ws_bytes += len(delta)
                 if self._ws_events > 256 or self._ws_bytes > 16384:
-                    raise StreamError("Codex: ciclo de espaços nos argumentos de tool call")
+                    raise StreamError("Codex: whitespace loop in tool call arguments")
             if item_id in self._active:
                 self._active[item_id]["function"]["arguments"] += delta
             return [_tool_delta_chunk(self._index_of.get(item_id, 0), delta)]
@@ -366,8 +443,8 @@ class _CodexReader:
             return [_delta_chunk(Delta(reasoning_content=delta))]
 
         if kind in ("response.output_text.delta", "response.refusal.delta"):
-            # O OMP trata `refusal` como texto visível; sem este ramo um turno recusado
-            # chegava ao cliente com content vazio e stop limpo.
+            # OMP treats `refusal` as visible text; without this branch a refused turn
+            # reached the client with empty content and a clean stop.
             delta = str(event.get("delta") or "")
             if not delta:
                 return []
@@ -385,34 +462,34 @@ class _CodexReader:
 
         if kind in ("response.failed", "error"):
             payload = event.get("response") or {}
-            detail = payload.get("error") or event.get("message") or "erro desconhecido"
+            detail = payload.get("error") or event.get("message") or "unknown error"
             raise StreamError(f"Codex: {detail}")
 
         return []
 
     def close(self) -> list[ModelResponseStream]:
-        """Só `response.completed`/`response.incomplete` fecham a resposta.
+        """Only `response.completed`/`response.incomplete` close the response.
 
-        Um stream cortado antes disso é falha de transporte: devolvê-lo como sucesso
-        entregava output truncado como se estivesse completo.
+        A stream cut before that is a transport failure: returning it as success delivered
+        truncated output as if it were complete.
         """
         if not self._turn.terminal:
-            raise StreamError("Codex: stream terminou sem response.completed/response.incomplete")
+            raise StreamError("Codex: stream ended without response.completed/response.incomplete")
         return []
 
 
 def _raise_in_band(event: dict[str, Any]) -> None:
-    """O CCA devolve erros dentro do stream com HTTP 200."""
+    """The CCA returns errors inside the stream with HTTP 200."""
     error = event.get("error")
     if isinstance(error, dict) and int(error.get("code") or 0) >= 400:
         raise StreamError(f"Antigravity {error.get('code')}: {error.get('message') or error}")
     feedback = (event.get("response") or {}).get("promptFeedback")
     if isinstance(feedback, dict) and feedback.get("blockReason"):
-        raise StreamError(f"Antigravity: conteúdo bloqueado ({feedback['blockReason']})")
+        raise StreamError(f"Antigravity: content blocked ({feedback['blockReason']})")
 
 
 class _AntigravityReader:
-    """Traduz eventos de ``:streamGenerateContent``, actualizando um `_Turn`."""
+    """Translates ``:streamGenerateContent`` events, updating a `_Turn`."""
 
     __slots__ = ("_guard", "_leak", "_tool_index", "_turn", "_wire_model")
 
@@ -437,8 +514,17 @@ class _AntigravityReader:
             return []
         turn.finish_raw = candidates[0].get("finishReason") or turn.finish_raw
 
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        if candidates[0].get("finishReason"):
+            # The event that closes the turn is the only one carrying the full
+            # `usageMetadata`, and it is the one the retirement notice comes in (measured:
+            # a single event, with text, `finishReason: STOP` and `total_tokens=0`).
+            # Guarding here, **before** emitting what this event carries, is what keeps the
+            # notice from going out as content.
+            self._guard_retired("".join(str(part.get("text") or "") for part in parts))
+
         chunks: list[ModelResponseStream] = []
-        for part in (candidates[0].get("content") or {}).get("parts") or []:
+        for part in parts:
             text = str(part.get("text") or "")
             if text:
                 chunks.extend(self._text(text, thought=bool(part.get("thought"))))
@@ -447,14 +533,25 @@ class _AntigravityReader:
                 chunks.extend(self._call(call, part.get("thoughtSignature")))
         return chunks
 
+    def _guard_retired(self, pending: str = "") -> None:
+        """A retired model answers 200 with a notice; accepting it put it in the history.
+
+        The check is over the turn's **accumulated** text plus what has not been emitted
+        yet: the notice can arrive split across parts, and neither half alone matches the
+        markers.
+        """
+        antigravity.raise_if_retired(
+            "".join(self._turn.text) + pending, self._turn.usage_meta, self._wire_model
+        )
+
     def _text(self, text: str, *, thought: bool) -> list[ModelResponseStream]:
         turn = self._turn
         if thought:
             if self._guard is not None and (reason := self._guard.feed(text)):
                 raise thinking_loop.ThinkingLoopError(
-                    f"Antigravity: raciocínio em loop ({reason}) após "
-                    f"{self._guard.chars} chars em {self._wire_model}; abortado em vez "
-                    "de facturar o resto"
+                    f"Antigravity: reasoning loop ({reason}) after "
+                    f"{self._guard.chars} chars on {self._wire_model}; aborted instead of "
+                    "billing the rest"
                 )
             turn.reasoning.append(text)
             return [_delta_chunk(Delta(reasoning_content=text))]
@@ -482,17 +579,20 @@ class _AntigravityReader:
         return [_tool_open_chunk(index, call_id, name), _tool_delta_chunk(index, arguments)]
 
     def close(self) -> list[ModelResponseStream]:
-        """Despeja o que o filtro de leak reteve e afinal não era planeamento."""
-        if self._leak is None:
-            return []
-        tail = self._leak.flush()
-        if not tail:
-            return []
-        self._turn.text.append(tail)
-        return [_delta_chunk(Delta(content=tail))]
+        """Flushes what the leak filter held back and turned out not to be planning."""
+        chunks: list[ModelResponseStream] = []
+        if self._leak is not None and (tail := self._leak.flush()):
+            self._turn.text.append(tail)
+            chunks.append(_delta_chunk(Delta(content=tail)))
+        # Safety net: if the notice arrives with no `finishReason` in the same event, or
+        # spread over several, `feed` never saw it whole. Here the turn is complete and the
+        # final `usageMetadata` has arrived. Fires at most once per response — if `feed`
+        # already raised, this line is never reached.
+        self._guard_retired()
+        return chunks
 
 
-# -- forma que o LiteLLM espera ------------------------------------------------
+# -- the shape LiteLLM expects -------------------------------------------------
 
 
 def _delta_chunk(delta: Delta) -> ModelResponseStream:
@@ -500,7 +600,7 @@ def _delta_chunk(delta: Delta) -> ModelResponseStream:
 
 
 def _tool_open_chunk(index: int, call_id: str, name: str) -> ModelResponseStream:
-    """Abre uma tool call. O ``role`` viaja aqui porque pode ser o primeiro chunk do turno."""
+    """Opens a tool call. ``role`` rides here because this may be the turn's first chunk."""
     return _delta_chunk(
         Delta(
             role="assistant",
@@ -527,11 +627,11 @@ def _finish_chunk(reason: str) -> ModelResponseStream:
 
 
 def _usage_chunk(usage: Usage) -> ModelResponseStream:
-    """Chunk final com o usage real; sem ele o LiteLLM estima por contagem de tokens.
+    """Final chunk with the real usage; without it LiteLLM estimates by token counting.
 
-    ``choices`` leva uma entrada vazia em vez de vir a ``[]``: o iterador da rota
-    ``/v1/responses`` faz ``chunk.choices[0].delta`` sem guarda, e uma lista vazia mata o
-    stream antes do evento terminal — o cliente fica à espera para sempre.
+    ``choices`` carries one empty entry instead of being ``[]``: the ``/v1/responses``
+    route's iterator does ``chunk.choices[0].delta`` with no guard, and an empty list kills
+    the stream before the terminal event — the client waits forever.
     """
     chunk = ModelResponseStream(
         choices=[StreamingChoices(index=0, delta=Delta(), finish_reason=None)]
@@ -541,7 +641,7 @@ def _usage_chunk(usage: Usage) -> ModelResponseStream:
 
 
 def _litellm_usage(usage: Usage) -> litellm.Usage:
-    """``cached_tokens`` tem de ir também no atributo que o spend logging lê."""
+    """``cached_tokens`` also has to go on the attribute the spend logging reads."""
     out = litellm.Usage(
         prompt_tokens=usage.prompt_tokens,
         completion_tokens=usage.completion_tokens,
@@ -554,7 +654,7 @@ def _litellm_usage(usage: Usage) -> litellm.Usage:
 
 
 def _message(turn: _Turn) -> dict[str, Any]:
-    """Mensagem assistant no shape OpenAI, com o raciocínio no campo padronizado."""
+    """Assistant message in the OpenAI shape, with the reasoning in the standard field."""
     message: dict[str, Any] = {"role": "assistant"}
     if turn.tool_calls:
         message["tool_calls"] = turn.tool_calls
@@ -576,14 +676,14 @@ def _model_response(model: str, turn: _Turn, *, finish_reason: str, usage: Usage
     )
 
 
-# -- despacho ------------------------------------------------------------------
+# -- dispatch --------------------------------------------------------------------
 
 
 def _normalize(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
-    """``(model, messages)`` posicionais passam a kwargs.
+    """Positional ``(model, messages)`` become kwargs.
 
-    O LiteLLM aceita ambas as formas; sem isto o despacho via ``kwargs["model"]`` não via
-    o modelo e todos os pedidos posicionais caíam no original.
+    LiteLLM accepts both forms; without this, dispatch via ``kwargs["model"]`` did not see
+    the model and every positional request fell through to the original.
     """
     if args and "model" not in kwargs:
         kwargs["model"] = args[0]
@@ -598,10 +698,10 @@ class _Reader(Protocol):
 
 
 async def _drive(events: AsyncIterator[dict[str, Any]], reader: _Reader) -> None:
-    """Caminho não-streaming: consome tudo pelo mesmo leitor e descarta os chunks.
+    """Non-streaming path: consumes everything through the same reader, discarding chunks.
 
-    Uma rotina de interpretação só, partilhada com o streaming — ter duas foi o que fez as
-    versões síncrona e assíncrona do original divergirem.
+    A single interpretation routine, shared with the streaming path — having two is what
+    made the original's synchronous and asynchronous versions diverge.
     """
     async for event in events:
         reader.feed(event)
@@ -611,7 +711,7 @@ async def _drive(events: AsyncIterator[dict[str, Any]], reader: _Reader) -> None
 async def _pump(
     events: AsyncIterator[dict[str, Any]], reader: _Reader
 ) -> AsyncIterator[ModelResponseStream]:
-    """Caminho streaming: emite os chunks de cada evento à medida que chegam."""
+    """Streaming path: emits each event's chunks as they arrive."""
     async for event in events:
         for chunk in reader.feed(event):
             yield chunk
@@ -669,39 +769,49 @@ async def _antigravity_stream(
     yield _usage_chunk(google_usage(turn.usage_meta))
 
 
-async def dispatch(**kwargs: Any) -> Any:
-    """Serve o pedido se o modelo for de uma subscrição nossa; ``None`` se não for.
+async def dispatch(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
+    """Serves the request if the model belongs to one of our subscriptions; ``None`` if not.
 
-    ``None`` é a única forma de dizer "não é meu" sem fabricar resposta: o chamador
-    delega no original. Um modelo nosso que o upstream recuse propaga o erro — `RemapRequired`
-    e `RedeemRequired` incluídas, pelas razões no topo do módulo.
+    ``None`` is the only way to say "not mine" without fabricating a response: the caller
+    delegates to the original. One of our models that the upstream refuses propagates the
+    error — `RemapRequired` and `RedeemRequired` included, for the reasons at the top of
+    the module.
+
+    ``provider`` comes from the deployment's `model_info.mysubs_provider` when the request
+    goes through the Router, and **wins** over the name heuristic. It is what keeps a
+    `claude-sonnet-4-6` served by Antigravity from being treated as Anthropic, or a
+    `gpt-oss-120b-medium` from the same account from ending up at Codex — measured: seven
+    of the 32 models in the real catalog dispatched to the wrong place.
     """
     model = str(kwargs.get("model") or "")
     messages = kwargs.get("messages") or []
     streaming = bool(kwargs.get("stream"))
 
-    if is_gemini_model(model):
+    if provider == "google-antigravity" or (provider is None and is_gemini_model(model)):
         if streaming:
             return _wrap_stream(_antigravity_stream(model, messages, kwargs), model, kwargs)
         return await _antigravity_turn(model, messages, kwargs)
 
-    # Depois do Gemini: `codex.is_codex_model` faz match em qualquer nome com "gpt-", e um
-    # hipotético "gemini-gpt" pertence ao Google.
-    if codex.is_codex_model(model):
+    # After Gemini: `codex.is_codex_model` matches any name containing "gpt-", and a
+    # hypothetical "gemini-gpt" belongs to Google.
+    if provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
         if streaming:
             return _wrap_stream(_codex_stream(model, messages, kwargs), model, kwargs)
         return await _codex_turn(model, messages, kwargs)
 
+    # `anthropic` has no branch of its own: it is served by LiteLLM's native path with the
+    # prompt and the token that `_delegate_kwargs` injects. Returning `None` is what routes
+    # it there.
     return None
 
 
 def _wrap_stream(
     chunks: AsyncIterator[ModelResponseStream], model: str, kwargs: dict[str, Any]
 ) -> litellm.CustomStreamWrapper:
-    """Embrulha no iterador do LiteLLM: é ele que o proxy sabe consumir.
+    """Wraps it in LiteLLM's iterator: that is what the proxy knows how to consume.
 
-    Devolver o gerador cru dava ao cliente objectos sem o protocolo que a rota
-    ``/v1/chat/completions`` espera — e nenhum callback de spend log dispararia.
+    Returning the raw generator gave the client objects without the protocol the
+    ``/v1/chat/completions`` route expects — and no spend log callback would fire.
     """
     return litellm.CustomStreamWrapper(
         completion_stream=chunks,
@@ -712,10 +822,11 @@ def _wrap_stream(
 
 
 def _logging_obj(model: str, kwargs: dict[str, Any]) -> Logging:
-    """Objecto de logging para quando o chamador não traz o dele.
+    """Logging object for when the caller does not bring its own.
 
-    O `CustomStreamWrapper` desreferencia-o no construtor — passar ``None`` rebenta antes
-    do primeiro chunk. O proxy injecta sempre o seu; uma chamada directa à biblioteca não.
+    `CustomStreamWrapper` dereferences it in the constructor — passing ``None`` blows up
+    before the first chunk. The proxy always injects its own; a direct library call does
+    not.
     """
     return Logging(
         model=model,
@@ -726,16 +837,6 @@ def _logging_obj(model: str, kwargs: dict[str, Any]) -> Logging:
         litellm_call_id=str(kwargs.get("litellm_call_id") or uuid.uuid4()),
         function_id=str(kwargs.get("id") or uuid.uuid4()),
     )
-
-
-async def _delegate_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Kwargs para o original, com o prompt Claude aplicado quando é um modelo Claude.
-
-    É o que o ``_inject_claude_prompt`` do original faz: a subscrição Anthropic só valida
-    a identidade do Claude Code como system message, e sem isto o pedido é recusado.
-    """
-    model = str(kwargs.get("model") or "")
-    return anthropic.build_request(kwargs, model, await _access_token("anthropic"))
 
 
 async def _wrapped_acompletion(*args: Any, **kwargs: Any) -> Any:
@@ -749,11 +850,11 @@ async def _wrapped_acompletion(*args: Any, **kwargs: Any) -> Any:
 
 
 def _wrapped_completion(*args: Any, **kwargs: Any) -> Any:
-    """Caminho síncrono: corre o mesmo `dispatch` num loop privado.
+    """Synchronous path: runs the same `dispatch` in a private loop.
 
-    Duplicar a lógica numa versão síncrona foi o que fez as duas derivarem no original. O
-    loop é privado porque `asyncio.run` recusa correr dentro de um loop já activo, e o
-    proxy chama isto de threads sem loop nenhum.
+    Duplicating the logic in a synchronous version is what made the two drift apart in the
+    original. The loop is private because `asyncio.run` refuses to run inside an already
+    active loop, and the proxy calls this from threads with no loop at all.
     """
     kwargs = _normalize(args, kwargs)
     served = _run_sync(dispatch(**kwargs))
@@ -765,13 +866,13 @@ def _wrapped_completion(*args: Any, **kwargs: Any) -> Any:
 
 
 def _run_sync(coroutine: Coroutine[Any, Any, Any]) -> Any:
-    """Corre uma corotina a partir de código síncrono, haja ou não loop activo."""
+    """Runs a coroutine from synchronous code, whether or not a loop is active."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coroutine)
-    # Chamada síncrona de dentro de um loop: correr numa thread com loop próprio é a
-    # única saída que não bloqueia o loop do chamador contra si mesmo.
+    # Synchronous call from inside a loop: running on a thread with its own loop is the
+    # only way out that does not deadlock the caller's loop against itself.
     result: list[Any] = []
     error: list[BaseException] = []
 
@@ -789,61 +890,89 @@ def _run_sync(coroutine: Coroutine[Any, Any, Any]) -> Any:
     return result[0]
 
 
-#: Sítios que referem as funções de entrada. `litellm/__init__.py` faz
-#: `from .main import acompletion`, o que **copia** a referência: rebindar só
-#: `litellm.main` deixa `litellm.acompletion` a apontar para a função original, e um
-#: cliente que chame `litellm.acompletion(...)` — a forma documentada — nunca passa pelo
-#: despacho. O `sitecustomize.py` original patcha os dois (linhas 2916-2917) e o porte
-#: começou por patchar só um: o pedido rebentava com "LLM Provider NOT provided", porque
-#: chegava ao caminho nativo com um nome que nenhum provedor conhece.
+#: Places that refer to the entry functions. `litellm/__init__.py` does
+#: `from .main import acompletion`, which **copies** the reference: rebinding only
+#: `litellm.main` leaves `litellm.acompletion` pointing at the original function, and a
+#: client calling `litellm.acompletion(...)` — the documented form — never goes through
+#: dispatch. The original `sitecustomize.py` patches both (lines 2916-2917) and the port
+#: started out patching only one: the request blew up with "LLM Provider NOT provided",
+#: because it reached the native path with a name no provider knows.
 _ASYNC_TARGETS: Final = ((litellm, "acompletion"), (litellm.main, "acompletion"))
 _SYNC_TARGETS: Final = ((litellm, "completion"), (litellm.main, "completion"))
 
 
 def _router_class() -> Any:
-    """A classe `Router` do LiteLLM.
+    """LiteLLM's `Router` class.
 
-    Importada aqui em vez de no topo: `litellm.Router` não é um export declarado e o mypy
-    recusa o acesso directo. O import local mantém o resto do módulo verificável.
+    Imported late: `litellm.router` drags in the whole proxy, and this module has to be
+    importable without it.
     """
     from litellm.router import Router
 
     return Router
 
 
+async def _delegate_kwargs(
+    kwargs: dict[str, Any], *, provider: ProviderId | None = None
+) -> dict[str, Any]:
+    """Kwargs for the original, with the Claude prompt applied when it is a Claude model.
+
+    This is what the original's ``_inject_claude_prompt`` does: the Anthropic subscription
+    only validates the Claude Code identity as a system message, and without it the request
+    is refused.
+
+    A declared ``provider`` that is **not** `anthropic` blocks the injection. The
+    Antigravity catalog serves `claude-sonnet-4-6` and `claude-opus-4-6-thinking`: without
+    this guard, those requests carried the Anthropic subscription token to a Google
+    endpoint — one account's credential sent to another.
+    """
+    model = str(kwargs.get("model") or "")
+    if provider is not None and provider != "anthropic":
+        return kwargs
+    return anthropic.build_request(kwargs, model, await _access_token("anthropic"))
+
+
 async def _wrapped_router_acompletion(
     self: Any, model: str, messages: list[Any], stream: bool = False, **kwargs: Any
 ) -> Any:
-    """O caminho que o **proxy** usa de facto.
+    """The path the **proxy** actually uses.
 
-    O proxy não chama `litellm.acompletion`: chama `Router.acompletion`, que resolve o
-    deployment e constrói o cliente do provedor **antes** de qualquer função de módulo ser
-    tocada. Sem este patch, um modelo de subscrição chegava ao cliente nativo e rebentava
-    com `Illegal header value b'Bearer '` — o deployment não leva `api_key` porque a
-    credencial é OAuth e vive no store, não no `config.yaml`.
+    The proxy does not call `litellm.acompletion`: it calls `Router.acompletion`, which
+    resolves the deployment and builds the provider client **before** any module function is
+    touched. Without this patch, a subscription model reached the native client and blew up
+    with `Illegal header value b'Bearer '` — the deployment carries no `api_key` because the
+    credential is OAuth and lives in the store, not in `config.yaml`.
 
-    O `sitecustomize.py` original diz-o no comentário da linha 2812: *"Proxy routes through
-    Router.acompletion, not necessarily the module functions above."* O porte patchava só
-    as funções de módulo, e o sintoma só aparecia no proxy — nunca numa chamada à
-    biblioteca.
+    The original `sitecustomize.py` says so in the comment on line 2812: *"Proxy routes
+    through Router.acompletion, not necessarily the module functions above."* The port
+    patched only the module functions, and the symptom showed up only in the proxy — never
+    on a library call.
     """
-    served = await dispatch(model=model, messages=messages, stream=stream, **kwargs)
+    # The provider comes from the deployment, not from the name: this is where the Router
+    # has the information, and it is the only way to tell Anthropic's `claude-sonnet-4-6`
+    # from the namesake served by Antigravity.
+    declared = provider_of_deployment(self, model)
+    served = await dispatch(
+        provider=declared, model=model, messages=messages, stream=stream, **kwargs
+    )
     if served is not None:
         return served
     original = _state.original_router_acompletion
     assert original is not None
-    delegated = await _delegate_kwargs({"model": model, "messages": messages, **kwargs})
+    delegated = await _delegate_kwargs(
+        {"model": model, "messages": messages, **kwargs}, provider=declared
+    )
     delegated.pop("model", None)
     delegated.pop("messages", None)
     return await original(self, model=model, messages=messages, stream=stream, **delegated)
 
 
 def install() -> None:
-    """Aplica o patch. Idempotente.
+    """Applies the patch. Idempotent.
 
-    A guarda não é cosmética: instalar duas vezes encadeava dois wrappers, e o segundo
-    guardava o primeiro como "original" — `uninstall` deixava então o patch meio posto e
-    cada pedido passava duas vezes pelo despacho.
+    The guard is not cosmetic: installing twice chained two wrappers, and the second saved
+    the first as the "original" — `uninstall` then left the patch half applied and every
+    request went through dispatch twice.
     """
     if _state.original_acompletion is not None:
         return
@@ -859,7 +988,7 @@ def install() -> None:
 
 
 def uninstall() -> None:
-    """Repõe os originais em todos os sítios. Sem patch posto, não faz nada."""
+    """Restores the originals everywhere. With no patch applied, does nothing."""
     if _state.original_acompletion is None:
         return
     for module, name in _ASYNC_TARGETS:

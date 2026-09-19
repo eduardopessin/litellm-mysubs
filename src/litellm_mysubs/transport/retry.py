@@ -1,11 +1,12 @@
-"""Política de reabertura de ligação, separada do transporte.
+"""Connection reopening policy, separated from the transport.
 
-No original, a decisão do que fazer com um 401, um 400 ou um 429 estava embutida dentro dos
-laços de ``httpx``, duplicada entre a versão síncrona e a assíncrona — e as duas tinham
-derivado formas diferentes da mesma regra. Aqui a decisão é uma função pura sobre
-``(status, corpo)``, e o transporte limita-se a executá-la.
+In the original, the decision of what to do with a 401, a 400 or a 429 was embedded inside
+the ``httpx`` loops, duplicated between the synchronous and the asynchronous version — and
+the two had drifted into different shapes of the same rule. Here the decision is a pure
+function over ``(status, body)``, and the transport merely executes it.
 
-Isso torna testável o que interessa — *quando* se retenta e porquê — sem abrir ligações.
+That makes the part that matters — *when* a retry happens and why — testable without
+opening connections.
 """
 
 from __future__ import annotations
@@ -16,22 +17,22 @@ from typing import Final
 
 
 class Action(Enum):
-    """O que fazer a seguir."""
+    """What to do next."""
 
     RETURN = "return"
-    """Resposta boa: entregar."""
+    """Good response: deliver it."""
 
     REFRESH_TOKEN = "refresh_token"
-    """Credencial rejeitada: reler e tentar de novo com a nova."""
+    """Credential rejected: re-read it and try again with the new one."""
 
     REMAP_MODEL = "remap_model"
-    """A conta não serve este nome; se for um alias conhecido, reencaminhar."""
+    """The account does not serve this name; if it is a known alias, reroute."""
 
     REDEEM_CREDIT = "redeem_credit"
-    """Quota esgotada e há crédito de reset por usar."""
+    """Quota exhausted and there is unused reset credit."""
 
     FAIL = "fail"
-    """Nada a fazer: propagar o erro do upstream."""
+    """Nothing to do: propagate the upstream error."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,10 +45,10 @@ class Decision:
         return self.action in (Action.REFRESH_TOKEN, Action.REMAP_MODEL, Action.REDEEM_CREDIT)
 
 
-#: Tentativas de abertura. Três chega para renovar o token e remapear o modelo uma vez cada.
+#: Open attempts. Three is enough to refresh the token and remap the model once each.
 MAX_ATTEMPTS: Final = 3
 
-#: Marca da recusa de modelo pela conta ChatGPT.
+#: Marker of the ChatGPT account refusing a model.
 UNSUPPORTED_MARKER: Final = "is not supported when using Codex"
 
 
@@ -62,36 +63,38 @@ def decide_codex(
     can_remap: bool = False,
     can_redeem: bool = False,
 ) -> Decision:
-    """O que fazer com a resposta de abertura do Codex.
+    """What to do with the Codex open response.
 
-    ``can_remap`` e ``can_redeem`` são capacidades do chamador, não do estado global: se
-    não houver alias conhecido nem crédito, a decisão tem de ser falhar — retentar o mesmo
-    pedido daria o mesmo erro três vezes e triplicava a latência antes de o dizer.
+    ``can_remap`` and ``can_redeem`` are capabilities of the caller, not of global state:
+    with no known alias and no credit, the decision has to be to fail — retrying the same
+    request would give the same error three times and triple the latency before saying so.
     """
     if status == 200:
         return Decision(Action.RETURN)
     if status == 401:
-        return Decision(Action.REFRESH_TOKEN, "credencial rejeitada")
+        return Decision(Action.REFRESH_TOKEN, "credential rejected")
     if status == 400 and is_unsupported_model(body):
         if can_remap:
-            return Decision(Action.REMAP_MODEL, "alias conhecido de um modelo servido")
-        # Um nome arbitrário recusado é a resposta correcta: substituí-lo por outro modelo
-        # devolvia 200 com o campo `model` a ecoar o pedido, e a facturação passava a mentir.
-        return Decision(Action.FAIL, "a conta não serve este modelo")
+            return Decision(Action.REMAP_MODEL, "known alias of a served model")
+        # An arbitrary refused name is the correct answer: substituting another model for
+        # it returned 200 with the `model` field echoing the request, and billing started
+        # to lie.
+        return Decision(Action.FAIL, "the account does not serve this model")
     if status == 429 and can_redeem:
-        return Decision(Action.REDEEM_CREDIT, "quota esgotada, crédito de reset disponível")
+        return Decision(Action.REDEEM_CREDIT, "quota exhausted, reset credit available")
     return Decision(Action.FAIL, f"HTTP {status}")
 
 
 def decide_antigravity(status: int) -> Decision:
-    """O que fazer com a resposta de abertura do Antigravity.
+    """What to do with the Antigravity open response.
 
-    O failover é só no *endpoint*: um 404 ou 503 não autoriza responder com outro modelo.
-    Um 404 é "esta conta não serve este modelo" e um 503 é capacidade; em qualquer dos
-    casos tenta-se o host seguinte e, esgotados, propaga-se.
+    Failover is on the *endpoint* only: a 404 or a 503 does not authorise answering with
+    another model. A 404 is "this account does not serve this model" and a 503 is
+    capacity; in either case the next host is tried and, once exhausted, the error
+    propagates.
     """
     if status == 200:
         return Decision(Action.RETURN)
     if status == 401:
-        return Decision(Action.REFRESH_TOKEN, "credencial rejeitada")
+        return Decision(Action.REFRESH_TOKEN, "credential rejected")
     return Decision(Action.FAIL, f"HTTP {status}")

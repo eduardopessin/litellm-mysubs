@@ -8,3 +8,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Session material, not product
+local/
+
+# Lockfile of a tool the CI does not use
+uv.lock

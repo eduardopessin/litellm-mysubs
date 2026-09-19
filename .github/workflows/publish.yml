@@ -1,0 +1,31 @@
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  # The same gates as every other push. A tag is not a reason to publish something
+  # that was never tested: ruff, mypy, pytest, the LiteLLM contract job and the
+  # anchor check all have to pass before anything leaves the runner.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  pypi:
+    needs: [ci]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/litellm-mysubs
+    permissions:
+      # Trusted publishing: the runner mints a short-lived OIDC token for PyPI.
+      # No long-lived API token lives in the repository secrets.
+      id-token: write
+    steps:
+      # The artifact built by the `build` job of the reusable workflow. Rebuilding
+      # here would publish something the gates never saw.
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

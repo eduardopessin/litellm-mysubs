@@ -1,4 +1,4 @@
-"""A sub-app `/mysubs`: o que o utilizador vê e o que os botões fazem."""
+"""The `/mysubs` sub-app: what the user sees and what the buttons do."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ class FakeStore:
 
     def get(self, provider: ProviderId) -> Credential:
         if provider in self.unreadable:
-            raise PermissionError("0644, devia ser 0600")
+            raise PermissionError("0644, should be 0600")
         return self.creds[provider]
 
     def set(self, credential: Credential) -> None:
@@ -54,11 +54,11 @@ class FakeRouter:
 def build(
     store: FakeStore | None = None, router: FakeRouter | None = None
 ) -> tuple[TestClient, MySubsService, FakeRouter]:
-    """Uma sub-app sem guarda, para exercitar o comportamento da página.
+    """A sub-app with no guard, to exercise the page's behaviour.
 
-    A guarda é testada à parte em `TestAuth`: misturá-la aqui obrigaria cada teste de
-    conteúdo a carregar uma identidade, e o que se afirma nesses é o que a página faz, não
-    quem lá chega.
+    The guard is tested separately in `TestAuth`: mixing it in here would force every
+    content test to carry an identity, and what those assert is what the page does, not who
+    gets to it.
     """
     used_router = router or FakeRouter()
     service = MySubsService(store=store or FakeStore(), router_source=lambda: used_router)
@@ -69,16 +69,21 @@ def build(
 
 class TestCards:
     def test_every_provider_shows_even_when_unconnected(self) -> None:
-        """Um provedor por ligar é informação: é o que diz ao utilizador o que pode
-        acrescentar. Esconder os não-ligados fazia a página parecer vazia sem razão."""
+        """An unconnected provider is information: it is what tells the user what they can
+        add. Hiding the unconnected ones made the page look empty for no reason.
+
+        The labels come from `PROVIDER_LABELS`, not repeated here: a literal copy would turn
+        every rename into a test failure that is not a defect.
+        """
+        from litellm_mysubs.ui.service import PROVIDER_LABELS
+
         client, _, _ = build()
         body = client.get("/mysubs/").text
-        assert "Claude Max" in body
-        assert "ChatGPT Plus (Codex)" in body
-        assert "Google Antigravity" in body
+        for label in PROVIDER_LABELS.values():
+            assert label in body, label
 
     def test_an_expired_token_is_shown_as_expired_not_as_connected(self) -> None:
-        """ "Ligado" num token morto manda o utilizador depurar o sítio errado."""
+        """A dead token shown as "connected" sends the user to debug the wrong place."""
         store = FakeStore(
             {
                 "anthropic": Credential(
@@ -88,11 +93,11 @@ class TestCards:
         )
         client, _, _ = build(store)
         body = client.get("/mysubs/").text
-        assert "token expirado" in body
+        assert "token expired" in body
 
     def test_an_unreadable_credential_does_not_take_the_page_down(self) -> None:
-        """O store recusa ficheiros com permissões largas — decisão certa. Aqui traduz-se
-        em "por ligar" com os outros cards ainda visíveis, não num 500."""
+        """The store refuses files with loose permissions — the right call. Here that shows
+        up as "not connected" with the other cards still visible, not as a 500."""
         store = FakeStore({"anthropic": Credential(provider="anthropic", access_token="a")})
         store.unreadable.add("anthropic")
         client, _, _ = build(store)
@@ -111,19 +116,24 @@ class TestConnect:
 
     def test_unknown_provider_is_refused(self) -> None:
         client, _, _ = build()
-        assert client.post("/mysubs/connect/inventado").status_code == 404
+        assert client.post("/mysubs/connect/made-up").status_code == 404
 
     def test_pasting_without_connecting_explains_instead_of_crashing(self) -> None:
-        """O erro tem de dizer o passo em falta: um 500 aqui não ensina nada."""
+        """The error has to name the missing step: a 500 here teaches nothing."""
         client, _, _ = build()
         response = client.post(
             "/mysubs/paste/anthropic", data={"pasted": "abc"}, follow_redirects=False
         )
         assert response.status_code == 303
-        assert "Conectar" in response.headers["location"]
+        assert "Connect" in response.headers["location"]
 
     def test_upstream_error_reaches_the_user(self) -> None:
-        """`invalid_grant: code expirado` diz o que fazer; "falhou" não diz nada."""
+        """`invalid_grant: code expirado` says what to do; "failed" says nothing.
+
+        The upstream description stays in Portuguese on purpose: the assertion is that the
+        provider's own text reaches the user unrewritten, and an English fixture would not
+        tell a pass-through apart from a message of ours.
+        """
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -152,23 +162,24 @@ class TestApply:
                 wire_name="claude-haiku-4-5",
                 suggested_name="claude-haiku-4-5",
                 verified=False,
-                note="rede",
+                note="network",
             ),
         ]
         return client, service, router
 
-    def test_chosen_models_reach_the_router_with_the_wire_prefix(
+    def test_chosen_models_reach_the_router_with_both_prefixes(
         self, ready: tuple[TestClient, MySubsService, FakeRouter]
     ) -> None:
-        """Sem prefixo o nome cai na resolução por wildcard, que materializa deployments
-        fantasma para qualquer nome pedido."""
+        """Without a prefix on the wire the name falls into wildcard resolution, which
+        materialises phantom deployments for any requested name. The public name carries the
+        subscription because `claude-sonnet-4-6` is also served by Antigravity."""
         client, _, router = ready
         client.post(
             "/mysubs/apply/anthropic", data={"chosen": ["claude-opus-5"]}, follow_redirects=False
         )
         assert len(router.model_list) == 1
         entry = router.model_list[0]
-        assert entry["model_name"] == "claude-opus-5"
+        assert entry["model_name"] == "mysubs/claudecode/claude-opus-5"
         assert entry["litellm_params"]["model"] == "anthropic/claude-opus-5"
         assert entry["model_info"]["managed_by"] == "mysubs"
 
@@ -179,12 +190,12 @@ class TestApply:
         client.post(
             "/mysubs/apply/anthropic", data={"chosen": ["claude-opus-5"]}, follow_redirects=False
         )
-        assert [d["model_name"] for d in router.model_list] == ["claude-opus-5"]
+        assert [d["model_name"] for d in router.model_list] == ["mysubs/claudecode/claude-opus-5"]
 
     def test_a_model_the_discovery_never_returned_is_refused(
         self, ready: tuple[TestClient, MySubsService, FakeRouter]
     ) -> None:
-        """Aplicar um nome inventado produziria exactamente os 400 que motivaram o pacote."""
+        """Applying a made-up name would produce exactly the 400s that motivated the package."""
         client, _, router = ready
         response = client.post(
             "/mysubs/apply/anthropic", data={"chosen": ["gpt-4-turbo"]}, follow_redirects=False
@@ -198,7 +209,7 @@ class TestApply:
         response = client.post(
             "/mysubs/apply/anthropic", data={"chosen": ["x"]}, follow_redirects=False
         )
-        assert "descobre" in response.headers["location"].lower()
+        assert "discover" in response.headers["location"].lower()
         assert router.model_list == []
 
 
@@ -207,16 +218,16 @@ class TestState:
         store = FakeStore({"anthropic": Credential(provider="anthropic", access_token="a")})
         client, service, _ = build(store)
         service.discovered["anthropic"] = [
-            DiscoveredModel(wire_name="w", suggested_name="s", verified=False, note="rede em baixo")
+            DiscoveredModel(wire_name="w", suggested_name="s", verified=False, note="network down")
         ]
         payload = client.get("/mysubs/api/state").json()
         connected = [p for p in payload["providers"] if p["connected"]]
         assert [p["provider"] for p in connected] == ["anthropic"]
-        assert payload["discovered"]["anthropic"][0]["note"] == "rede em baixo"
+        assert payload["discovered"]["anthropic"][0]["note"] == "network down"
 
 
 class TestAuth:
-    """A guarda. `/mysubs` liga contas pessoais e altera os modelos servidos."""
+    """The guard. `/mysubs` connects personal accounts and changes the models served."""
 
     def _app(self, guard: object) -> TestClient:
         service = MySubsService(store=FakeStore(), router_source=lambda: None)
@@ -225,34 +236,35 @@ class TestAuth:
         return TestClient(app)
 
     def test_every_route_is_closed_by_default(self) -> None:
-        """O default tem de proteger. Antes desta guarda, `GET /mysubs/api/state` respondia
-        200 a qualquer um que alcançasse o proxy — e com uma sub ligada expunha validade e
-        projecto."""
+        """The default has to protect. Before this guard, `GET /mysubs/api/state` answered
+        200 to anyone who could reach the proxy — and with a subscription connected it
+        exposed the expiry and the project."""
         client = self._app(_DEFAULT_GUARD)
         assert client.get("/mysubs/").status_code == 403
         assert client.get("/mysubs/api/state").status_code == 403
         assert client.post("/mysubs/connect/anthropic").status_code == 403
 
     def test_only_a_full_admin_passes(self) -> None:
-        """O `allowed_route_check_inside_route` do LiteLLM aceita `proxy_admin_viewer`, o
-        que está certo para ler listas e errado aqui: um papel de leitura não deve iniciar
-        um fluxo OAuth nem mexer no Router."""
+        """LiteLLM's `allowed_route_check_inside_route` accepts `proxy_admin_viewer`, which
+        is right for reading lists and wrong here: a read-only role must not start an OAuth
+        flow nor touch the Router."""
         for role in ("proxy_admin_viewer", "internal_user", "team", None):
-            with pytest.raises(Exception, match="administradores"):
+            with pytest.raises(Exception, match="proxy admins only"):
                 require_admin(SimpleNamespace(user_role=role))
 
         admin = SimpleNamespace(user_role="proxy_admin")
         assert require_admin(admin) is admin
 
     def test_an_enum_role_is_read_by_value(self) -> None:
-        """O LiteLLM entrega `LitellmUserRoles`, não uma string; comparar o enum cru
-        recusava um administrador legítimo."""
+        """LiteLLM hands over `LitellmUserRoles`, not a string; comparing the raw enum
+        refused a legitimate administrator."""
         admin = SimpleNamespace(user_role=SimpleNamespace(value="proxy_admin"))
         assert require_admin(admin) is admin
 
     def test_the_opt_out_is_explicit(self) -> None:
-        """Quem corre sem base de dados de chaves não tem `proxy_admin` nenhum. Sem escape,
-        acabaria a montar a sub-app à mão — sem guarda e sem o saber."""
+        """Whoever runs without a key database has no `proxy_admin` at all. With no escape
+        hatch, they would end up mounting the sub-app by hand — unguarded, without knowing
+        it."""
         assert auth_disabled({"MYSUBS_DISABLE_AUTH": "1"}) is True
         assert auth_disabled({"MYSUBS_DISABLE_AUTH": "true"}) is True
         assert auth_disabled({}) is False
@@ -260,8 +272,8 @@ class TestAuth:
 
 
 class TestErrorPages:
-    """Uma recusa tem de ser legível. O acesso negado já funcionava; o 500 é que não
-    ensinava nada a quem o via."""
+    """A refusal has to be readable. Access denied already worked; it was the 500 that
+    taught nothing to whoever saw it."""
 
     def _app(self) -> TestClient:
         service = MySubsService(store=FakeStore(), router_source=lambda: None)
@@ -270,35 +282,35 @@ class TestErrorPages:
         return TestClient(app, raise_server_exceptions=False)
 
     def test_a_refusal_is_not_a_server_error(self) -> None:
-        """Verificado no proxy real: sem este handler a recusa chegava como
+        """Verified on the real proxy: without this handler the refusal arrived as
 
             HTTP 500  RuntimeError: Caught handled exception, but response already started
 
-        porque o `user_api_key_auth` levanta `ProxyException` e uma sub-app montada não
-        herda o handler que a converte.
+        because `user_api_key_auth` raises `ProxyException` and a mounted sub-app does not
+        inherit the handler that converts it.
         """
         response = self._app().get("/mysubs/")
         assert response.status_code in (401, 403)
         assert response.status_code != 500
 
     def test_the_browser_gets_a_page_not_raw_json(self) -> None:
-        """É a UI: quem abre pelo menu tem de perceber o que fazer."""
+        """This is the UI: whoever opens it from the menu has to understand what to do."""
         response = self._app().get("/mysubs/", headers={"accept": "text/html"})
         assert "text/html" in response.headers["content-type"]
-        assert "Sem acesso" in response.text
-        assert "chave de administrador" in response.text
+        assert "No access" in response.text
+        assert "admin key" in response.text
 
     def test_a_json_client_still_gets_json(self) -> None:
-        """Quem automatiza não quer HTML."""
+        """Whoever automates does not want HTML."""
         response = self._app().get("/mysubs/api/state", headers={"accept": "application/json"})
         assert "application/json" in response.headers["content-type"]
         assert "detail" in response.json()
 
     def test_a_proxy_exception_is_converted_too(self) -> None:
-        """`ProxyException` não é uma `HTTPException`: é uma `Exception` simples que o
-        proxy converte num handler da app dele. Registar só o handler das `HTTPException`
-        deixava passar exactamente a excepção que o `user_api_key_auth` levanta — que é a
-        que aparece em produção.
+        """`ProxyException` is not an `HTTPException`: it is a plain `Exception` that the
+        proxy converts in a handler on its own app. Registering only the `HTTPException`
+        handler let through exactly the exception `user_api_key_auth` raises — which is the
+        one that shows up in production.
         """
         from litellm.proxy._types import ProxyException
 
@@ -321,11 +333,11 @@ class TestErrorPages:
             "/mysubs/explode", headers={"accept": "text/html"}
         )
         assert response.status_code == 401
-        assert "Sem acesso" in response.text
+        assert "No access" in response.text
 
 
 class TestSessionCookie:
-    """A sessão da UI tem de servir: é assim que se chega à página pelo menu."""
+    """The UI session has to work: that is how the page is reached from the menu."""
 
     def _token(self, role: str = "proxy_admin", key: str = "sk-master") -> str:
         import jwt
@@ -340,10 +352,10 @@ class TestSessionCookie:
         return SimpleNamespace(cookies=cookies)
 
     def test_a_valid_session_identifies_the_admin(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """O `user_api_key_auth` só lê cabeçalhos — verificado, nem uma referência a
-        cookies nesse módulo. A dashboard contorna-o lendo o cookie por `document.cookie`
-        e construindo o `Authorization` em JavaScript; uma página servida fora da SPA não
-        faz isso, e sem este caminho uma sessão de administrador válida dava 401.
+        """`user_api_key_auth` only reads headers — verified, not one reference to cookies in
+        that module. The dashboard works around it by reading the cookie via `document.cookie`
+        and building the `Authorization` header in JavaScript; a page served outside the SPA
+        does not do that, and without this path a valid administrator session gave 401.
         """
         import litellm.proxy.proxy_server as proxy_server
 
@@ -353,11 +365,11 @@ class TestSessionCookie:
         assert user.user_role == "proxy_admin"
 
     def test_a_forged_cookie_is_not_a_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """O JWT é HS256 assinado com a `master_key`: sem ela, não se forja."""
+        """The JWT is HS256 signed with the `master_key`: without it, it cannot be forged."""
         import litellm.proxy.proxy_server as proxy_server
 
         monkeypatch.setattr(proxy_server, "master_key", "sk-master", raising=False)
-        assert session_user(self._request({"token": self._token(key="outra")})) is None
+        assert session_user(self._request({"token": self._token(key="other")})) is None
         assert session_user(self._request({"token": "abc.def.ghi"})) is None
 
     def test_an_expired_session_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -373,7 +385,7 @@ class TestSessionCookie:
         assert session_user(self._request({"token": stale})) is None
 
     def test_no_cookie_is_not_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Ausência de sessão devolve `None` para o caminho da chave ter a sua vez."""
+        """No session returns `None` so the key path gets its turn."""
         import litellm.proxy.proxy_server as proxy_server
 
         monkeypatch.setattr(proxy_server, "master_key", "sk-master", raising=False)
@@ -382,11 +394,11 @@ class TestSessionCookie:
     def test_a_viewer_session_still_cannot_manage_subscriptions(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Ter sessão não é ter mandato: o papel continua a decidir."""
+        """Having a session is not having a mandate: the role still decides."""
         import litellm.proxy.proxy_server as proxy_server
 
         monkeypatch.setattr(proxy_server, "master_key", "sk-master", raising=False)
         user = session_user(self._request({"token": self._token(role="proxy_admin_viewer")}))
         assert user is not None
-        with pytest.raises(Exception, match="administradores"):
+        with pytest.raises(Exception, match="proxy admins only"):
             require_admin(user)

@@ -1,9 +1,9 @@
-"""Ramos de defesa do wire da Anthropic.
+"""Defensive branches of the Anthropic wire.
 
-Entradas malformadas, limites e caminhos de desistência. Estão separados do contrato
-principal porque respondem a outra pergunta: não "que forma vai no fio", mas "o que
-acontece quando a entrada não é o que se espera". Um pedido chega ao proxy vindo de
-qualquer cliente, e uma excepção aqui é um 500 em vez de um pedido servido.
+Malformed inputs, limits and give-up paths. They are separated from the main contract
+because they answer a different question: not "what shape goes on the wire", but "what
+happens when the input is not what is expected". A request reaches the proxy from any
+client, and an exception here is a 500 instead of a served request.
 """
 
 from __future__ import annotations
@@ -16,9 +16,9 @@ from litellm_mysubs.wire import anthropic as ant
 
 
 class TestMalformedInput:
-    """O proxy recebe pedidos de clientes que não controlamos."""
+    """The proxy receives requests from clients we do not control."""
 
-    @pytest.mark.parametrize("message", [None, "texto", 42, []])
+    @pytest.mark.parametrize("message", [None, "text", 42, []])
     def test_non_dict_message_is_not_markable(self, message: object) -> None:
         assert ant.is_markable(message) is False
 
@@ -26,17 +26,17 @@ class TestMalformedInput:
         assert ant.count_breakpoints([None, "x", 42]) == 0
 
     def test_non_list_tool_calls_has_no_anchor(self) -> None:
-        assert ant.tool_call_anchor({"tool_calls": "nao-e-lista"}) is None
+        assert ant.tool_call_anchor({"tool_calls": "not-a-list"}) is None
 
     def test_non_dict_tool_call_skipped(self) -> None:
         assert ant.tool_call_anchor({"tool_calls": [None, "x"]}) is None
 
     def test_non_function_tool_call_skipped(self) -> None:
-        """convert_to_anthropic_tool_invoke salta o que não é type: function."""
+        """convert_to_anthropic_tool_invoke skips whatever is not type: function."""
         assert ant.tool_call_anchor({"tool_calls": [{"id": "c", "type": "custom"}]}) is None
 
     def test_last_valid_tool_call_wins(self) -> None:
-        """A âncora é a última chamada marcável, porque cobre mais prefixo."""
+        """The anchor is the last markable call, because it covers more prefix."""
         message = {
             "tool_calls": [
                 {"id": "a", "type": "function"},
@@ -47,15 +47,15 @@ class TestMalformedInput:
         assert ant.tool_call_anchor(message) == 2
 
     def test_unknown_role_is_not_markable(self) -> None:
-        assert ant.is_markable({"role": "funcao-estranha", "content": "x"}) is False
+        assert ant.is_markable({"role": "strange-role", "content": "x"}) is False
 
     def test_non_string_content_is_not_markable(self) -> None:
         assert ant.is_markable({"role": "user", "content": {"a": 1}}) is False
 
     def test_non_list_messages_returns_unchanged(self) -> None:
-        """Um cliente pode mandar messages como string; não deve rebentar."""
-        out = ant.build_request({"messages": "nao-e-lista"}, "claude-opus-5")
-        assert out["messages"] == "nao-e-lista"
+        """A client may send messages as a string; it must not blow up."""
+        out = ant.build_request({"messages": "not-a-list"}, "claude-opus-5")
+        assert out["messages"] == "not-a-list"
 
     def test_missing_messages_key(self) -> None:
         out = ant.build_request({}, "claude-opus-5")
@@ -71,19 +71,19 @@ class TestMalformedInput:
                 {
                     "role": "system",
                     "content": [
-                        {"type": "text", "text": "instrução"},
+                        {"type": "text", "text": "instruction"},
                         {"type": "image", "source": {}},
                     ],
                 }
             ]
         )
-        assert client == "instrução"
+        assert client == "instruction"
         assert rest == []
 
 
 class TestMarkBreakpointGivesUp:
-    """Já marcado significa não voltar a marcar: dois marcadores na mesma âncora
-    gastam orçamento sem cobrir mais prefixo."""
+    """Already marked means do not mark again: two markers on the same anchor spend
+    budget without covering more prefix."""
 
     def test_tool_message_already_marked(self) -> None:
         message: dict[str, Any] = {"role": "tool", "tool_call_id": "c", "cache_control": {}}
@@ -107,19 +107,19 @@ class TestMarkBreakpointGivesUp:
         assert ant.mark_breakpoint({"role": "user", "content": {"a": 1}}) is False
 
     def test_string_content_becomes_marked_block(self) -> None:
-        message: dict[str, Any] = {"role": "user", "content": "olá"}
+        message: dict[str, Any] = {"role": "user", "content": "hello"}
         assert ant.mark_breakpoint(message) is True
         assert message["content"] == [
-            {"type": "text", "text": "olá", "cache_control": ant.cache_control()}
+            {"type": "text", "text": "hello", "cache_control": ant.cache_control()}
         ]
 
     def test_skips_blank_and_thinking_blocks(self) -> None:
-        """A âncora recai no primeiro bloco de texto real, de trás para a frente."""
+        """The anchor falls back to the first real text block, scanning backwards."""
         message: dict[str, Any] = {
             "role": "assistant",
             "content": [
                 {"type": "text", "text": "real"},
-                {"type": "thinking", "text": "raciocínio"},
+                {"type": "thinking", "text": "reasoning"},
                 {"type": "text", "text": "   "},
             ],
         }
@@ -132,8 +132,8 @@ class TestMarkBreakpointGivesUp:
 
 
 class TestCacheDeepCopy:
-    """Marcar tem de produzir estruturas novas: mutar o que o cliente mandou faz o
-    marcador aparecer no histórico dele."""
+    """Marking has to produce new structures: mutating what the client sent makes the
+    marker show up in their history."""
 
     def test_tool_calls_are_copied_not_mutated(self) -> None:
         call = {"id": "c1", "type": "function", "function": {"name": "f"}}
@@ -163,8 +163,9 @@ class TestCacheDeepCopy:
         assert ant.count_breakpoints(marked) == 1
 
     def test_empty_marker_does_not_consume_budget(self) -> None:
-        """Um ``cache_control`` vazio não é um marcador: a Anthropic conta os blocos que
-        o trazem preenchido, e descontá-lo gastaria orçamento sem cobrir prefixo."""
+        """An empty ``cache_control`` is not a marker: Anthropic counts the blocks that
+        carry it filled in, and discounting it would spend budget without covering
+        prefix."""
         assert ant.count_breakpoints([{"role": "tool", "cache_control": {}}]) == 0
 
 
@@ -178,10 +179,10 @@ class TestToolChoiceShapes:
         assert ant._forced_tool_choice(choice) is False
 
     def test_openai_function_selection_is_not_forcing(self) -> None:
-        """`{"type": "function"}` selecciona uma ferramenta; não obriga a chamá-la.
+        """`{"type": "function"}` selects a tool; it does not force calling it.
 
-        O wire da Anthropic só conhece `any`/`tool`/`auto`/`none`. Tratar a forma OpenAI
-        como forçada desligava o raciocínio sem razão nenhuma do lado do servidor.
+        The Anthropic wire only knows `any`/`tool`/`auto`/`none`. Treating the OpenAI
+        shape as forcing turned reasoning off for no reason at all on the server side.
         """
         assert ant._forced_tool_choice({"type": "function", "function": {"name": "f"}}) is False
         out = ant.apply_thinking_params(
@@ -193,7 +194,7 @@ class TestToolChoiceShapes:
 
 class TestThinkingEdges:
     def test_explicit_budget_is_capped(self) -> None:
-        """Tecto de 8192 pela janela TPM curta da subscrição."""
+        """Ceiling of 8192 because of the subscription's short TPM window."""
         out = ant.apply_thinking_params(
             {"thinking": {"type": "enabled", "budget_tokens": 99999}}, "claude-haiku-4-5"
         )
@@ -212,7 +213,7 @@ class TestThinkingEdges:
         assert out["temperature"] == 1.0
 
     def test_temperature_without_thinking_drops_reasoning(self) -> None:
-        """Sem thinking activo, uma temperatura custom é do cliente e manda ela."""
+        """Without thinking active, a custom temperature belongs to the client and wins."""
         out = ant.apply_thinking_params({"temperature": 0.3}, "claude-opus-5")
         assert out["temperature"] == 0.3
         assert "thinking" not in out

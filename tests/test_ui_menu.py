@@ -1,7 +1,7 @@
-"""Injecção do item "MySubs" no menu do LiteLLM.
+"""Injection of the "MySubs" item into the LiteLLM menu.
 
-Os testes desta camada existem porque o trabalho real foi feito contra o proxy a correr, e
-três defeitos só apareceram lá. Cada um está fixado abaixo.
+The tests in this layer exist because the real work was done against the running proxy,
+and three defects only showed up there. Each one is pinned below.
 """
 
 from __future__ import annotations
@@ -22,9 +22,9 @@ from litellm_mysubs.ui.menu import (
     install_menu,
 )
 
-#: A forma real do menu, tal como aparece no chunk minificado do LiteLLM 1.101.0. O
-#: `icon:(0,a.jsx)($.FlaskConical,{...e0})` está aqui de propósito: foi o que partiu a
-#: primeira regex.
+#: The real shape of the menu, as it appears in the minified chunk of LiteLLM 1.101.0. The
+#: `icon:(0,a.jsx)($.FlaskConical,{...e0})` is here on purpose: it is what broke the first
+#: regex.
 REAL_MENU = (
     'e2=[{groupLabel:"AI Gateway",items:[{key:"api-keys",page:"api-keys",label:"Virtual Keys"},'
     '{key:"experimental",page:"experimental",label:"Experimental",'
@@ -41,9 +41,9 @@ class TestAnchor:
         assert 'children:[{key:"mysubs"' in patched.chunk
 
     def test_braces_inside_the_icon_do_not_stop_the_match(self) -> None:
-        """A primeira versão usava `[^}]*?` entre a chave e o `children`. Entre eles está
-        `icon:(0,a.jsx)($.FlaskConical,{...e0})`, que tem chavetas — a classe negada parava
-        aí e a injecção falhava em silêncio no bundle real."""
+        """The first version used `[^}]*?` between the key and the `children`. Between them
+        sits `icon:(0,a.jsx)($.FlaskConical,{...e0})`, which has braces — the negated class
+        stopped there and the injection failed silently on the real bundle."""
         assert "{...e0}" in REAL_MENU
         assert inject(REAL_MENU).ok
 
@@ -53,24 +53,24 @@ class TestAnchor:
         assert '{key:"tag-management"' in patched
 
     def test_other_menu_groups_are_untouched(self) -> None:
-        """Injectar no sítio errado moveria entradas de outro grupo."""
+        """Injecting in the wrong place would move entries of another group."""
         patched = inject(REAL_MENU).chunk
         assert '{key:"api-keys",page:"api-keys",label:"Virtual Keys"}' in patched
 
     def test_the_entry_uses_external_url(self) -> None:
-        """`/mysubs` é servida por uma sub-app FastAPI, não por uma rota do Next: sem
-        `external_url` o router da SPA tentava resolvê-la internamente e mostrava o 404
-        dela."""
+        """`/mysubs` is served by a FastAPI sub-app, not by a Next route: without
+        `external_url` the SPA router tried to resolve it internally and showed its own
+        404."""
         assert f'external_url:"{UI_PATH}/"' in MENU_ENTRY
 
     def test_injecting_twice_does_not_duplicate(self) -> None:
         once = inject(REAL_MENU).chunk
-        assert inject(once).chunk == ""  # devolve "já presente" sem mexer
+        assert inject(once).chunk == ""  # returns "already present" without touching it
 
     def test_an_unrecognised_bundle_fails_soft(self) -> None:
-        """Um botão em falta é uma inconveniência; um arranque falhado é uma avaria. A
-        razão tem de nomear a alternativa — o URL directo."""
-        result = inject('e2=[{groupLabel:"outra coisa",items:[]}]')
+        """A missing button is an inconvenience; a failed startup is a breakdown. The
+        reason has to name the alternative — the direct URL."""
+        result = inject('e2=[{groupLabel:"something else",items:[]}]')
         assert result.ok is False
         assert UI_PATH in result.reason
 
@@ -81,15 +81,15 @@ class TestRouteWiring:
         chunk_dir.mkdir(parents=True)
         (chunk_dir / "menu.js").write_text(REAL_MENU, "utf-8")
         app = FastAPI()
-        # Reproduz as três montagens do proxy (`proxy_server.py:2048-2060`).
+        # Reproduces the proxy's three mounts (`proxy_server.py:2048-2060`).
         for prefix in ("/_next", "/litellm-asset-prefix/_next"):
             app.mount(prefix, StaticFiles(directory=str(tmp_path / "_next")), name=prefix)
         app.mount("/ui", StaticFiles(directory=str(tmp_path)), name="ui")
         return app, tmp_path
 
     def test_a_route_added_after_the_mount_never_wins(self, tmp_path: Path) -> None:
-        """O FastAPI resolve por ordem de registo. Foi o primeiro defeito: a rota era
-        acrescentada e o `StaticFiles` continuava a servir o original."""
+        """FastAPI resolves by registration order. This was the first defect: the route was
+        added and `StaticFiles` kept serving the original."""
         app, _ = self._app_with_static(tmp_path)
 
         async def patched() -> Any:
@@ -103,10 +103,10 @@ class TestRouteWiring:
     def test_every_asset_prefix_serves_the_patched_chunk(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        """O segundo defeito, e o mais caro: a UI carrega os chunks por
-        `/litellm-asset-prefix/_next`, não por `/ui/_next`. Patchar um só caminho dava o
-        chunk modificado a quem o pedisse à mão e o original ao browser — 29650 bytes
-        contra 29533, com o mesmo URL aparente.
+        """The second defect, and the most expensive one: the UI loads the chunks through
+        `/litellm-asset-prefix/_next`, not through `/ui/_next`. Patching a single path gave
+        the modified chunk to whoever requested it by hand and the original to the browser
+        — 29650 bytes against 29533, with the same apparent URL.
         """
         app, root = self._app_with_static(tmp_path)
         monkeypatch.setattr("litellm_mysubs.ui.menu.find_ui_root", lambda: root)
@@ -117,9 +117,9 @@ class TestRouteWiring:
             assert '{key:"mysubs"' in body, prefix
 
     def test_the_patched_chunk_is_not_cacheable(self, tmp_path: Path, monkeypatch: Any) -> None:
-        """Terceiro defeito: o browser guarda os chunks por hash de nome, e o nome não muda
-        quando o conteúdo passa a ser o nosso. Sem `no-store`, a página servia o original
-        até alguém limpar a cache à mão."""
+        """Third defect: the browser caches the chunks by name hash, and the name does not
+        change when the content becomes ours. Without `no-store`, the page served the
+        original until somebody cleared the cache by hand."""
         app, root = self._app_with_static(tmp_path)
         monkeypatch.setattr("litellm_mysubs.ui.menu.find_ui_root", lambda: root)
         install_menu(app)
@@ -127,8 +127,9 @@ class TestRouteWiring:
         assert response.headers["cache-control"] == "no-store"
 
     def test_nothing_is_written_to_site_packages(self, tmp_path: Path, monkeypatch: Any) -> None:
-        """Editar o chunk no disco deixaria um `pip install --force-reinstall` a restaurar o
-        original sem aviso, e um ficheiro modificado a confundir quem investigue."""
+        """Editing the chunk on disk would leave a `pip install --force-reinstall`
+        restoring the original without warning, and a modified file confusing whoever
+        investigates."""
         app, root = self._app_with_static(tmp_path)
         chunk = root / "_next" / "static" / "chunks" / "menu.js"
         before = chunk.read_text("utf-8")
@@ -139,15 +140,15 @@ class TestRouteWiring:
 
 class TestRealBundle:
     def test_the_installed_litellm_bundle_is_recognised(self) -> None:
-        """Se esta falhar numa versão nova do LiteLLM, o botão deixou de aparecer — e a
-        página continua a funcionar por URL. É o aviso, não uma avaria."""
+        """If this fails on a new LiteLLM version, the button stopped appearing — and the
+        page keeps working by URL. It is the warning, not a breakdown."""
         root = find_ui_root()
         if root is None:
-            return  # LiteLLM sem UI compilada
+            return  # LiteLLM without a compiled UI
         chunk = find_menu_chunk(root)
-        assert chunk is not None, "o chunk do menu não foi encontrado"
+        assert chunk is not None, "the menu chunk was not found"
         assert inject(chunk.read_text("utf-8")).ok
 
 
-def TestTextOf(app: FastAPI, path: str) -> str:  # noqa: N802 - auxiliar, não é um teste
+def TestTextOf(app: FastAPI, path: str) -> str:  # noqa: N802 - helper, not a test
     return TestClient(app).get(path).text

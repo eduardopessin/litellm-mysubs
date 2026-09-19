@@ -1,14 +1,14 @@
-"""Verifica as âncoras `# omp:` contra o pacote real do OMP.
+"""Check the `# omp:` anchors against the real OMP package.
 
-O wiring é do ``@oh-my-pi/pi-ai``; este pacote é uma porta para Python. Sem verificação, um
-rename do lado deles deixa as âncoras a apontar para nada e ninguém dá por isso até
-alguém tentar seguir uma.
+The wiring comes from ``@oh-my-pi/pi-ai``; this package is a port to Python. Without
+checking, a rename on their side leaves the anchors pointing at nothing and nobody notices
+until someone tries to follow one.
 
-    python tools/check_omp_drift.py            # verifica a versão fixada
-    python tools/check_omp_drift.py --update   # só reporta a versão mais recente
+    python tools/check_omp_drift.py            # check the pinned version
+    python tools/check_omp_drift.py --update   # only report the latest version
 
-Sai com 1 se algum símbolo anotado tiver desaparecido. Uma versão nova no npm é aviso, não
-erro: actualizar é uma decisão, não uma obrigação.
+Exits with 1 if any annotated symbol has disappeared. A new version on npm is a warning,
+not an error: upgrading is a decision, not an obligation.
 """
 
 from __future__ import annotations
@@ -22,22 +22,36 @@ import urllib.request
 from pathlib import Path
 from typing import Final, NamedTuple
 
-#: Versão do OMP contra a qual as âncoras foram escritas.
+#: OMP version the anchors were written against.
 OMP_VERSION = "18.2.6"
 
-#: O wiring está repartido por **três** pacotes: `pi-ai` tem a lógica, `pi-catalog` tem as
-#: constantes de fio (valores de headers, versões de cliente fixadas), e `pi-utils` tem o
-#: que é transversal a todos os provedores — o `USER_AGENT`, entre outros. Uma âncora pode
-#: apontar para qualquer um deles.
+#: The wiring is split across **three** packages: `pi-ai` has the logic, `pi-catalog` has
+#: the wire constants (header values, pinned client versions), and `pi-utils` has what is
+#: shared across every provider — the `USER_AGENT`, among others. An anchor may point at
+#: any of them.
 #:
-#: Cada pacote em falta é uma âncora que não se pode verificar. Foi assim que o
-#: `User-Agent` do Codex passou despercebido e acabou inventado: procurei-o nos dois que
-#: tinha, não o encontrei, e escrevi um por analogia em vez de ir buscar o terceiro.
+#: Every missing package is an anchor that cannot be checked. That is how the Codex
+#: `User-Agent` slipped through and ended up invented: it was looked up in the two
+#: packages at hand, not found, and written by analogy instead of fetching the third.
 PACKAGES: Final = ("@oh-my-pi/pi-ai", "@oh-my-pi/pi-catalog", "@oh-my-pi/pi-utils")
 REGISTRY = "https://registry.npmjs.org"
 
 #: `# omp: providers/anthropic.ts :: symbolA, symbolB`
 ANCHOR_RE = re.compile(r"^\s*#\s*omp:\s*(?P<file>[\w./-]+)\s*::\s*(?P<symbols>[\w.,\s]+?)\s*$")
+
+#: `# omp= providers/codex.ts :: CODEX_USAGE_PATH = "wham/usage"`, or `# omp= CODEX_USAGE_PATH
+#: = "wham/usage"` right after an `# omp:` anchor — there the file is inherited from it.
+#:
+#: The plain anchor proves the **name** exists. It proves nothing about the **value**, and
+#: the value is what goes on the wire: an endpoint path, a pinned client version, a client
+#: id. Upstream can swap `"wham/usage"` for something else without touching the constant's
+#: name, and the check would stay green while the plugin hit a 404.
+#:
+#: Measured: changing `claudeCodeSdkVersion` from `0.112.1` to `0.999.0` in the OMP tarball
+#: left all 177 name anchors green. That is the hole this form closes.
+VALUE_RE = re.compile(
+    r"^\s*#\s*omp=\s*(?:(?P<file>[\w./-]+)\s*::\s*)?(?P<symbol>\w+)\s*=\s*(?P<value>.+?)\s*$"
+)
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 
@@ -47,20 +61,48 @@ class Anchor(NamedTuple):
     line: int
     file: str
     symbol: str
+    #: Literal the symbol must have on the OMP side. Empty: only the name is checked.
+    value: str = ""
 
     def __str__(self) -> str:
-        return f"{self.path.name}:{self.line} -> {self.file} :: {self.symbol}"
+        tail = f" = {self.value}" if self.value else ""
+        return f"{self.path.name}:{self.line} -> {self.file} :: {self.symbol}{tail}"
 
 
 def collect_anchors() -> list[Anchor]:
-    """Uma âncora por símbolo: várias no mesmo comentário contam separadamente."""
+    """One anchor per symbol: several in the same comment count separately.
+
+    Two forms. ``# omp:`` proves the symbol exists; ``# omp=`` also proves the value, for
+    what goes on the wire and breaks silently when it changes. The value form may omit the
+    file and inherit it from the name anchor immediately above - that is the common case,
+    and repeating a long path on both lines only serves to blow the margin.
+    """
     anchors: list[Anchor] = []
     for source in sorted(SRC.rglob("*.py")):
+        previous = ""
         for number, text in enumerate(source.read_text("utf-8").splitlines(), start=1):
+            if value_match := VALUE_RE.match(text):
+                file = value_match.group("file") or previous
+                if not file:
+                    message = f"{source.name}:{number}: `# omp=` with no file and no anchor above"
+                    raise SystemExit(message)
+                anchors.append(
+                    Anchor(
+                        source,
+                        number,
+                        file,
+                        value_match.group("symbol"),
+                        value_match.group("value"),
+                    )
+                )
+                previous = file
+                continue
             match = ANCHOR_RE.match(text)
             if match is None:
+                previous = ""
                 continue
             file = match.group("file")
+            previous = file
             for symbol in match.group("symbols").split(","):
                 if stripped := symbol.strip():
                     anchors.append(Anchor(source, number, file, stripped))
@@ -68,14 +110,14 @@ def collect_anchors() -> list[Anchor]:
 
 
 def fetch_sources(version: str) -> dict[str, str]:
-    """Ficheiros ``src/`` dos tarballs, indexados por caminho relativo.
+    """``src/`` files from the tarballs, indexed by relative path.
 
-    Os três pacotes **partilham caminhos** — `index.ts` existe nos três, `stream.ts` no
-    `pi-ai` e no `pi-utils`, `types.ts` e `utils.ts` no `pi-ai` e no `pi-catalog`. Juntá-los
-    sem cuidado faz o último tapar os anteriores, e uma âncora para um símbolo do ficheiro
-    tapado falha como se ele não existisse. Concatena-se o conteúdo em vez de o substituir:
-    a pergunta que se faz é "este símbolo existe neste caminho", e a resposta certa é sim
-    quando existe em qualquer um dos pacotes.
+    The three packages **share paths** — `index.ts` exists in all three, `stream.ts` in
+    `pi-ai` and `pi-utils`, `types.ts` and `utils.ts` in `pi-ai` and `pi-catalog`. Merging
+    them carelessly makes the last one shadow the earlier ones, and an anchor for a symbol
+    in the shadowed file fails as if it did not exist. The content is concatenated instead
+    of replaced: the question being asked is "does this symbol exist at this path", and the
+    right answer is yes when it exists in any of the packages.
     """
     sources: dict[str, str] = {}
     for package in PACKAGES:
@@ -104,6 +146,22 @@ def _fetch_package_sources(package: str, version: str) -> dict[str, str]:
     return sources
 
 
+def _literal(content: str, symbol: str) -> str:
+    """The literal assigned to ``symbol``, normalized to double quotes.
+
+    Only direct string assignments are recognized — ``const X = "y"``, with or without a
+    type annotation, and with backticks or single quotes instead of double. A composed
+    value (``` `${BASE}/x` ```) is not a literal and returns empty: the value anchor does
+    not serve those, and saying so is better than faking a comparison.
+    """
+    match = re.search(
+        rf"(?:const|let|var)\s+{re.escape(symbol)}\s*(?::[^=]+?)?=\s*"
+        r"""(?P<quote>["'`])(?P<value>[^"'`$\\]*)(?P=quote)""",
+        content,
+    )
+    return f'"{match.group("value")}"' if match else ""
+
+
 def latest_version() -> str:
     with urllib.request.urlopen(f"{REGISTRY}/{PACKAGES[0]}", timeout=60) as response:
         return str(json.load(response)["dist-tags"]["latest"])
@@ -112,38 +170,41 @@ def latest_version() -> str:
 def main() -> int:
     latest = latest_version()
     if "--update" in sys.argv:
-        print(f"fixada: {OMP_VERSION}\nmais recente: {latest}")
+        print(f"pinned: {OMP_VERSION}\nlatest: {latest}")
         return 0
 
     anchors = collect_anchors()
     if not anchors:
-        print("nenhuma âncora `# omp:` encontrada")
+        print("no `# omp:` anchors found")
         return 0
 
     sources = fetch_sources(OMP_VERSION)
     names = " + ".join(p.split("/")[-1] for p in PACKAGES)
-    print(f"{names}@{OMP_VERSION}: {len(sources)} ficheiros, {len(anchors)} âncoras\n")
+    print(f"{names}@{OMP_VERSION}: {len(sources)} files, {len(anchors)} anchors\n")
 
     broken: list[tuple[Anchor, str]] = []
     for anchor in anchors:
         content = sources.get(anchor.file)
         if content is None:
-            broken.append((anchor, "ficheiro inexistente"))
+            broken.append((anchor, "file does not exist"))
         elif anchor.symbol not in content:
-            broken.append((anchor, "símbolo ausente"))
+            broken.append((anchor, "symbol missing"))
+        elif anchor.value and (found := _literal(content, anchor.symbol)) != anchor.value:
+            actual = found or "(not a literal assignment)"
+            broken.append((anchor, f"value changed: upstream has {actual}"))
         else:
             print(f"  ok    {anchor}")
 
     for anchor, reason in broken:
-        print(f"  FALHA {anchor}  ({reason})")
+        print(f"  FAIL  {anchor}  ({reason})")
 
     if latest != OMP_VERSION:
-        print(f"\naviso: {PACKAGES[0]}@{latest} disponível (fixada: {OMP_VERSION})")
+        print(f"\nwarning: {PACKAGES[0]}@{latest} available (pinned: {OMP_VERSION})")
 
     if broken:
-        print(f"\n{len(broken)} âncora(s) sem correspondência")
+        print(f"\n{len(broken)} anchor(s) without a match")
         return 1
-    print(f"\n{len(anchors)} âncoras verificadas")
+    print(f"\n{len(anchors)} anchors verified")
     return 0
 
 

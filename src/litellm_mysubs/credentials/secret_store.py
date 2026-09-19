@@ -1,13 +1,13 @@
-"""Credenciais no gestor de segredos que o LiteLLM já tem configurado.
+"""Credentials in the secret manager LiteLLM already has configured.
 
-Quem corre o LiteLLM a sério configura `general_settings.key_management_system` — Vault,
-AWS Secrets Manager, Azure Key Vault, GCP. Escrever os tokens das subscrições noutro sítio
-seria ignorar a decisão que o operador já tomou, e deixar segredos em disco num sítio que a
-política dele não cobre.
+Anyone running LiteLLM seriously configures `general_settings.key_management_system` —
+Vault, AWS Secrets Manager, Azure Key Vault, GCP. Writing the subscription tokens somewhere
+else would ignore the decision the operator already made, and leave secrets on disk in a
+place their policy does not cover.
 
-O cliente vive em `litellm.secret_manager_client`, preenchido no arranque do proxy. Não é
-capturado na construção: o store é criado quando a UI monta, e nessa altura o proxy ainda
-não leu a configuração. Pergunta-se quando é preciso.
+The client lives in `litellm.secret_manager_client`, filled in at proxy startup. It is not
+captured at construction: the store is created when the UI mounts, and at that point the
+proxy has not yet read the configuration. It is asked for when needed.
 """
 
 from __future__ import annotations
@@ -26,13 +26,13 @@ from .store import (
     to_payload,
 )
 
-#: Prefixo dos segredos. Um nome previsível é o que permite ao operador escrever a política
-#: de acesso — `litellm-mysubs-*` num Vault, uma tag no AWS — sem ter de adivinhar.
+#: Secret name prefix. A predictable name is what lets the operator write the access policy
+#: — `litellm-mysubs-*` in a Vault, a tag in AWS — without having to guess.
 SECRET_PREFIX: Final = "litellm-mysubs"
 
-#: Descrição gravada com o segredo onde o gestor a suporta. Um segredo anónimo num cofre
-#: partilhado é um segredo que ninguém se atreve a apagar.
-SECRET_DESCRIPTION: Final = "Credencial OAuth de subscrição, gerida pelo litellm-mysubs"
+#: Description stored with the secret where the manager supports it. An anonymous secret in
+#: a shared vault is a secret nobody dares delete.
+SECRET_DESCRIPTION: Final = "Subscription OAuth credential, managed by litellm-mysubs"
 
 
 def secret_name(provider: ProviderId) -> str:
@@ -40,63 +40,63 @@ def secret_name(provider: ProviderId) -> str:
 
 
 class SecretManagerUnavailableError(RuntimeError):
-    """Não há gestor de segredos configurado no LiteLLM."""
+    """There is no secret manager configured in LiteLLM."""
 
 
 def active_client() -> Any | None:
-    """O gestor configurado, ou ``None``.
+    """The configured manager, or ``None``.
 
-    Lido no momento — `litellm.secret_manager_client` só é preenchido quando o proxy
-    processa `key_management_system`, depois de este módulo ser importado.
+    Read on the spot — `litellm.secret_manager_client` is only filled in when the proxy
+    processes `key_management_system`, after this module has been imported.
     """
     try:
         import litellm
-    except ImportError:  # pragma: no cover - o pacote é dependência do proxy
+    except ImportError:  # pragma: no cover - the package is a dependency of the proxy
         return None
     return getattr(litellm, "secret_manager_client", None)
 
 
 def is_available() -> bool:
-    """Se há onde guardar. É o que decide qual store a UI usa."""
+    """Whether there is somewhere to store. This is what decides which store the UI uses."""
     return active_client() is not None
 
 
 class SecretManagerCredentialStore(CredentialStore):
-    """Credenciais no cofre do LiteLLM.
+    """Credentials in the LiteLLM vault.
 
-    É dono do refresh: um cofre é a fonte de verdade partilhada, e o ponto de serialização
-    que a regra do dono único exige. Dois proxies contra o mesmo cofre continuam a precisar
-    de que só um renove — isso é configuração, não algo que este store possa impor.
+    It owns the refresh: a vault is the shared source of truth, and the serialization point
+    the single-owner rule demands. Two proxies against the same vault still need only one of
+    them to renew — that is configuration, not something this store can enforce.
     """
 
     owns_refresh = True
 
     def __init__(self, *, client: Any | None = None) -> None:
-        #: Injectável para teste; `None` significa "pergunta ao LiteLLM quando precisares".
+        #: Injectable for tests; `None` means "ask LiteLLM when you need it".
         self._client = client
         self._cache: dict[ProviderId, Credential] = {}
         self._loaded = False
         self._lock = threading.Lock()
 
-    # -- acesso ao cliente -----------------------------------------------------
+    # -- client access ---------------------------------------------------------
 
     def _require_client(self) -> Any:
         client = self._client if self._client is not None else active_client()
         if client is None:
             raise SecretManagerUnavailableError(
-                "não há `key_management_system` configurado no LiteLLM: "
-                "define-o em general_settings ou usa o store de ficheiro"
+                "no `key_management_system` configured in LiteLLM: "
+                "set it in general_settings or use the file store"
             )
         return client
 
-    # -- leitura ---------------------------------------------------------------
+    # -- reading ---------------------------------------------------------------
 
     def reload(self) -> bool:
-        """Relê o cofre. Devolve ``True`` se algo mudou.
+        """Re-reads the vault. Returns ``True`` if anything changed.
 
-        Um segredo ilegível **não** apaga o que estava em cache: uma falha de rede contra o
-        cofre não é prova de que a credencial desapareceu, e tratá-la como tal desligaria
-        todas as subscrições a meio de um incidente de rede.
+        An unreadable secret does **not** clear what was cached: a network failure against
+        the vault is no proof that the credential disappeared, and treating it as such would
+        disconnect every subscription in the middle of a network incident.
         """
         client = self._require_client()
         with self._lock:
@@ -104,8 +104,8 @@ class SecretManagerCredentialStore(CredentialStore):
             for provider in PROVIDER_IDS:
                 raw = self._read_one(client, provider)
                 if raw is None:
-                    # Distingue-se "o cofre disse que não existe" de "não consegui
-                    # perguntar": só o primeiro remove.
+                    # "The vault said it does not exist" is distinguished from "I could not
+                    # ask": only the former removes.
                     continue
                 credential = from_payload(provider, raw)
                 if credential is not None:
@@ -119,9 +119,9 @@ class SecretManagerCredentialStore(CredentialStore):
         try:
             value = client.sync_read_secret(secret_name(provider))
         except Exception:
-            # Ausente e inalcançável são indistinguíveis na interface do LiteLLM
-            # (`sync_read_secret` devolve `None` para um e levanta para o outro, mas nem
-            # todos os backends respeitam isso). Conservador: mantém-se o que havia.
+            # Absent and unreachable are indistinguishable in LiteLLM's interface
+            # (`sync_read_secret` returns `None` for one and raises for the other, but not
+            # every backend honours that). Conservative: keep what was there.
             return self._cached_payload(provider)
         if not value:
             return None
@@ -140,16 +140,16 @@ class SecretManagerCredentialStore(CredentialStore):
             self.reload()
         return self._cache.get(provider)
 
-    # -- escrita ---------------------------------------------------------------
+    # -- writing ---------------------------------------------------------------
 
     def set(self, provider: ProviderId, credential: Credential) -> None:
-        """Grava no cofre.
+        """Writes to the vault.
 
-        A interface do LiteLLM só tem escrita assíncrona — `sync_write_secret` não existe no
-        `BaseSecretManager`. Corre-se o *coroutine* aqui em vez de tornar `CredentialStore`
-        async: o contrato é partilhado com os stores de ficheiro e de ambiente, que são
-        síncronos por natureza, e um `async def set` obrigaria todos os chamadores a mudar
-        por causa de uma implementação.
+        LiteLLM's interface only has an asynchronous write — `sync_write_secret` does not
+        exist on `BaseSecretManager`. The *coroutine* is run here instead of making
+        `CredentialStore` async: the contract is shared with the file and environment
+        stores, which are synchronous by nature, and an `async def set` would force every
+        caller to change because of one implementation.
         """
         client = self._require_client()
         _run(
@@ -170,12 +170,12 @@ class SecretManagerCredentialStore(CredentialStore):
 
 
 def _run(coro: Any) -> Any:
-    """Corre um *coroutine* a partir de código síncrono.
+    """Runs a *coroutine* from synchronous code.
 
-    Dentro de um loop a correr — que é o caso na UI, servida por FastAPI — `asyncio.run`
-    levanta. Usa-se então uma thread com loop próprio: bloqueia o handler o tempo da
-    escrita, que é o comportamento certo aqui. Guardar uma credencial e responder antes de
-    ela estar no cofre mostraria "ligado" a quem, depois de um reinício, não estaria.
+    Inside a running loop — which is the case in the UI, served by FastAPI — `asyncio.run`
+    raises. So a thread with its own loop is used: it blocks the handler for the duration of
+    the write, which is the right behaviour here. Saving a credential and replying before it
+    is in the vault would show "connected" to someone who, after a restart, would not be.
     """
     try:
         asyncio.get_running_loop()

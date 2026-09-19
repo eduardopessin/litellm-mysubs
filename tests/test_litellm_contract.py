@@ -1,15 +1,15 @@
-"""Símbolos do LiteLLM de que o plugin depende.
+"""LiteLLM symbols the plugin depends on.
 
-O plugin corre dentro da imagem de outra pessoa e toca em internals que não fazem parte
-de nenhuma API pública. Quando o LiteLLM renomeia ou move um destes símbolos, o plugin
-deixa de aplicar o patch — e, sem este ficheiro, isso só se descobre em produção, com
-pedidos a ir para o upstream errado.
+The plugin runs inside somebody else's image and touches internals that are not part of
+any public API. When LiteLLM renames or moves one of these symbols, the plugin stops
+applying the patch — and, without this file, that is only discovered in production, with
+requests going to the wrong upstream.
 
-Cada asserção aqui responde a "o que é que parte se isto mudar".
+Every assertion here answers "what breaks if this changes".
 
-``pytest.importorskip`` mantém o ficheiro utilizável no ambiente de desenvolvimento, onde
-o LiteLLM não é dependência obrigatória. No CI, o job ``litellm-contract`` instala-o
-explicitamente, por isso lá o skip não acontece.
+``pytest.importorskip`` keeps the file usable in the development environment, where
+LiteLLM is not a mandatory dependency. In CI, the ``litellm-contract`` job installs it
+explicitly, so the skip does not happen there.
 """
 
 from __future__ import annotations
@@ -18,11 +18,11 @@ import inspect
 
 import pytest
 
-litellm = pytest.importorskip("litellm", reason="litellm não instalado neste ambiente")
+litellm = pytest.importorskip("litellm", reason="litellm not installed in this environment")
 
 
 class TestRouterSurface:
-    """O registry injecta deployments por aqui."""
+    """The registry injects deployments through here."""
 
     def test_router_has_set_model_list(self) -> None:
         assert callable(getattr(litellm.Router, "set_model_list", None))
@@ -32,11 +32,11 @@ class TestRouterSurface:
         assert isinstance(router.model_list, list)
 
     def test_router_acompletion_is_async(self) -> None:
-        """A guarda de nomes embrulha este método; se deixar de ser async, parte."""
+        """The name guard wraps this method; if it stops being async, it breaks."""
         assert inspect.iscoroutinefunction(litellm.Router.acompletion)
 
     def test_router_acompletion_signature(self) -> None:
-        """Embrulhamos com (self, model, messages, stream=False, **kwargs)."""
+        """We wrap it with (self, model, messages, stream=False, **kwargs)."""
         params = inspect.signature(litellm.Router.acompletion).parameters
         assert {"model", "messages"} <= set(params)
 
@@ -47,14 +47,14 @@ class TestModuleSurface:
         assert inspect.iscoroutinefunction(litellm.main.acompletion)
 
     def test_route_request_module_exists(self) -> None:
-        """A rota /v1/responses só é apanhada neste boundary."""
+        """The /v1/responses route is only caught at this boundary."""
         from litellm.proxy import route_llm_request
 
         assert inspect.iscoroutinefunction(route_llm_request.route_request)
 
 
 class TestOfficialExtensionPoints:
-    """Superfícies públicas — preferíveis ao monkey-patch onde cheguem."""
+    """Public surfaces — preferable to monkey-patching wherever they reach."""
 
     def test_custom_provider_map_is_supported(self) -> None:
         from litellm.utils import custom_llm_setup
@@ -69,5 +69,5 @@ class TestOfficialExtensionPoints:
             assert hasattr(CustomLLM, method), method
 
     def test_exceptions_used_by_the_guard(self) -> None:
-        """A guarda levanta NotFoundError para um nome já recusado pelo upstream."""
+        """The guard raises NotFoundError for a name the upstream has already refused."""
         assert issubclass(litellm.NotFoundError, Exception)

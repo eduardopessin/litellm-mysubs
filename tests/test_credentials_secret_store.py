@@ -1,4 +1,4 @@
-"""Credenciais no gestor de segredos do LiteLLM."""
+"""Credentials in the LiteLLM secret manager."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from litellm_mysubs.credentials.store import Credential
 
 
 class FakeVault:
-    """Um cofre em memória com a interface do `BaseSecretManager`."""
+    """An in-memory vault with the `BaseSecretManager` interface."""
 
     def __init__(self, initial: dict[str, str] | None = None) -> None:
         self.data = dict(initial or {})
@@ -26,7 +26,7 @@ class FakeVault:
     def sync_read_secret(self, secret_name: str, **_: Any) -> str | None:
         self.reads += 1
         if self.unreachable:
-            raise ConnectionError("cofre inalcançável")
+            raise ConnectionError("vault unreachable")
         return self.data.get(secret_name)
 
     async def async_write_secret(
@@ -68,8 +68,8 @@ class TestRoundtrip:
         assert store.get("anthropic") == credential
 
     def test_the_secret_name_is_predictable(self) -> None:
-        """Um nome estável é o que permite ao operador escrever a política de acesso sem
-        adivinhar."""
+        """A stable name is what lets the operator write the access policy without
+        guessing."""
         assert secret_name("anthropic") == "litellm-mysubs-anthropic"
 
     def test_deleting_removes_it_from_the_vault(self) -> None:
@@ -83,10 +83,11 @@ class TestRoundtrip:
 
 class TestResilience:
     def test_an_unreachable_vault_does_not_wipe_what_was_known(self) -> None:
-        """Uma falha de rede contra o cofre não é prova de que a credencial desapareceu.
+        """A network failure against the vault is no proof that the credential is gone.
 
-        Tratá-la como tal desligaria todas as subscrições a meio de um incidente de rede —
-        exactamente quando o operador menos quer descobrir que perdeu as credenciais.
+        Treating it as such would disconnect every subscription in the middle of a network
+        incident — exactly when the operator least wants to find out the credentials are
+        lost.
         """
         vault = FakeVault(
             {secret_name("anthropic"): stored(Credential(provider="anthropic", access_token="AT"))}
@@ -99,7 +100,7 @@ class TestResilience:
         assert store.get("anthropic") is not None
 
     def test_a_secret_the_vault_says_is_gone_is_dropped(self) -> None:
-        """Ausência confirmada é diferente de falha: esta remove."""
+        """A confirmed absence is different from a failure: this one removes."""
         vault = FakeVault(
             {secret_name("anthropic"): stored(Credential(provider="anthropic", access_token="AT"))}
         )
@@ -111,7 +112,7 @@ class TestResilience:
         assert store.get("anthropic") is None
 
     def test_corrupt_json_is_not_a_credential(self) -> None:
-        vault = FakeVault({secret_name("anthropic"): "isto não é json"})
+        vault = FakeVault({secret_name("anthropic"): "this is not json"})
         store = SecretManagerCredentialStore(client=vault)
         assert store.get("anthropic") is None
 
@@ -129,22 +130,22 @@ class TestResilience:
 
 class TestAvailability:
     def test_without_a_configured_manager_it_says_so(self) -> None:
-        """A mensagem tem de nomear a configuração em falta: quem a vê precisa de saber o
-        que escrever no `config.yaml`."""
+        """The message has to name the missing configuration: whoever sees it needs to know
+        what to write in `config.yaml`."""
         store = SecretManagerCredentialStore(client=None)
         with pytest.raises(SecretManagerUnavailableError, match="key_management_system"):
             store.reload()
 
     def test_it_owns_the_refresh(self) -> None:
-        """Um cofre é o ponto de serialização que a regra do dono único exige."""
+        """A vault is the serialization point that the single-owner rule requires."""
         assert SecretManagerCredentialStore(client=FakeVault()).owns_refresh is True
 
 
 class TestInsideAnEventLoop:
     @pytest.mark.asyncio
     async def test_writing_works_while_a_loop_is_running(self) -> None:
-        """A UI corre dentro do loop do FastAPI e a escrita do LiteLLM é async: um
-        `asyncio.run` directo levantaria `RuntimeError` no primeiro Conectar.
+        """The UI runs inside the FastAPI loop and the LiteLLM write is async: a direct
+        `asyncio.run` would raise `RuntimeError` on the first Connect.
         """
         vault = FakeVault()
         store = SecretManagerCredentialStore(client=vault)

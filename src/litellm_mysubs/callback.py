@@ -1,20 +1,20 @@
-"""O `CustomLogger` que o `config.yaml` carrega.
+"""The `CustomLogger` that `config.yaml` loads.
 
     litellm_settings:
       callbacks: ["litellm_mysubs.MySubs"]
 
-É o único ponto de entrada do pacote numa instalação normal. Tudo o resto — o patch, a UI,
-o registry — é accionado a partir daqui.
+It is the package's only entry point in a normal installation. Everything else — the patch,
+the UI, the registry — is triggered from here.
 
-## A regra que não se quebra
+## The rule that is not broken
 
-**Este callback nunca altera o pedido.** O `async_pre_call_hook` do LiteLLM pode devolver um
-`data` modificado, e é assim que guardrails e injectores de prompt funcionam. Aqui devolve-se
-sempre `None`: o hook serve só de gatilho de arranque, e um plugin cujo objectivo é
-*acrescentar* modelos não tem negócio nenhum a mexer nos pedidos dos que já existiam.
+**This callback never alters the request.** LiteLLM's `async_pre_call_hook` may return a
+modified `data`, and that is how guardrails and prompt injectors work. Here `None` is always
+returned: the hook serves only as a startup trigger, and a plugin whose purpose is to *add*
+models has no business touching the requests of the ones that were already there.
 
-Pela mesma razão não se implementa `async_filter_deployments`: filtrar deployments é mexer
-no roteamento de modelos que não são nossos.
+For the same reason `async_filter_deployments` is not implemented: filtering deployments is
+meddling with the routing of models that are not ours.
 """
 
 from __future__ import annotations
@@ -27,15 +27,15 @@ from .credentials.store import ProviderId
 
 
 def _base() -> type:
-    """A classe base: `CustomLogger` se o LiteLLM estiver presente, `object` se não.
+    """The base class: `CustomLogger` if LiteLLM is present, `object` if not.
 
-    O proxy **exige** `isinstance(loaded, CustomLogger)` — medido: um objecto com os hooks
-    certos mas sem a herança faz `load_config` levantar e o arranque falha por completo. Não
-    é opcional.
+    The proxy **requires** `isinstance(loaded, CustomLogger)` — measured: an object with the
+    right hooks but without the inheritance makes `load_config` raise and startup fails
+    outright. It is not optional.
 
-    A resolução é tardia para `litellm_mysubs` continuar importável sem o LiteLLM: o
-    `mysubs-setup` corre antes de haver proxy configurado, e os testes desta camada não
-    devem arrastar o pacote inteiro.
+    Resolution is late so that `litellm_mysubs` stays importable without LiteLLM:
+    `mysubs-setup` runs before there is a configured proxy, and this layer's tests must not
+    drag in the whole package.
     """
     try:
         from litellm.integrations.custom_logger import CustomLogger
@@ -46,21 +46,45 @@ def _base() -> type:
 
 
 class MySubs(_base()):  # type: ignore[misc]
-    """Liga as subscrições ao proxy."""
+    """Connects the subscriptions to the proxy."""
 
     def __init__(self, store: Any = None) -> None:
         self._bootstrap = Bootstrap()
         self._store = store
+        # Mount here, not on the first request. The proxy instantiates the `config.yaml`
+        # `callbacks` **inside** `proxy_startup_event`, before the `yield` that opens the
+        # server to traffic — measured: by the end of the lifespan the callback already
+        # exists and `llm_router` is already ready. Mounting on `async_pre_call_hook` left
+        # `/mysubs` answering 404 until someone made an inference request, and a 404
+        # teaches nothing to whoever restarted the proxy and opened the page first.
+        #
+        # The UI only. The patch still depends on a connected credential, and that decision
+        # belongs to `setup`: mounting a page adds a prefix, patching means entering the
+        # path of every request in the installation.
+        with contextlib.suppress(Exception):
+            self._mount_ui()
 
-    # -- estado ----------------------------------------------------------------
+    def _mount_ui(self) -> None:
+        """Mounts `/mysubs` if the proxy already has an app. Silent if it does not.
+
+        With no app — imported by a test, or by `mysubs-setup` — there is nowhere to mount,
+        and that is not an error: `setup` tries again once there is one.
+        """
+        if disabled():
+            return
+        app = _proxy_app()
+        if app is not None:
+            self._bootstrap.mount(app, self.store)
+
+    # -- state ---------------------------------------------------------------------
 
     @property
     def store(self) -> Any:
-        """O store de credenciais, resolvido à primeira utilização.
+        """The credential store, resolved on first use.
 
-        Tardio porque a escolha depende de `litellm.secret_manager_client`, que o proxy só
-        preenche depois de processar `key_management_system` — e este objecto é construído
-        antes disso.
+        Late because the choice depends on `litellm.secret_manager_client`, which the proxy
+        only fills in after processing `key_management_system` — and this object is built
+        before that.
         """
         if self._store is None:
             from .ui.install import default_store
@@ -70,7 +94,7 @@ class MySubs(_base()):  # type: ignore[misc]
 
     @property
     def status(self) -> dict[str, Any]:
-        """Para diagnóstico: `mysubs-setup --estado` mostra isto."""
+        """For diagnostics: `mysubs-setup --status` shows this."""
         return {
             "disabled": disabled(),
             "patched": self._bootstrap.patched,
@@ -79,12 +103,12 @@ class MySubs(_base()):  # type: ignore[misc]
             "error": self._bootstrap.error,
         }
 
-    # -- arranque --------------------------------------------------------------
+    # -- startup -------------------------------------------------------------------
 
     def setup(self, app: Any = None) -> dict[str, Any]:
-        """Monta a UI e aplica o patch se houver subscrição ligada.
+        """Mounts the UI and applies the patch if a subscription is connected.
 
-        Chamado pelos hooks e pelo `mysubs-setup`. Idempotente.
+        Called by the hooks and by `mysubs-setup`. Idempotent.
         """
         if disabled():
             return self.status
@@ -94,7 +118,7 @@ class MySubs(_base()):  # type: ignore[misc]
         self._bootstrap.patch(self.store)
         return self.status
 
-    # -- hooks do LiteLLM ------------------------------------------------------
+    # -- LiteLLM hooks -------------------------------------------------------------
 
     async def async_pre_call_hook(
         self,
@@ -103,12 +127,12 @@ class MySubs(_base()):  # type: ignore[misc]
         data: dict[str, Any] | None = None,
         call_type: str = "",
     ) -> None:
-        """Gatilho de arranque. **Devolve sempre `None`.**
+        """Startup trigger. **Always returns `None`.**
 
-        `None` significa "não modifiquei nada" e é o que garante que o pedido segue
-        exactamente como chegou. Devolver `data` aqui — mesmo intacto — poria este plugin no
-        caminho de escrita de todos os pedidos da instalação, incluindo os dos modelos que
-        já lá estavam.
+        `None` means "I modified nothing" and is what guarantees the request goes on exactly
+        as it arrived. Returning `data` here — even untouched — would put this plugin on the
+        write path of every request in the installation, including those of the models that
+        were already there.
         """
         self.setup()
         return None
@@ -119,10 +143,11 @@ class MySubs(_base()):  # type: ignore[misc]
         user_api_key_dict: Any = None,
         response: Any = None,
     ) -> None:
-        """Absorve o uso que vier nos cabeçalhos da resposta.
+        """Absorbs whatever usage comes in the response headers.
 
-        É como os cards sabem a quota: uma subscrição não tem endpoint de uso, o estado só
-        viaja nas respostas. Um erro aqui não pode afectar a resposta que o cliente recebe.
+        It is how the cards know the quota: a subscription has no usage endpoint, the state
+        only travels on the responses. An error here must not affect the response the client
+        receives.
         """
         with contextlib.suppress(Exception):
             self._observe(data, response)

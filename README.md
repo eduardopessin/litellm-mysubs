@@ -1,123 +1,195 @@
 # litellm-mysubs
 
-Liga as tuas subscrições ao [LiteLLM](https://github.com/BerriAI/litellm) e serve-as como
-modelos: **Claude Max**, **ChatGPT Plus (Codex)** e **Google Antigravity**.
+Serve your Claude Max, ChatGPT Plus (Codex) and Google Antigravity subscriptions as ordinary
+OpenAI-compatible models through [LiteLLM](https://github.com/BerriAI/litellm).
 
-> **Estado: alpha.** Fundações e bridges de wire protocol estão montadas e testadas.
-> Descoberta de modelos, OAuth e UI estão em construção — ver [ROADMAP](#roadmap).
+[![PyPI](https://img.shields.io/pypi/v/litellm-mysubs.svg)](https://pypi.org/project/litellm-mysubs/)
+[![Python](https://img.shields.io/pypi/pyversions/litellm-mysubs.svg)](https://pypi.org/project/litellm-mysubs/)
+[![CI](https://github.com/eduardopessin/litellm-mysubs/actions/workflows/ci.yml/badge.svg)](https://github.com/eduardopessin/litellm-mysubs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Porquê
+## The problem
 
-Uma subscrição de IA não é uma API key. Os tokens são OAuth de cliente first-party, o
-conjunto de modelos servido não é o da API pública, e cada provedor fala um protocolo
-próprio (Responses API, Cloud Code, Messages). Este pacote trata dessas diferenças para
-que um cliente qualquer de OpenAI as veja como modelos normais do LiteLLM.
+A subscription is not an API key, and the difference is not cosmetic:
 
-## Instalação
+- **The tokens are first-party OAuth.** They come from the provider's own client flow, they
+  rotate, and they expire — there is no static string to paste into `model_list`.
+- **The model set is different.** What a subscription serves is not the public API catalog.
+  `claude-sonnet-4-20250514` exists on the Anthropic API and returns 404 on a Max account.
+  Neither Anthropic nor Codex expose a catalog endpoint for subscription tokens.
+- **Each provider speaks its own protocol.** Codex speaks the Responses API, Antigravity
+  speaks Cloud Code, Anthropic speaks Messages. None of them is the chat-completions shape
+  your client sends.
+
+This package absorbs those three differences so any OpenAI client sees plain LiteLLM models.
+
+## Quickstart
 
 ```bash
-pip install litellm-mysubs
-mysubs-setup
+pip install litellm-mysubs && mysubs-setup
 ```
 
-O `mysubs-setup` encontra o LiteLLM do ambiente e o `config.yaml` em uso, e acrescenta uma
-linha:
+1. `mysubs-setup` locates the LiteLLM in your environment and the `config.yaml` it loads,
+   then appends one line to it.
+2. Restart the proxy.
+3. Open the LiteLLM UI as an admin and go to **Experimental → MySubs** (or go straight to
+   `<proxy-url>/mysubs`).
+4. Press **Connect** on a provider card and follow the login.
+
+The single line `mysubs-setup` adds:
 
 ```yaml
 litellm_settings:
   callbacks: ["litellm_mysubs.proxy_handler_instance"]
 ```
 
-Não toca em `model_list`, `router_settings` nem `general_settings` — o roteamento que já
-existe não é negócio do instalador. Deixa uma cópia do original em `config.yaml.mysubs-bak`
-e recusa-se a escrever um ficheiro que já não carregue.
+It does not touch `model_list`, `router_settings` or `general_settings` — routing you
+already configured is not the installer's business. It leaves the original at
+`config.yaml.mysubs-bak` and refuses to write a file that would no longer load.
 
-Reinicia o proxy e abre `<url>/mysubs`. A página exige uma chave de administrador
-(`proxy_admin`).
+![The MySubs page, with the three provider cards and their quota windows](docs/mysubs.png)
 
-### Enquanto não houver subscrição ligada, o pacote é inerte
+## How connecting works
 
-O monkey-patch só se aplica quando há pelo menos uma credencial. Instalado e sem
-subscrições, é indistinguível de não estar instalado.
+1. **Press Connect.** The card opens the provider's login page in your browser.
+2. **Authenticate** with the provider as usual.
+3. **Return the result.** Two paths, both ending in the same place — see below.
+4. **Discovery runs.** The page probes each candidate model against your account and shows
+   what actually answered. Nothing is listed as available unless the upstream replied.
+5. **Pick and apply.** The selected models are injected into the LiteLLM Router under the
+   `mysubs/<subscription>/` prefix and are immediately callable by any client.
 
-### Desligar
+Tokens are then refreshed in the background, with a `flock` held across processes so that
+multiple proxy workers never race on the same rotating refresh token.
+
+### Why there are two return paths
+
+These OAuth clients register `http://localhost:54545/callback` (and `:1455`, `:51121`) as
+their redirect. `localhost` resolves in the **browser**, so the callback port has to be open
+on the machine you are browsing from — and the proxy usually runs somewhere else.
+
+**Local command (transparent).** The page issues a pairing code; you run the command it
+shows on the machine with the browser:
+
+```bash
+pip install litellm-mysubs
+mysubs-login anthropic --url https://your-proxy --code XXXX-XXXX-XXXX
+```
+
+It opens the loopback port the provider requires, catches the code from the redirect, and
+deposits the credential in the proxy. Nothing is copied by hand. If LiteLLM runs on your own
+machine, drop `--url` and `--code` — it writes straight to the local store.
+
+The pairing code lives ten minutes, is single-use, and authorises exactly one provider. That
+is what keeps the proxy admin key off your command line.
+
+**Paste (always works).** Authenticate, then paste the return URL — or just the code — back
+into the page. Survives an occupied port, SSH without a tunnel, or a machine with no browser.
+
+## What is guaranteed
+
+- **Inert until a subscription is connected.** The patch is only applied once at least one
+  credential exists. Installed with no subscriptions, it is indistinguishable from not being
+  installed — the Router is untouched.
+- **Your `config.yaml` survives.** One line appended, a backup written next to it, and a
+  refusal to save a file that would not parse.
+- **The UI does not depend on a patched bundle.** `/mysubs` is a mounted FastAPI sub-app and
+  always works by direct URL. The **Experimental** menu entry is a best-effort string patch
+  of a pre-compiled Next.js chunk whose filename is a build hash; when a new LiteLLM version
+  does not match, it logs the direct URL instead of failing. Nothing in `site-packages` is
+  ever rewritten — the modified copy is served from memory.
+- **Credentials go where your policy says.** A `0600` file at
+  `~/.litellm/mysubs/credentials.json` by default, the secret manager LiteLLM already has
+  configured (`general_settings.key_management_system`) if you run one, or read-only
+  environment variables. Loose permissions on the file are rejected, not silently fixed.
+- **Never a fabricated number.** An unreachable provider shows the error or the last real
+  snapshot labelled with its age. A model name the subscription does not serve returns the
+  upstream error — it is never silently answered by a different model.
+
+### Turning it off
 
 | | |
 |---|---|
-| `MYSUBS_DISABLE=1` | desliga tudo sem editar o `config.yaml` |
-| `MYSUBS_DISABLE_AUTH=1` | dispensa `proxy_admin` (proxies sem base de dados de chaves) |
-| apagar a linha dos `callbacks` | desinstala |
+| `MYSUBS_DISABLE=1` | disables everything without editing `config.yaml` |
+| `MYSUBS_DISABLE_AUTH=1` | skips the `proxy_admin` check (proxies with no key database) |
+| remove the `callbacks` line | uninstalls |
 
-## Princípios
+## Providers
 
-Vêm de incidentes medidos em produção, não de preferência de estilo.
+| Provider | Model prefix | Wire protocol | Quota reported |
+|---|---|---|---|
+| Claude Max | `mysubs/claudecode/` | Messages | 5h / 7d, from headers + `/api/oauth/usage` |
+| ChatGPT Plus (Codex) | `mysubs/codex/` | Responses API | 5h / 7d, from headers + `wham/usage` |
+| Google Antigravity | `mysubs/antigravity/` | Cloud Code | `:retrieveUserQuotaSummary` only |
 
-**Falhar alto.** Um nome de modelo que a subscrição não serve devolve o erro do upstream.
-Nunca se responde com outro modelo: a substituição silenciosa faz a facturação, as
-comparações e a reprodutibilidade mentirem, e o cliente nunca sabe que falou com outro
-modelo.
+On the wire that means `api.anthropic.com/v1/messages`,
+`chatgpt.com/backend-api/codex/responses`, and `v1internal:streamGenerateContent`.
+Antigravity is the one case where the quota endpoint is the only source: measured against
+the real backend, it returns no rate-limit headers at all.
 
-**Um só dono do refresh.** Anthropic e OpenAI emitem refresh tokens rotativos de uso
-único. Dois renovadores independentes sobre o mesmo token produzem `invalid_grant` em
-ciclo e forçam re-login manual. Um store que não é dono lê e nunca troca.
+Anthropic and Codex have no catalog endpoint for subscription tokens, so their model lists
+come from a curated set of measured names plus a live probe of each one. Antigravity has a
+real catalog (`:fetchAvailableModels`) and it is used directly.
 
-**Nunca inventar números.** Um provedor inalcançável mostra o erro ou o último
-instantâneo real, etiquetado com a idade — nunca um valor plausível fabricado.
-
-**Medir contra o backend.** As formas de wire vêm de medição contra o serviço real, não
-de documentação. Os comentários no código trazem as medições que motivaram cada decisão.
-
-## Arquitectura
-
-```
-src/litellm_mysubs/
-├── credentials/     store plugável: ficheiro (0600), Secret, ambiente
-├── wire/            um módulo por provedor; não se referenciam entre si
-├── catalog/         descoberta de modelos servidos
-├── registry.py      injecção no Router + guardas contra deployments fantasma
-└── patch.py         o único módulo que muta estado global
-```
-
-Todos os módulos são importáveis sem efeitos colaterais. Só `patch.py` altera o LiteLLM,
-e apenas quando invocado — é isso que torna o resto testável por unidades.
-
-## Desenvolvimento
+## Development
 
 ```bash
-uv venv && uv pip install -e ".[dev]"
-pytest                 # unitários
-ruff check . && mypy   # lint + tipos
+pip install -e ".[dev]"
+pytest                  # unit tests
+ruff check . && mypy    # lint and types
 ```
 
-Testes que tocam no LiteLLM real precisam dos extras do proxy:
+1628 tests, 86% branch coverage (the suite fails below 85%), `ruff` and `mypy --strict`
+clean. Tests that touch real LiteLLM internals need the proxy extras:
 
 ```bash
-uv pip install "litellm[proxy]"
+pip install "litellm[proxy]"
 pytest tests/test_litellm_contract.py
 ```
 
-Esse ficheiro afirma a existência dos símbolos internos de que o patch depende
-(`Router.acompletion`, `route_llm_request.route_request`, `custom_provider_map`). É o que
-transforma um upgrade incompatível do LiteLLM em CI vermelho em vez de numa avaria em
-produção.
+That file asserts the internal symbols the patch depends on — `Router.acompletion`,
+`route_llm_request.route_request`, `custom_provider_map`. CI runs it against both the pinned
+`litellm[proxy]` 1.101.0 and the current release, which turns an incompatible upstream
+upgrade into a red build instead of a production outage.
 
-## Roadmap
+CI also runs the unit suite on Python 3.11, 3.12 and 3.13, and verifies 186 source anchors
+against the upstream implementations they were ported from, on every push. An anchor pins
+both the symbol name and, where it matters, its value — a renamed endpoint path or a bumped
+client version fails the build rather than drifting silently.
 
-O destino é um plugin instalável: ligar a subscrição pela UI do próprio LiteLLM, escolher
-os modelos, aplicar. As fatias abaixo são os passos desse fluxo, não módulos.
+## Architecture
 
-| | Fatia | Entrega | Estado |
-|---|---|---|---|
-| 0 | Fundações: credenciais, registry, CI | — | ✅ |
-| 1 | Bridges de wire protocol (Anthropic, Codex, Antigravity) | — | ✅ |
-| 2 | `pip install` + patch automático | um token manual já serve modelos | em curso |
-| 3 | Descoberta de modelos e aplicação | escolher o que a subscrição serve | — |
-| 4 | OAuth com paste do código de retorno | ligar sem copiar tokens à mão | — |
-| 5 | UI `/mysubs` montada no proxy | o produto: botão, cards, aplicar | — |
+```
+src/litellm_mysubs/
+├── credentials/   pluggable store (0600 file, secret manager, env), OAuth,
+│                  loopback callback server, cross-process refresh lock
+├── wire/          one module per provider; they never reference each other
+├── transport/     HTTP client, SSE, host failover, retry
+├── catalog/       discovery of the models a subscription actually serves, quota
+├── ui/            the `/mysubs` sub-app: cards, pairing, apply
+├── login_cli.py   `mysubs-login` — the interceptor, run on your own machine
+├── setup_cli.py   `mysubs-setup` — the one-line config edit
+├── registry.py    Router injection and guards against phantom deployments
+└── plugin.py      the only module that mutates global state
+```
 
-O objectivo completo, com o estado de cada passo e as decisões já medidas que o
-condicionam, está em [`local/GOAL.md`](local/GOAL.md).
+Every module imports without side effects. Only `plugin.py` modifies LiteLLM, and only when
+invoked — which is what keeps the rest unit-testable.
 
-## Licença
+## Design decisions
 
-MIT
+[`docs/DECISIONS.md`](docs/DECISIONS.md) holds ten entries. Each records what was decided,
+**the measurement that supports it**, and what would reopen the question. Without the
+measurement it is not a decision, it is a preference.
+
+For example, D1 explains why streaming stays in a monkey-patch instead of the official
+`CustomLLM` path: a minimal handler reporting `prompt_tokens=100, completion_tokens=5,
+cached_tokens=80` had 8/2 delivered to the client and `cached_tokens` lost, in every one of
+the four supported ways of emitting the final chunk. Without real usage, LiteLLM estimates
+with `token_counter` and every cache hit becomes invisible in `/spend/logs` — on a
+subscription account that is the difference between 8697 and 2876 prompt tokens for the same
+request, and the only way to know why the quota ran out.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

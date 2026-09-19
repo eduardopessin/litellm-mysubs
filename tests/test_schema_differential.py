@@ -1,23 +1,23 @@
-"""Diferenciação do normalizador de schema contra o TypeScript real.
+"""Differential testing of the schema normalizer against the real TypeScript.
 
-Os testes dirigidos em ``test_schema.py`` afirmam regras nomeadas — o que deve acontecer a
-um `anyOf`, a um `$ref`, a um `not`. Este afirma outra coisa: que para **qualquer** schema
-o resultado é byte-a-byte o do OMP.
+The targeted tests in ``test_schema.py`` assert named rules — what must happen to an
+`anyOf`, a `$ref`, a `not`. This one asserts something else: that for **any** schema the
+result is byte-for-byte the one OMP produces.
 
-As 400 entradas foram geradas com um gerador determinístico e passadas pelo
-``normalizeSchemaForCCA`` real, corrido em Node a partir do tarball do
-``@oh-my-pi/pi-ai`` 18.2.6. As saídas gravadas são o que o TypeScript produziu, não o que
-o Python produz — regenerá-las a partir do Python tornaria o teste circular e inútil.
+The 400 entries were generated with a deterministic generator and passed through the real
+``normalizeSchemaForCCA``, run in Node from the ``@oh-my-pi/pi-ai`` 18.2.6 tarball. The
+recorded outputs are what the TypeScript produced, not what the Python produces —
+regenerating them from the Python would make the test circular and useless.
 
-Regenerar quando a versão fixada do OMP subir::
+Regenerate when the pinned OMP version goes up::
 
     cd /tmp/ccaharness
     cp tests/fixtures/cca_schema_cases.json cases.json
     node --experimental-strip-types run.ts > tests/fixtures/cca_schema_expected.json
 
-Um teste destes paga-se onde os dirigidos não chegam: apanhou uma guarda de ciclo que
-usava ``id()`` como identidade e truncava nós distintos que reutilizavam o mesmo endereço
-de memória — um schema com `not` residual passava a válido e seguia para o fio.
+A test like this pays for itself where the targeted ones do not reach: it caught a cycle
+guard that used ``id()`` as identity and truncated distinct nodes that reused the same
+memory address — a schema with a residual `not` became valid and went out on the wire.
 """
 
 from __future__ import annotations
@@ -42,13 +42,13 @@ EXPECTED = _load("cca_schema_expected.json")
 
 
 def test_corpus_is_paired() -> None:
-    """Um corpus desemparelhado silencia o teste em vez de o fazer falhar."""
+    """An unpaired corpus silences the test instead of failing it."""
     assert len(CASES) == len(EXPECTED)
-    assert CASES, "corpus vazio"
+    assert CASES, "empty corpus"
 
 
 @pytest.mark.parametrize("index", range(len(CASES)))
 def test_matches_the_typescript_output(index: int) -> None:
-    """Saída idêntica à do ``normalizeSchemaForCCA`` real."""
+    """Output identical to the real ``normalizeSchemaForCCA``."""
     produced = normalize_for_cca(CASES[index])
     assert json.dumps(produced, sort_keys=True) == json.dumps(EXPECTED[index], sort_keys=True)

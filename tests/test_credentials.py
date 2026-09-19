@@ -1,8 +1,8 @@
-"""Armazenamento de credenciais.
+"""Credential storage.
 
-O ficheiro guarda refresh tokens de subscrições pessoais. Os testes de permissões e de
-escrita atómica defendem isso; os de ``owns_refresh`` defendem a regra do dono único,
-cuja violação produz ``invalid_grant`` em ciclo e obriga a re-login manual.
+The file holds refresh tokens of personal subscriptions. The permissions and atomic write
+tests defend that; the ``owns_refresh`` ones defend the single-owner rule, whose violation
+produces ``invalid_grant`` in a loop and forces a manual re-login.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ class TestRoundTrip:
         assert set(store.connected()) == {"anthropic", "google-antigravity"}
 
     def test_project_id_survives(self, store_path: Path) -> None:
-        """Descoberto no fluxo OAuth do Google; perdê-lo obriga a religar a subscrição."""
+        """Found in the Google OAuth flow; losing it forces reconnecting the subscription."""
         store = FileCredentialStore(store_path)
         store.set("google-antigravity", cred(provider="google-antigravity", project_id="proj-9"))
         assert FileCredentialStore(store_path).get("google-antigravity").project_id == "proj-9"  # type: ignore[union-attr]
@@ -64,7 +64,7 @@ class TestPermissions:
         assert stat.S_IMODE(store_path.stat().st_mode) == 0o600
 
     def test_rejects_world_readable_file(self, store_path: Path) -> None:
-        """Apertar os bits em silêncio não desfaz uma leitura que já possa ter ocorrido."""
+        """Tightening the bits silently does not undo a read that may already have happened."""
         store_path.parent.mkdir(parents=True, exist_ok=True)
         store_path.write_text("{}", encoding="utf-8")
         os.chmod(store_path, 0o644)
@@ -74,7 +74,7 @@ class TestPermissions:
 
 class TestReload:
     def test_detects_external_change(self, store_path: Path) -> None:
-        """Uma rotação escrita por outro agente tem de ficar viva sem restart."""
+        """A rotation written by another process has to take effect without a restart."""
         store = FileCredentialStore(store_path)
         store.set("anthropic", cred(access_token="old"))
 
@@ -82,7 +82,7 @@ class TestReload:
         payload["anthropic"]["access_token"] = "rotated"
         store_path.write_text(json.dumps(payload), encoding="utf-8")
         os.chmod(store_path, 0o600)
-        os.utime(store_path, (0, 0))  # mtime distinto do gravado em cache
+        os.utime(store_path, (0, 0))  # mtime distinct from the one kept in cache
 
         assert store.get("anthropic").access_token == "rotated"  # type: ignore[union-attr]
 
@@ -94,19 +94,19 @@ class TestReload:
 
 class TestExpiry:
     def test_unknown_expiry_is_not_expired(self) -> None:
-        """Um token colado à mão não traz validade e tem de ser tentado, não descartado."""
+        """A hand-pasted token carries no expiry and has to be tried, not discarded."""
         assert cred(expires_at=0).is_expired(now=1_000_000) is False
 
     def test_leeway_expires_early(self) -> None:
-        """Renovar à tangente entrega um token que morre a meio do pedido.
+        """Refreshing at the very last moment delivers a token that dies mid-request.
 
-        Com validade em 1_000_000 e leeway de 60s, o corte está em 999_940.
+        With expiry at 1_000_000 and a leeway of 60s, the cut-off is at 999_940.
         """
         c = cred(expires_at=1_000_000)
-        assert c.is_expired(now=1_000_001, leeway_s=60) is True  # já passou
-        assert c.is_expired(now=999_950, leeway_s=60) is True  # dentro da leeway
-        assert c.is_expired(now=999_940, leeway_s=60) is True  # no limite exacto
-        assert c.is_expired(now=999_939, leeway_s=60) is False  # um segundo antes
+        assert c.is_expired(now=1_000_001, leeway_s=60) is True  # already past
+        assert c.is_expired(now=999_950, leeway_s=60) is True  # inside the leeway
+        assert c.is_expired(now=999_940, leeway_s=60) is True  # exactly at the boundary
+        assert c.is_expired(now=999_939, leeway_s=60) is False  # one second earlier
 
 
 class TestEnvStore:
@@ -119,11 +119,12 @@ class TestEnvStore:
         assert EnvCredentialStore({}).get("anthropic") is None
 
     def test_is_not_refresh_owner(self) -> None:
-        """Dois renovadores sobre um refresh token rotativo dão invalid_grant em ciclo."""
+        """Two refreshers over a rotating refresh token give invalid_grant in a loop."""
         assert EnvCredentialStore({}).owns_refresh is False
         assert FileCredentialStore.owns_refresh is True
 
     def test_write_fails_loudly(self) -> None:
-        """Escrever em os.environ não persiste; falhar alto evita a ilusão de ter guardado."""
+        """Writing to os.environ does not persist; failing loudly avoids the illusion of
+        having stored it."""
         with pytest.raises(ReadOnlyStoreError):
             EnvCredentialStore({}).set("anthropic", cred())

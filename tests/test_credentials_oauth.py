@@ -1,18 +1,23 @@
-"""Fluxo OAuth com paste e renovação.
+"""OAuth flow with paste and refresh.
 
-O que estes testes defendem não é que um POST devolve 200. É o conjunto de coisas que,
-quando falham, falham em silêncio e só aparecem semanas depois:
+What these tests defend is not that a POST returns 200. It is the set of things that, when
+they fail, fail silently and only surface weeks later:
 
-* o paste aceita as três formas que o utilizador consegue produzir — e recusa um ``state``
-  que não é o do pedido, que é o único sinal de CSRF que temos;
-* a rotação **substitui** o refresh token. Guardar o antigo por cima de um novo dá
-  ``invalid_grant`` na renovação seguinte, e o sintoma é re-login manual sem explicação;
-* o ``project_id`` do Antigravity sai do ``loadCodeAssist`` e sobrevive à renovação. Sem
-  ele todos os pedidos de inferência dão 400;
-* o ``error_description`` do upstream chega ao utilizador intacto. É o que lhe diz o que
-  fazer; substituí-lo por uma mensagem nossa apaga-o.
+* the paste accepts the three forms the user can produce — and refuses a ``state`` that is
+  not the request's, which is the only CSRF signal we have;
+* rotation **replaces** the refresh token. Storing the old one over a new one gives
+  ``invalid_grant`` on the next refresh, and the symptom is a manual re-login with no
+  explanation;
+* the Antigravity ``project_id`` comes out of ``loadCodeAssist`` and survives the refresh.
+  Without it every inference request returns 400;
+* the upstream's ``error_description`` reaches the user intact. It is what tells them what
+  to do; replacing it with a message of ours erases it.
 
-Tudo com ``httpx.MockTransport``: sem rede, sem relógio real.
+All of it with ``httpx.MockTransport``: no network, no real clock.
+
+Some upstream payloads in the fixtures are deliberately in Portuguese: those tests assert
+that the provider's own text propagates unrewritten, and an English fixture would not tell
+a pass-through apart from a message of ours.
 """
 
 from __future__ import annotations
@@ -47,7 +52,7 @@ def client_of(handler: Handler) -> httpx.AsyncClient:
 
 
 def request_for(provider: ProviderId = "anthropic") -> AuthRequest:
-    return AuthRequest(url="https://exemplo/autorizar", state="ST4TE", verifier="v" * 43)
+    return AuthRequest(url="https://example/authorize", state="ST4TE", verifier="v" * 43)
 
 
 def query_of(url: str) -> dict[str, str]:
@@ -64,11 +69,11 @@ def json_of(request: httpx.Request) -> dict[str, Any]:
 
 
 def token_response(**extra: Any) -> httpx.Response:
-    return httpx.Response(200, json={"access_token": "at-novo", "expires_in": 3600, **extra})
+    return httpx.Response(200, json={"access_token": "at-new", "expires_in": 3600, **extra})
 
 
 class FakeStore(CredentialStore):
-    """Store mínimo cuja única propriedade interessante é a posse do refresh."""
+    """Minimal store whose only interesting property is ownership of the refresh."""
 
     def __init__(self, *, owns_refresh: bool) -> None:
         self.owns_refresh = owns_refresh
@@ -77,10 +82,10 @@ class FakeStore(CredentialStore):
         return None
 
     def set(self, provider: ProviderId, credential: Credential) -> None:
-        raise AssertionError("não devia escrever")
+        raise AssertionError("should not write")
 
     def delete(self, provider: ProviderId) -> None:
-        raise AssertionError("não devia apagar")
+        raise AssertionError("should not delete")
 
     def reload(self) -> bool:
         return False
@@ -88,8 +93,9 @@ class FakeStore(CredentialStore):
 
 class TestPKCE:
     def test_challenge_is_s256_of_verifier(self) -> None:
-        """Se o desafio não for o SHA-256 do verifier, a troca do código dá `invalid_grant`
-        no servidor — e o erro só aparece depois de o utilizador já ter feito login."""
+        """If the challenge is not the SHA-256 of the verifier, the code exchange gives
+        `invalid_grant` at the server — and the error only shows up after the user has
+        already logged in."""
         request = begin("openai-codex")
         expected = (
             base64.urlsafe_b64encode(hashlib.sha256(request.verifier.encode()).digest())
@@ -100,20 +106,20 @@ class TestPKCE:
         assert query_of(request.url)["code_challenge_method"] == "S256"
 
     def test_verifier_is_fresh_per_request(self) -> None:
-        primeiro, segundo = begin("anthropic"), begin("anthropic")
-        assert primeiro.verifier != segundo.verifier
-        assert primeiro.state != segundo.state
+        first, second = begin("anthropic"), begin("anthropic")
+        assert first.verifier != second.verifier
+        assert first.state != second.state
 
     def test_challenge_is_url_safe_and_unpadded(self) -> None:
-        """Padding e `+`/`/` teriam de ser escapados; há servidores que comparam byte a
-        byte com o que receberam e rejeitam a diferença."""
+        """Padding and `+`/`/` would have to be escaped; some servers compare byte for byte
+        with what they received and reject the difference."""
         challenge = query_of(begin("anthropic").url)["code_challenge"]
         assert "=" not in challenge
         assert "+" not in challenge and "/" not in challenge
 
     def test_antigravity_has_no_pkce(self) -> None:
-        """A regra do OMP não activa PKCE no Google; o segredo do cliente faz esse papel.
-        Mandar um desafio que o servidor não espera não ajuda e pode ser recusado."""
+        """The OMP rule does not enable PKCE on Google; the client secret plays that role.
+        Sending a challenge the server does not expect does not help and may be refused."""
         request = begin("google-antigravity")
         assert request.verifier == ""
         assert "code_challenge" not in query_of(request.url)
@@ -121,21 +127,21 @@ class TestPKCE:
 
 class TestAuthorizeUrl:
     def test_anthropic_asks_for_a_pasteable_code(self) -> None:
-        """`code=true` é o que faz a página mostrar um código copiável em vez de
-        redireccionar. Sem isto o paste deixa de ser possível num container."""
+        """`code=true` is what makes the page show a copyable code instead of redirecting.
+        Without it the paste stops being possible inside a container."""
         assert query_of(begin("anthropic").url)["code"] == "true"
 
     def test_google_asks_for_a_refresh_token(self) -> None:
-        """Sem `access_type=offline` o Google não emite refresh token; sem
-        `prompt=consent` não o reemite a quem já consentiu. Faltar um deles produz uma
-        subscrição que morre na primeira expiração."""
+        """Without `access_type=offline` Google issues no refresh token; without
+        `prompt=consent` it does not reissue one to whoever already consented. Missing either
+        produces a subscription that dies at the first expiry."""
         params = query_of(begin("google-antigravity").url)
         assert params["access_type"] == "offline"
         assert params["prompt"] == "consent"
 
     def test_codex_redirect_uri_is_the_registered_one(self) -> None:
-        """A OpenAI só autoriza este URI exacto; derivá-lo de um porto livre seria
-        rejeitado no servidor depois de o utilizador já ter autenticado."""
+        """OpenAI only authorises this exact URI; deriving it from a free port would be
+        rejected at the server after the user had already authenticated."""
         params = query_of(begin("openai-codex").url)
         assert params["redirect_uri"] == "http://localhost:1455/auth/callback"
         assert params["client_id"] == "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -145,13 +151,13 @@ class TestAuthorizeUrl:
         assert query_of(request.url)["state"] == request.state
 
     def test_anthropic_requests_inference_scope(self) -> None:
-        """`user:inference` é o que dá inferência directa com token de subscrição; sem ele
-        o token só serve para gestão de conta."""
+        """`user:inference` is what grants direct inference with a subscription token;
+        without it the token is only good for account management."""
         assert "user:inference" in query_of(begin("anthropic").url)["scope"].split(" ")
 
 
 class TestPaste:
-    """As três formas que o utilizador consegue produzir, e o que tem de ser recusado."""
+    """The three forms the user can produce, and what has to be refused."""
 
     async def exchange(self, pasted: str, provider: ProviderId = "anthropic") -> httpx.Request:
         seen: list[httpx.Request] = []
@@ -165,18 +171,19 @@ class TestPaste:
         return seen[0]
 
     async def test_full_callback_url(self) -> None:
-        """O que o browser mostra na barra quando o redirect não alcança o porto local."""
+        """What the browser shows in the bar when the redirect does not reach the local
+        port."""
         sent = await self.exchange("https://claude.ai/callback?code=abc123&state=ST4TE")
         assert json_of(sent)["code"] == "abc123"
 
     async def test_bare_code(self) -> None:
-        """Quem copia só o pedaço do código não deve ser obrigado a reconstruir uma URL."""
+        """Whoever copies only the code fragment must not be forced to rebuild a URL."""
         sent = await self.exchange("abc123")
         assert json_of(sent)["code"] == "abc123"
 
     async def test_code_hash_state(self) -> None:
-        """O formato que a Anthropic mostra com `code=true`. O fragmento é o `state`, não
-        parte do código — mandá-lo junto faz o servidor recusar a troca."""
+        """The format Anthropic shows with `code=true`. The fragment is the `state`, not part
+        of the code — sending it along makes the server refuse the exchange."""
         sent = await self.exchange("abc123#ST4TE")
         assert json_of(sent)["code"] == "abc123"
 
@@ -185,7 +192,7 @@ class TestPaste:
         assert json_of(sent)["code"] == "abc123"
 
     async def test_code_with_hash_inside_the_query(self) -> None:
-        """A Anthropic chega a devolver `code=abc#state` dentro da própria query."""
+        """Anthropic sometimes returns `code=abc#state` inside the query itself."""
         sent = await self.exchange("https://claude.ai/callback?code=abc123%23ST4TE&state=ST4TE")
         assert json_of(sent)["code"] == "abc123"
 
@@ -195,11 +202,11 @@ class TestPaste:
 
 
 class TestPasteRejection:
-    """Nenhum destes chega a tocar na rede: o handler falha se for chamado."""
+    """None of these ever touches the network: the handler fails if it is called."""
 
     def client(self) -> httpx.AsyncClient:
         def handler(request: httpx.Request) -> httpx.Response:
-            raise AssertionError(f"não devia haver pedido: {request.url}")
+            raise AssertionError(f"there should be no request: {request.url}")
 
         return client_of(handler)
 
@@ -209,20 +216,20 @@ class TestPasteRejection:
                 await complete(
                     "anthropic",
                     request_for(),
-                    "https://claude.ai/callback?code=abc&state=OUTRO",
+                    "https://claude.ai/callback?code=abc&state=OTHER",
                     client=client,
                 )
         assert "state" in str(excinfo.value).lower()
 
     async def test_state_mismatch_in_fragment_raises(self) -> None:
-        """O fragmento é a autoridade sobre o `state`; um trocado ali conta tanto como na
-        query, senão o formato `codigo#state` seria um buraco de CSRF."""
+        """The fragment is the authority on the `state`; one swapped there counts as much as
+        in the query, otherwise the `code#state` format would be a CSRF hole."""
         async with self.client() as client:
             with pytest.raises(OAuthError):
-                await complete("anthropic", request_for(), "abc#OUTRO", client=client)
+                await complete("anthropic", request_for(), "abc#OTHER", client=client)
 
     async def test_error_in_callback_url_propagates_description(self) -> None:
-        """O `error_description` do retorno é o que diz ao utilizador o que fazer."""
+        """The callback's `error_description` is what tells the user what to do."""
         async with self.client() as client:
             with pytest.raises(OAuthError) as excinfo:
                 await complete(
@@ -252,68 +259,71 @@ class TestPasteRejection:
 
 class TestExchange:
     async def test_verifier_and_state_reach_the_token_endpoint(self) -> None:
-        """O verifier é o segredo que nunca viajou; sem ele a troca falha. O `state` vai
-        no corpo porque a regra da Anthropic o exige lá, não só no URL."""
+        """The verifier is the secret that never travelled; without it the exchange fails. The
+        `state` goes in the body because Anthropic's rule demands it there, not only in the
+        URL."""
         seen: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             seen.append(request)
             return token_response(refresh_token="rt-1")
 
-        pedido = request_for()
+        request = request_for()
         async with client_of(handler) as client:
-            await complete("anthropic", pedido, "abc#ST4TE", client=client)
+            await complete("anthropic", request, "abc#ST4TE", client=client)
 
-        corpo = json_of(seen[0])
-        assert corpo["code_verifier"] == pedido.verifier
-        assert corpo["state"] == pedido.state
-        assert corpo["grant_type"] == "authorization_code"
+        body = json_of(seen[0])
+        assert body["code_verifier"] == request.verifier
+        assert body["state"] == request.state
+        assert body["grant_type"] == "authorization_code"
 
     async def test_anthropic_uses_json_and_codex_uses_form(self) -> None:
-        """Não são intermutáveis: a Anthropic recusa urlencoded e o Google recusa JSON.
-        Trocar isto dá um 400 opaco do servidor."""
-        corpos: dict[str, str] = {}
+        """They are not interchangeable: Anthropic refuses urlencoded and Google refuses JSON.
+        Swapping them gives an opaque 400 from the server."""
+        content_types: dict[str, str] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
-            corpos[str(request.url)] = request.headers["content-type"]
+            content_types[str(request.url)] = request.headers["content-type"]
             return token_response(refresh_token="rt-1")
 
         async with client_of(handler) as client:
             await complete("anthropic", request_for(), "abc", client=client)
             await complete("openai-codex", request_for(), "abc", client=client)
 
-        assert corpos["https://api.anthropic.com/v1/oauth/token"].startswith("application/json")
-        assert corpos["https://auth.openai.com/oauth/token"].startswith(
+        assert content_types["https://api.anthropic.com/v1/oauth/token"].startswith(
+            "application/json"
+        )
+        assert content_types["https://auth.openai.com/oauth/token"].startswith(
             "application/x-www-form-urlencoded"
         )
 
     async def test_expiry_skew_lands_before_the_real_deadline(self) -> None:
-        """A margem da Anthropic é 300s. Renovar exactamente na expiração é renovar tarde:
-        um pedido em voo apanha o token já morto."""
+        """Anthropic's margin is 300s. Refreshing exactly at the expiry is refreshing late:
+        an in-flight request catches the token already dead."""
         async with client_of(lambda _: token_response(refresh_token="rt-1")) as client:
-            credencial = await complete("anthropic", request_for(), "abc", client=client)
-        atraso = credencial.expires_at - time.time()
-        assert 3200 < atraso < 3310
+            credential = await complete("anthropic", request_for(), "abc", client=client)
+        lead = credential.expires_at - time.time()
+        assert 3200 < lead < 3310
 
     async def test_missing_access_token_raises_with_body(self) -> None:
-        """Há provedores que embrulham o erro num envelope de sucesso; o corpo é a única
-        explicação e tem de subir."""
-        resposta = httpx.Response(200, json={"code": 4001, "msg": "conta suspensa"})
-        async with client_of(lambda _: resposta) as client:
+        """Some providers wrap the error in a success envelope; the body is the only
+        explanation and has to bubble up."""
+        response = httpx.Response(200, json={"code": 4001, "msg": "conta suspensa"})
+        async with client_of(lambda _: response) as client:
             with pytest.raises(OAuthError) as excinfo:
                 await complete("anthropic", request_for(), "abc", client=client)
         assert "conta suspensa" in str(excinfo.value)
 
     async def test_provider_error_propagates_description(self) -> None:
-        """Princípio 3: o `error_description` real, nunca uma mensagem genérica por cima."""
-        resposta = httpx.Response(
+        """Principle 3: the real `error_description`, never a generic message on top."""
+        response = httpx.Response(
             400,
             json={
                 "error": "invalid_grant",
                 "error_description": "O código de autorização expirou; repete o login",
             },
         )
-        async with client_of(lambda _: resposta) as client:
+        async with client_of(lambda _: response) as client:
             with pytest.raises(OAuthError) as excinfo:
                 await complete("openai-codex", request_for(), "abc", client=client)
 
@@ -324,45 +334,46 @@ class TestExchange:
 
 class TestRefreshRotation:
     async def test_rotated_token_replaces_the_old_one(self) -> None:
-        """O caso que produz `invalid_grant` em ciclo quando corre mal: o provedor rodou o
-        token, o antigo já não serve, e guardá-lo mata a renovação seguinte."""
-        velha = Credential("anthropic", "at-velho", refresh_token="rt-velho", expires_at=1.0)
-        async with client_of(lambda _: token_response(refresh_token="rt-novo")) as client:
-            nova = await refresh(velha, client=client)
+        """The case that produces a loop of `invalid_grant` when it goes wrong: the provider
+        rotated the token, the old one no longer works, and storing it kills the next
+        refresh."""
+        old = Credential("anthropic", "at-old", refresh_token="rt-old", expires_at=1.0)
+        async with client_of(lambda _: token_response(refresh_token="rt-new")) as client:
+            new = await refresh(old, client=client)
 
-        assert nova.refresh_token == "rt-novo"
-        assert nova.access_token == "at-novo"
-        assert velha.refresh_token == "rt-velho", "a credencial antiga é imutável"
+        assert new.refresh_token == "rt-new"
+        assert new.access_token == "at-new"
+        assert old.refresh_token == "rt-old", "the old credential is immutable"
 
     async def test_unrotated_token_is_preserved(self) -> None:
-        """Nem todos rodam. Um provedor que omite `refresh_token` não está a revogar o
-        nosso — apagá-lo forçaria re-login sem motivo."""
-        velha = Credential("openai-codex", "at-velho", refresh_token="rt-velho")
+        """Not everyone rotates. A provider that omits `refresh_token` is not revoking ours —
+        deleting it would force a re-login for no reason."""
+        old = Credential("openai-codex", "at-old", refresh_token="rt-old")
         async with client_of(lambda _: token_response()) as client:
-            nova = await refresh(velha, client=client)
-        assert nova.refresh_token == "rt-velho"
+            new = await refresh(old, client=client)
+        assert new.refresh_token == "rt-old"
 
     async def test_sends_the_stored_refresh_token(self) -> None:
         seen: list[dict[str, str]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             seen.append(form_of(request))
-            return token_response(refresh_token="rt-novo")
+            return token_response(refresh_token="rt-new")
 
         async with client_of(handler) as client:
-            await refresh(Credential("openai-codex", "at", refresh_token="rt-velho"), client=client)
+            await refresh(Credential("openai-codex", "at", refresh_token="rt-old"), client=client)
 
         assert seen[0]["grant_type"] == "refresh_token"
-        assert seen[0]["refresh_token"] == "rt-velho"
+        assert seen[0]["refresh_token"] == "rt-old"
 
     async def test_anthropic_refresh_carries_the_beta_headers(self) -> None:
-        """O Claude Code manda-os na renovação e não na troca inicial; sem eles o endpoint
-        trata o pedido como vindo de outro cliente."""
+        """Claude Code sends them on the refresh and not on the initial exchange; without them
+        the endpoint treats the request as coming from a different client."""
         seen: list[httpx.Headers] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             seen.append(request.headers)
-            return token_response(refresh_token="rt-novo")
+            return token_response(refresh_token="rt-new")
 
         async with client_of(handler) as client:
             await refresh(Credential("anthropic", "at", refresh_token="rt"), client=client)
@@ -371,18 +382,18 @@ class TestRefreshRotation:
         assert "userOAuthProvider" in seen[0]["user-agent"]
 
     async def test_refresh_error_propagates_description(self) -> None:
-        resposta = httpx.Response(
+        response = httpx.Response(
             400,
             json={"error": "invalid_grant", "error_description": "Refresh token expired"},
         )
-        async with client_of(lambda _: resposta) as client:
+        async with client_of(lambda _: response) as client:
             with pytest.raises(OAuthError) as excinfo:
                 await refresh(Credential("anthropic", "at", refresh_token="rt"), client=client)
         assert "Refresh token expired" in str(excinfo.value)
 
     async def test_without_refresh_token_raises_before_the_network(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
-            raise AssertionError("não devia haver pedido")
+            raise AssertionError("there should be no request")
 
         async with client_of(handler) as client:
             with pytest.raises(OAuthError):
@@ -390,12 +401,12 @@ class TestRefreshRotation:
 
 
 class TestRefreshOwnership:
-    """Regra do dono único: dois renovadores sobre o mesmo token de uso único produzem
-    `invalid_grant` em ciclo e forçam re-login manual."""
+    """Single-owner rule: two refreshers on the same single-use token produce a loop of
+    `invalid_grant` and force a manual re-login."""
 
     async def test_non_owner_store_refuses_without_touching_the_network(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
-            raise AssertionError("um store que não é dono não pode trocar o token")
+            raise AssertionError("a store that is not the owner must not exchange the token")
 
         async with client_of(handler) as client:
             with pytest.raises(NotRefreshOwnerError):
@@ -406,19 +417,19 @@ class TestRefreshOwnership:
                 )
 
     async def test_owner_store_refreshes(self) -> None:
-        async with client_of(lambda _: token_response(refresh_token="rt-novo")) as client:
-            nova = await refresh(
+        async with client_of(lambda _: token_response(refresh_token="rt-new")) as client:
+            new = await refresh(
                 Credential("anthropic", "at", refresh_token="rt"),
                 client=client,
                 store=FakeStore(owns_refresh=True),
             )
-        assert nova.refresh_token == "rt-novo"
+        assert new.refresh_token == "rt-new"
 
     async def test_without_store_the_caller_owns_it(self) -> None:
-        """Sem store não há quem verificar; quem chama assume a responsabilidade."""
-        async with client_of(lambda _: token_response(refresh_token="rt-novo")) as client:
-            nova = await refresh(Credential("anthropic", "at", refresh_token="rt"), client=client)
-        assert nova.access_token == "at-novo"
+        """With no store there is nobody to check; the caller takes on the responsibility."""
+        async with client_of(lambda _: token_response(refresh_token="rt-new")) as client:
+            new = await refresh(Credential("anthropic", "at", refresh_token="rt"), client=client)
+        assert new.access_token == "at-new"
 
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -427,12 +438,12 @@ ONBOARD_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser"
 
 
 class Antigravity:
-    """Backend do Antigravity por guião: token, depois `loadCodeAssist`/`onboardUser`."""
+    """Scripted Antigravity backend: token, then `loadCodeAssist`/`onboardUser`."""
 
     def __init__(self, *steps: dict[str, Any], token: dict[str, Any] | None = None) -> None:
         self.steps = list(steps)
         self.token = token or {
-            "access_token": "at-novo",
+            "access_token": "at-new",
             "refresh_token": "rt-1",
             "expires_in": 3600,
         }
@@ -447,105 +458,106 @@ class Antigravity:
         if request.content:
             self.bodies.append(json_of(request))
         if not self.steps:
-            raise AssertionError(f"pedido a mais: {url}")
+            raise AssertionError(f"one request too many: {url}")
         return httpx.Response(200, json=self.steps.pop(0))
 
 
 @pytest.fixture(autouse=True)
-def relogio_virtual(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Espera nenhuma, mas tempo que passa.
+def virtual_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No waiting, but time that passes.
 
-    O polling do ``onboardUser`` espera 1s por volta e o prazo é absoluto. Substituir a
-    espera por um no-op sem mexer no relógio tornaria o prazo inalcançável: o teste do
-    desistir ficaria a girar para sempre. Aqui cada espera adianta o relógio monotónico
-    exactamente o que teria esperado — o prazo é medido, a suite não espera.
+    The ``onboardUser`` polling waits 1s per round and the deadline is absolute. Replacing
+    the wait with a no-op without touching the clock would make the deadline unreachable:
+    the give-up test would spin forever. Here every wait advances the monotonic clock by
+    exactly what it would have waited — the deadline is measured, the suite does not wait.
     """
-    decorrido = 0.0
+    elapsed = 0.0
 
-    async def dormir(seconds: float) -> None:
-        nonlocal decorrido
-        decorrido += seconds
+    async def sleep(seconds: float) -> None:
+        nonlocal elapsed
+        elapsed += seconds
 
-    class Relogio:
-        """Shim em vez de `monkeypatch` no módulo `time`: mexer no `time` global afecta
-        o pytest e qualquer teste a correr ao lado."""
+    class Clock:
+        """A shim instead of `monkeypatch` on the `time` module: touching the global `time`
+        affects pytest and any test running alongside."""
 
         @staticmethod
         def monotonic() -> float:
-            return time.monotonic() + decorrido
+            return time.monotonic() + elapsed
 
         @staticmethod
         def time() -> float:
             return time.time()
 
-    monkeypatch.setattr(oauth, "_sleep", dormir)
-    monkeypatch.setattr(oauth, "time", Relogio)
+    monkeypatch.setattr(oauth, "_sleep", sleep)
+    monkeypatch.setattr(oauth, "time", Clock)
 
 
 class TestProjectDiscovery:
     async def test_project_id_comes_from_load_code_assist(self) -> None:
-        """Não vem do token nem do ambiente: é o `cloudaicompanionProject` que o
-        `loadCodeAssist` devolve. Sem ele todos os pedidos de inferência dão 400."""
+        """It comes neither from the token nor from the environment: it is the
+        `cloudaicompanionProject` that `loadCodeAssist` returns. Without it every inference
+        request returns 400."""
         backend = Antigravity(
             {
-                "cloudaicompanionProject": "projecto-1",
+                "cloudaicompanionProject": "project-1",
                 "currentTier": {"id": "free-tier"},
                 "allowedTiers": [{"id": "free-tier"}],
-                "paidTier": {"id": "pago"},
+                "paidTier": {"id": "paid"},
             },
             {
-                "cloudaicompanionProject": "projecto-1",
+                "cloudaicompanionProject": "project-1",
                 "currentTier": {"id": "free-tier"},
                 "allowedTiers": [{"id": "free-tier"}],
-                "paidTier": {"id": "pago"},
+                "paidTier": {"id": "paid"},
             },
         )
         async with client_of(backend) as client:
-            credencial = await complete("google-antigravity", request_for(), "abc", client=client)
+            credential = await complete("google-antigravity", request_for(), "abc", client=client)
 
-        assert credencial.project_id == "projecto-1"
-        assert ONBOARD_URL not in backend.urls, "a conta já tinha tier; não se provisiona"
+        assert credential.project_id == "project-1"
+        assert ONBOARD_URL not in backend.urls, "the account already had a tier; no provisioning"
 
     async def test_account_without_tier_is_onboarded_first(self) -> None:
-        """Sem `currentTier` a conta ainda não existe no Cloud Code Assist; saltar o
-        `onboardUser` deixaria a ligação sem projecto nenhum."""
+        """Without `currentTier` the account does not exist in Cloud Code Assist yet; skipping
+        `onboardUser` would leave the connection with no project at all."""
         backend = Antigravity(
-            {"allowedTiers": [{"id": "free-tier"}], "paidTier": {"id": "pago"}},
+            {"allowedTiers": [{"id": "free-tier"}], "paidTier": {"id": "paid"}},
             {"done": True, "response": {"@type": "OnboardUserResponse"}},
             {
-                "cloudaicompanionProject": "projecto-novo",
+                "cloudaicompanionProject": "project-new",
                 "currentTier": {"id": "free-tier"},
                 "allowedTiers": [{"id": "free-tier"}],
-                "paidTier": {"id": "pago"},
+                "paidTier": {"id": "paid"},
             },
         )
         async with client_of(backend) as client:
-            credencial = await complete("google-antigravity", request_for(), "abc", client=client)
+            credential = await complete("google-antigravity", request_for(), "abc", client=client)
 
-        assert credencial.project_id == "projecto-novo"
+        assert credential.project_id == "project-new"
         assert ONBOARD_URL in backend.urls
 
     async def test_onboard_operation_is_polled_until_done(self) -> None:
         backend = Antigravity(
-            {"allowedTiers": [{"id": "free-tier"}], "paidTier": {"id": "pago"}},
+            {"allowedTiers": [{"id": "free-tier"}], "paidTier": {"id": "paid"}},
             {"name": "operations/1", "done": False},
             {"name": "operations/1", "done": True, "response": {"@type": "OnboardUserResponse"}},
             {
-                "cloudaicompanionProject": "projecto-novo",
+                "cloudaicompanionProject": "project-new",
                 "currentTier": {"id": "free-tier"},
                 "allowedTiers": [{"id": "free-tier"}],
-                "paidTier": {"id": "pago"},
+                "paidTier": {"id": "paid"},
             },
         )
         async with client_of(backend) as client:
-            credencial = await complete("google-antigravity", request_for(), "abc", client=client)
+            credential = await complete("google-antigravity", request_for(), "abc", client=client)
 
-        assert credencial.project_id == "projecto-novo"
+        assert credential.project_id == "project-new"
         assert "https://daily-cloudcode-pa.googleapis.com/v1internal/operations/1" in backend.urls
 
     async def test_failed_onboard_operation_propagates_the_reason(self) -> None:
         backend = Antigravity(
-            {"allowedTiers": [{"id": "free-tier"}], "paidTier": {"id": "pago"}},
+            {"allowedTiers": [{"id": "free-tier"}], "paidTier": {"id": "paid"}},
             {"done": True, "error": {"code": 7, "message": "quota de projectos esgotada"}},
         )
         async with client_of(backend) as client:
@@ -554,11 +566,11 @@ class TestProjectDiscovery:
         assert "quota de projectos esgotada" in str(excinfo.value)
 
     async def test_ineligible_account_reports_the_validation_url(self) -> None:
-        """A conta precisa de uma acção no browser; a URL é o passo seguinte e não pode
-        ser engolida por uma mensagem nossa."""
+        """The account needs an action in the browser; the URL is the next step and must not
+        be swallowed by a message of ours."""
         backend = Antigravity(
             {
-                "allowedTiers": [{"id": "pago"}],
+                "allowedTiers": [{"id": "paid"}],
                 "ineligibleTiers": [
                     {
                         "tierId": "free-tier",
@@ -566,7 +578,7 @@ class TestProjectDiscovery:
                         "validationUrl": "https://valida.example/conta",
                     }
                 ],
-                "paidTier": {"id": "pago"},
+                "paidTier": {"id": "paid"},
             }
         )
         async with client_of(backend) as client:
@@ -577,18 +589,18 @@ class TestProjectDiscovery:
         assert "https://valida.example/conta" in str(excinfo.value)
 
     async def test_missing_project_raises_instead_of_inventing_one(self) -> None:
-        """Princípio 3: nunca fabricar um valor plausível. Um projecto inventado daria 400
-        em cada pedido, sem dizer porquê."""
+        """Principle 3: never fabricate a plausible value. A made-up project would give 400 on
+        every request, without saying why."""
         backend = Antigravity(
             {
                 "currentTier": {"id": "free-tier"},
                 "allowedTiers": [{"id": "free-tier"}],
-                "paidTier": {"id": "pago"},
+                "paidTier": {"id": "paid"},
             },
             {
                 "currentTier": {"id": "free-tier"},
                 "allowedTiers": [{"id": "free-tier"}],
-                "paidTier": {"id": "pago"},
+                "paidTier": {"id": "paid"},
             },
         )
         async with client_of(backend) as client:
@@ -597,14 +609,14 @@ class TestProjectDiscovery:
         assert "cloudaicompanionProject" in str(excinfo.value)
 
     async def test_token_without_refresh_is_rejected(self) -> None:
-        """Uma ligação sem refresh token morre na primeira expiração, e o utilizador não
-        saberia porquê. Recusar aqui é o único momento em que ainda dá para repetir."""
+        """A connection with no refresh token dies at the first expiry, and the user would not
+        know why. Refusing here is the only moment when it can still be retried."""
         backend = Antigravity(token={"access_token": "at", "expires_in": 3600})
         async with client_of(backend) as client:
             with pytest.raises(OAuthError) as excinfo:
                 await complete("google-antigravity", request_for(), "abc", client=client)
         assert "refresh" in str(excinfo.value).lower()
-        assert LOAD_URL not in backend.urls, "não se descobre projecto para uma ligação morta"
+        assert LOAD_URL not in backend.urls, "no project discovery for a dead connection"
 
     async def test_control_plane_error_propagates_the_upstream_body(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -628,23 +640,23 @@ class TestProjectDiscovery:
 
 class TestAntigravityRefresh:
     async def test_project_id_survives_the_refresh(self) -> None:
-        """O endpoint de token não devolve o projecto; perdê-lo aqui partiria todos os
-        pedidos seguintes com um 400 que não aponta para a renovação."""
-        velha = Credential(
-            "google-antigravity", "at-velho", refresh_token="rt-velho", project_id="projecto-1"
+        """The token endpoint does not return the project; losing it here would break every
+        subsequent request with a 400 that does not point back at the refresh."""
+        old = Credential(
+            "google-antigravity", "at-old", refresh_token="rt-old", project_id="project-1"
         )
-        async with client_of(lambda _: token_response(refresh_token="rt-novo")) as client:
-            nova = await refresh(velha, client=client)
+        async with client_of(lambda _: token_response(refresh_token="rt-new")) as client:
+            new = await refresh(old, client=client)
 
-        assert nova.project_id == "projecto-1"
-        assert nova.refresh_token == "rt-novo"
+        assert new.project_id == "project-1"
+        assert new.refresh_token == "rt-new"
 
     async def test_credential_without_project_refuses_to_refresh(self) -> None:
-        """`require "projectId"` da regra do OMP: renovar produziria um token válido e
-        inútil, e o erro só apareceria muito depois."""
+        """`require "projectId"` from the OMP rule: refreshing would produce a valid, useless
+        token, and the error would only surface much later."""
 
         def handler(request: httpx.Request) -> httpx.Response:
-            raise AssertionError("não devia haver pedido")
+            raise AssertionError("there should be no request")
 
         async with client_of(handler) as client:
             with pytest.raises(OAuthError) as excinfo:
@@ -654,8 +666,8 @@ class TestAntigravityRefresh:
         assert "project_id" in str(excinfo.value)
 
     async def test_refresh_sends_the_client_secret(self) -> None:
-        """O Google não aceita o grant sem segredo do cliente; sem ele devolve
-        `invalid_client` e a subscrição fica presa."""
+        """Google does not accept the grant without a client secret; without it it returns
+        `invalid_client` and the subscription gets stuck."""
         seen: list[dict[str, str]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -664,39 +676,40 @@ class TestAntigravityRefresh:
 
         async with client_of(handler) as client:
             await refresh(
-                Credential("google-antigravity", "at", refresh_token="rt", project_id="projecto-1"),
+                Credential("google-antigravity", "at", refresh_token="rt", project_id="project-1"),
                 client=client,
             )
         assert seen[0]["client_secret"].startswith("GOCSPX-")
 
 
 class TestSurvivorsClosed:
-    """Casos que uma primeira volta de mutação mostrou estarem por defender."""
+    """Cases that a first round of mutation showed to be undefended."""
 
     async def test_paid_tier_is_probed_with_the_project_in_the_body(self) -> None:
-        """Sem o `cloudaicompanionProject` no corpo o backend responde só com o tier
-        corrente, e a conta paga passa por gratuita. A segunda chamada não é redundante."""
-        conta = {
-            "cloudaicompanionProject": "projecto-1",
+        """Without the `cloudaicompanionProject` in the body the backend answers with the
+        current tier only, and a paid account passes for a free one. The second call is not
+        redundant."""
+        account = {
+            "cloudaicompanionProject": "project-1",
             "currentTier": {"id": "free-tier"},
             "allowedTiers": [{"id": "free-tier"}],
         }
-        completa = {**conta, "paidTier": {"id": "pago"}}
-        backend = Antigravity(conta, completa, conta, completa)
+        complete_account = {**account, "paidTier": {"id": "paid"}}
+        backend = Antigravity(account, complete_account, account, complete_account)
         async with client_of(backend) as client:
             await complete("google-antigravity", request_for(), "abc", client=client)
 
-        com_projecto = [b for b in backend.bodies if "cloudaicompanionProject" in b]
-        assert com_projecto, "a segunda chamada tem de reenviar o projecto descoberto"
-        assert com_projecto[0]["cloudaicompanionProject"] == "projecto-1"
+        with_project = [b for b in backend.bodies if "cloudaicompanionProject" in b]
+        assert with_project, "the second call has to resend the discovered project"
+        assert with_project[0]["cloudaicompanionProject"] == "project-1"
 
     async def test_onboard_that_never_finishes_gives_up(self) -> None:
-        """`done: false` para sempre tem de falhar; prender a ligação seria pior que um
-        erro, porque nada indicaria ao utilizador que parou."""
-        pendente = {"name": "operations/1", "done": False}
+        """`done: false` forever has to fail; hanging the connection would be worse than an
+        error, because nothing would tell the user it had stopped."""
+        pending = {"name": "operations/1", "done": False}
         backend = Antigravity(
-            {"allowedTiers": [{"id": "free-tier"}], "paidTier": {"id": "pago"}},
-            *[dict(pendente) for _ in range(200)],
+            {"allowedTiers": [{"id": "free-tier"}], "paidTier": {"id": "paid"}},
+            *[dict(pending) for _ in range(200)],
         )
         async with client_of(backend) as client:
             with pytest.raises(OAuthError) as excinfo:
@@ -704,64 +717,64 @@ class TestSurvivorsClosed:
         assert "onboardUser" in str(excinfo.value)
 
     async def test_onboard_done_without_response_is_a_failure(self) -> None:
-        """`done: true` sem `response` é o que o backend devolve quando o provisionamento
-        não se concretizou; tratá-lo como sucesso deixaria a conta sem projecto."""
+        """`done: true` with no `response` is what the backend returns when the provisioning
+        did not go through; treating it as success would leave the account with no project."""
         backend = Antigravity(
-            {"allowedTiers": [{"id": "free-tier"}], "paidTier": {"id": "pago"}},
+            {"allowedTiers": [{"id": "free-tier"}], "paidTier": {"id": "paid"}},
             {"done": True},
         )
         async with client_of(backend) as client:
             with pytest.raises(OAuthError) as excinfo:
                 await complete("google-antigravity", request_for(), "abc", client=client)
-        assert "sem resposta" in str(excinfo.value)
+        assert "without a response" in str(excinfo.value)
 
     async def test_google_error_object_is_not_flattened_to_raw_json(self) -> None:
-        """O Google embrulha a explicação em `error.message`. Devolver o JSON cru é
-        tecnicamente honesto e praticamente inútil: o utilizador não a encontra."""
-        resposta = httpx.Response(
+        """Google wraps the explanation in `error.message`. Returning the raw JSON is
+        technically honest and practically useless: the user does not find it."""
+        response = httpx.Response(
             400,
             json={"error": {"status": "INVALID_ARGUMENT", "message": "redirect_uri inválido"}},
         )
-        async with client_of(lambda _: resposta) as client:
+        async with client_of(lambda _: response) as client:
             with pytest.raises(OAuthError) as excinfo:
                 await complete("google-antigravity", request_for(), "abc", client=client)
         assert "INVALID_ARGUMENT: redirect_uri inválido" in str(excinfo.value)
 
     async def test_eligible_account_ignores_a_stale_ineligibility(self) -> None:
-        """`allowedTiers` com free-tier ganha: uma entrada residual em `ineligibleTiers`
-        não pode bloquear uma conta que o backend já autoriza."""
-        conta = {
-            "cloudaicompanionProject": "projecto-1",
+        """`allowedTiers` containing free-tier wins: a leftover entry in `ineligibleTiers` must
+        not block an account the backend already authorises."""
+        account = {
+            "cloudaicompanionProject": "project-1",
             "currentTier": {"id": "free-tier"},
             "allowedTiers": [{"id": "free-tier"}],
-            "paidTier": {"id": "pago"},
-            "ineligibleTiers": [{"tierId": "free-tier", "reasonMessage": "residual"}],
+            "paidTier": {"id": "paid"},
+            "ineligibleTiers": [{"tierId": "free-tier", "reasonMessage": "leftover"}],
         }
-        backend = Antigravity(conta, conta)
+        backend = Antigravity(account, account)
         async with client_of(backend) as client:
-            credencial = await complete("google-antigravity", request_for(), "abc", client=client)
-        assert credencial.project_id == "projecto-1"
+            credential = await complete("google-antigravity", request_for(), "abc", client=client)
+        assert credential.project_id == "project-1"
 
     async def test_paste_of_only_whitespace_never_reaches_the_network(self) -> None:
-        """Um paste vazio como código produziria um 400 opaco do provedor em vez de dizer
-        ao utilizador que não colou nada."""
+        """An empty paste used as the code would produce an opaque 400 from the provider
+        instead of telling the user they pasted nothing."""
 
         def handler(request: httpx.Request) -> httpx.Response:
-            raise AssertionError("não devia haver pedido")
+            raise AssertionError("there should be no request")
 
         async with client_of(handler) as client:
             with pytest.raises(OAuthError) as excinfo:
                 await complete("anthropic", request_for(), "\n\t ", client=client)
-        assert "nada colado" in str(excinfo.value)
+        assert "nothing pasted" in str(excinfo.value)
 
     async def test_fragment_without_a_code_is_rejected(self) -> None:
-        """`#ST4TE` sozinho passa a verificação do `state` mas não tem código. Deixá-lo
-        seguir mandaria `code=""` ao provedor."""
+        """`#ST4TE` on its own passes the `state` check but carries no code. Letting it
+        through would send `code=""` to the provider."""
 
         def handler(request: httpx.Request) -> httpx.Response:
-            raise AssertionError("não devia haver pedido")
+            raise AssertionError("there should be no request")
 
         async with client_of(handler) as client:
             with pytest.raises(OAuthError) as excinfo:
                 await complete("anthropic", request_for(), "#ST4TE", client=client)
-        assert "código" in str(excinfo.value)
+        assert "authorization code" in str(excinfo.value)

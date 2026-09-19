@@ -1,13 +1,13 @@
-"""Resolução de nomes de modelo do Google Antigravity (Cloud Code API).
+"""Google Antigravity (Cloud Code API) model name resolution.
 
-Este é o único provedor com catálogo consultável: ``:fetchAvailableModels`` devolve o que
-a conta serve, incluindo ``deprecatedModelIds``. Descontar a lista do próprio catálogo é
-melhor que manter uma estática, porque o catálogo anuncia variantes que o
-``streamGenerateContent`` recusa.
+This is the only provider with a queryable catalog: ``:fetchAvailableModels`` returns what
+the account serves, including ``deprecatedModelIds``. Subtracting that list from the
+catalog itself beats maintaining a static one, because the catalog advertises variants
+that ``streamGenerateContent`` refuses.
 
-O mapa estático é o plano B, usado apenas quando o catálogo não respondeu. Serve para não
-deixar a conta inutilizável por uma falha de rede, mas nunca para adivinhar: um nome que
-não corresponde levanta, em vez de ser servido por outro modelo em silêncio.
+The static map is the fallback, used only when the catalog did not answer. It exists so a
+network failure does not render the account unusable, never to guess: a name that does not
+match raises instead of being silently served by another model.
 """
 
 from __future__ import annotations
@@ -16,11 +16,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Final
 
-#: O catálogo anuncia estas variantes, mas o streamGenerateContent devolve
-#: 400 INVALID_ARGUMENT para elas. O omp documenta o mesmo e encaminha para gemini-pro-agent.
+#: The catalog advertises these variants, but streamGenerateContent returns
+#: 400 INVALID_ARGUMENT for them. omp documents the same and routes to gemini-pro-agent.
 BROKEN_WIRE: Final[tuple[str, ...]] = ("gemini-3.1-pro-high", "gemini-3-pro-high")
 
-#: Effort -> sufixo de variante, por ordem de preferência.
+#: Effort -> variant suffix, in order of preference.
 EFFORT_SUFFIXES: Final[dict[str, tuple[str, ...]]] = {
     "none": ("-extra-low", "-low", "", "-tiered"),
     "minimal": ("-extra-low", "-low", "", "-tiered"),
@@ -31,7 +31,7 @@ EFFORT_SUFFIXES: Final[dict[str, tuple[str, ...]]] = {
     "max": ("-high", "-medium", "-low", ""),
 }
 
-#: Famílias sem variante de sufixo utilizável no topo da escala.
+#: Families with no usable suffix variant at the top of the scale.
 EFFORT_OVERRIDES: Final[dict[tuple[str, str], str]] = {
     ("gemini-3.1-pro", "high"): "gemini-pro-agent",
     ("gemini-3.1-pro", "xhigh"): "gemini-pro-agent",
@@ -42,12 +42,12 @@ EFFORT_OVERRIDES: Final[dict[tuple[str, str], str]] = {
     ("gemini-3.5-flash", "max"): "gemini-3-flash-agent",
 }
 
-# Sufixos de variante que se descascam para chegar à família.
+# Variant suffixes that get stripped to reach the family.
 #
-# `-thinking` saiu de propósito: `gemini-2.5-flash-thinking` existe no catálogo e casa
-# pelo nome exacto, enquanto `gemini-3.8-flash-thinking` não existe — descascá-lo fazia um
-# nome inventado ser servido por `-low` em silêncio, exactamente o que tirar essas
-# entradas do config pretendia evitar.
+# `-thinking` was left out on purpose: `gemini-2.5-flash-thinking` exists in the catalog
+# and matches by exact name, while `gemini-3.8-flash-thinking` does not — stripping it made
+# an invented name be silently served by `-low`, exactly what removing those entries from
+# the config was meant to prevent.
 SUFFIXES: Final[tuple[str, ...]] = (
     "-tiered",
     "-extra-low",
@@ -57,9 +57,9 @@ SUFFIXES: Final[tuple[str, ...]] = (
     "-agent",
 )
 
-# Plano B para quando o catálogo não responde. As entradas `-thinking` saíram: não existem
-# no upstream. As `-tiered` existem e apontam para si mesmas, porque descascar um pedido
-# explícito é mentir sobre o que se serviu.
+# Fallback for when the catalog does not answer. The `-thinking` entries were dropped: they
+# do not exist upstream. The `-tiered` ones do exist and map to themselves, because
+# stripping an explicit request is lying about what was served.
 STATIC_MAP: Final[dict[str, str]] = {
     "gemini-3.8-flash-tiered": "gemini-3.8-flash-tiered",
     "gemini-3.8-flash": "gemini-3.8-flash-low",
@@ -80,20 +80,20 @@ CATALOG_TTL_S: Final = 600.0
 
 
 class ModelNotServedError(Exception):
-    """O nome pedido não corresponde a nada que a conta sirva.
+    """The requested name matches nothing the account serves.
 
-    Levantar é deliberado: o wildcard ``gemini-*`` faria qualquer nome inventado responder
-    como ``gemini-2.5-flash``, com o campo ``model`` a ecoar o nome pedido — e a
-    facturação, as comparações e a reprodutibilidade passariam a mentir.
+    Raising is deliberate: a ``gemini-*`` wildcard would make any invented name answer as
+    ``gemini-2.5-flash``, with the ``model`` field echoing the requested name — and
+    billing, comparisons and reproducibility would start to lie.
     """
 
 
 @dataclass(slots=True)
 class ModelCatalog:
-    """Catálogo da conta, com TTL.
+    """The account's catalog, with a TTL.
 
-    Instância em vez de global: dois proxies no mesmo processo teriam contas diferentes, e
-    um cache partilhado serviria o catálogo de um ao outro.
+    An instance rather than a global: two proxies in the same process would have different
+    accounts, and a shared cache would serve one's catalog to the other.
     """
 
     ids: tuple[str, ...] = ()
@@ -106,11 +106,11 @@ class ModelCatalog:
         return ((now if now is not None else time.time()) - self.fetched_at) < CATALOG_TTL_S
 
     def update(self, payload: dict[str, Any], *, now: float | None = None) -> tuple[str, ...]:
-        """Absorve uma resposta de ``:fetchAvailableModels``.
+        """Absorb a ``:fetchAvailableModels`` response.
 
-        O catálogo lista variantes que já não respondem e marca-as em
-        ``deprecatedModelIds`` — é assim que ``gemini-3.1-pro-high`` aparece servido e
-        devolve 400.
+        The catalog lists variants that no longer answer and flags them in
+        ``deprecatedModelIds`` — that is how ``gemini-3.1-pro-high`` shows up as served and
+        returns 400.
         """
         models = payload.get("models") or {}
         deprecated = {str(x).lower() for x in (payload.get("deprecatedModelIds") or [])}
@@ -123,7 +123,7 @@ class ModelCatalog:
 
 
 def base_family(model: str) -> str:
-    """Nome sem o sufixo de variante: ``gemini-3.8-flash-low`` -> ``gemini-3.8-flash``."""
+    """Name without the variant suffix: ``gemini-3.8-flash-low`` -> ``gemini-3.8-flash``."""
     base = str(model).split("/")[-1].lower()
     for suffix in SUFFIXES:
         if base.endswith(suffix):
@@ -136,9 +136,9 @@ def supports_function_ids(model: str) -> bool:
 
 
 def _from_catalog(raw: str, effort: str, available: tuple[str, ...]) -> str | None:
-    # Se o nome pedido *for* uma variante servida, respeita-se: pedir
-    # `gemini-3.8-flash-tiered` (real no catálogo) não pode acabar em `-low` porque o
-    # effort assim decidiu. Antes o sufixo era sempre descascado e o pedido perdia-se.
+    # If the requested name *is* a served variant, honour it: asking for
+    # `gemini-3.8-flash-tiered` (real in the catalog) must not end up at `-low` just because
+    # effort said so. The suffix used to be stripped unconditionally and the request was lost.
     if raw in available and raw not in BROKEN_WIRE:
         return raw
 
@@ -159,9 +159,9 @@ def _from_catalog(raw: str, effort: str, available: tuple[str, ...]) -> str | No
 def _from_static_map(raw: str) -> str | None:
     if raw in STATIC_MAP:
         return STATIC_MAP[raw]
-    # Correspondência parcial só quando o que sobra é um sufixo de variante conhecido. Com
-    # `if k in raw` cru, `gemini-3.8-flash` casava dentro de `gemini-3.8-flash-thinking` e
-    # servia `-low` para um nome que não existe.
+    # Partial match only when what is left over is a known variant suffix. With a raw
+    # `if k in raw`, `gemini-3.8-flash` matched inside `gemini-3.8-flash-thinking` and
+    # served `-low` for a name that does not exist.
     for known, wire in STATIC_MAP.items():
         if not raw.startswith(known):
             continue
@@ -173,7 +173,7 @@ def _from_static_map(raw: str) -> str | None:
 
 # omp: providers/google-gemini-cli.ts :: lastGoodEndpoint
 def map_model(model: str, effort: str | None = None, catalog: ModelCatalog | None = None) -> str:
-    """Nome que vai no fio. Levanta ``ModelNotServedError`` se nada corresponder."""
+    """Name that goes on the wire. Raises ``ModelNotServedError`` if nothing matches."""
     raw = str(model).split("/")[-1].lower()
     normalized_effort = str(effort or "medium").strip().lower() or "medium"
 
@@ -186,6 +186,6 @@ def map_model(model: str, effort: str | None = None, catalog: ModelCatalog | Non
         return resolved
 
     raise ModelNotServedError(
-        f"Google Antigravity: modelo '{raw}' não é servido por esta conta "
-        f"(nenhuma variante corresponde no catálogo nem no mapa estático)"
+        f"Google Antigravity: model '{raw}' is not served by this account "
+        f"(no variant matches in the catalog or in the static map)"
     )

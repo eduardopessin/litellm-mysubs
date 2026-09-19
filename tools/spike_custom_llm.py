@@ -1,16 +1,16 @@
-"""Reverifica a decisão D1: o `CustomLLM` oficial preserva o usage do provider?
+"""Rechecks decision D1: does the official `CustomLLM` preserve the provider's usage?
 
-Ver `docs/DECISIONS.md`. A resposta em 2026-09-18 foi **não** — o usage reportado é
-substituído por uma estimativa do `token_counter` e os cache hits desaparecem. Enquanto
-isso for verdade, os geradores de streaming têm de ficar em monkey-patch.
+See `docs/DECISIONS.md`. The answer on 2026-09-18 was **no** — the reported usage is
+replaced by a `token_counter` estimate and the cache hits disappear. While that holds, the
+streaming generators have to stay in a monkey-patch.
 
     python tools/spike_custom_llm.py
 
-Sai com 0 se a limitação se mantém (nada a fazer) e com 1 se **deixou de existir** — nesse
-caso a decisão D1 pode ser reaberta e o monkey-patch encolhido.
+Exits 0 if the limitation still holds (nothing to do) and 1 if it is **gone** — in which
+case D1 can be reopened and the monkey-patch shrunk.
 
-Não é um teste do pytest: mexe em estado global do LiteLLM (`custom_provider_map`), o que
-o torna hostil a correr ao lado de outros testes.
+Not a pytest test: it mutates LiteLLM global state (`custom_provider_map`), which makes it
+hostile to running alongside other tests.
 """
 
 from __future__ import annotations
@@ -29,10 +29,10 @@ try:
         Usage,
     )
 except ImportError:
-    raise SystemExit("litellm não instalado: pip install 'litellm[proxy]'") from None
+    raise SystemExit("litellm is not installed: pip install 'litellm[proxy]'") from None
 
-#: Valores que o handler reporta. Distintos de qualquer estimativa plausível para um
-#: prompt de duas palavras, para não haver coincidência.
+#: Values the handler reports. Distinct from any plausible estimate for a two-word prompt,
+#: so a match cannot be a coincidence.
 REPORTED_PROMPT = 100
 REPORTED_COMPLETION = 5
 REPORTED_CACHED = 80
@@ -49,7 +49,7 @@ def _usage() -> Usage:
 
 
 class Probe(CustomLLM):
-    """Handler mínimo: emite reasoning, conteúdo e um chunk final com usage."""
+    """Minimal handler: emits reasoning, content, and a final chunk carrying usage."""
 
     async def astreaming(self, *args: Any, **kwargs: Any) -> Any:
         yield ModelResponseStream(
@@ -66,7 +66,7 @@ class Probe(CustomLLM):
             id="spike",
             created=1,
             model="probe",
-            choices=[StreamingChoices(index=0, delta=Delta(content="Olá"), finish_reason=None)],
+            choices=[StreamingChoices(index=0, delta=Delta(content="Hi"), finish_reason=None)],
         )
         yield ModelResponseStream(
             id="spike",
@@ -109,22 +109,22 @@ async def run() -> int:
     from importlib.metadata import version
 
     print(f"litellm {version('litellm')}")
-    print(f"  reasoning_content preservado: {'sim' if reasoning_ok else 'NÃO'}")
+    print(f"  reasoning_content preserved: {'yes' if reasoning_ok else 'NO'}")
     print(
-        f"  usage do provider preservado: {'sim' if usage_ok else 'NÃO'}"
-        f"  (reportado {REPORTED_PROMPT}/{REPORTED_COMPLETION},"
-        f" recebido {got_prompt}/{got_completion})"
+        f"  provider usage preserved: {'yes' if usage_ok else 'NO'}"
+        f"  (reported {REPORTED_PROMPT}/{REPORTED_COMPLETION},"
+        f" received {got_prompt}/{got_completion})"
     )
     print(
-        f"  cached_tokens preservado: {'sim' if cached_ok else 'NÃO'}"
-        f"  (reportado {REPORTED_CACHED}, recebido {cached})"
+        f"  cached_tokens preserved: {'yes' if cached_ok else 'NO'}"
+        f"  (reported {REPORTED_CACHED}, received {cached})"
     )
     print()
 
     if usage_ok and cached_ok:
-        print("A limitação de D1 DEIXOU DE EXISTIR — a decisão pode ser reaberta.")
+        print("The D1 limitation is GONE — the decision can be reopened.")
         return 1
-    print("A limitação de D1 mantém-se: o streaming fica em monkey-patch.")
+    print("The D1 limitation still holds: streaming stays in a monkey-patch.")
     return 0
 
 

@@ -1,13 +1,14 @@
-"""Quem pode mexer nas subscrições.
+"""Who is allowed to touch the subscriptions.
 
-A página liga contas pessoais e injecta modelos no Router: é administração, não consulta.
-Usa-se a autenticação que o proxy já tem — `user_api_key_auth`, a mesma dependência de
-`/v1/models` e das rotas de gestão — em vez de inventar uma.
+The page connects personal accounts and injects models into the Router: that is
+administration, not consultation. It uses the authentication the proxy already has —
+`user_api_key_auth`, the same dependency as `/v1/models` and the management routes —
+instead of inventing one.
 
-Exige-se `proxy_admin` estrito. O `allowed_route_check_inside_route` do LiteLLM aceita
-também `proxy_admin_viewer`, o que está certo para ler listas e errado aqui: um papel de
-leitura não deve poder iniciar um fluxo OAuth que associa a subscrição pessoal de alguém à
-instalação, nem alterar que modelos o Router serve.
+Strict `proxy_admin` is required. LiteLLM's `allowed_route_check_inside_route` also accepts
+`proxy_admin_viewer`, which is right for reading lists and wrong here: a read-only role must
+not be able to start an OAuth flow that ties somebody's personal subscription to the
+installation, nor change which models the Router serves.
 """
 
 from __future__ import annotations
@@ -15,40 +16,42 @@ from __future__ import annotations
 import os
 from typing import Any
 
-#: Desliga a guarda. Existe porque a alternativa é pior: sem escape, quem corre o proxy
-#: sem base de dados de chaves — e portanto sem forma de ter um `proxy_admin` — ficaria de
-#: fora e acabaria a montar a sub-app à mão, sem guarda nenhuma e sem o saber.
+#: Turns the guard off. It exists because the alternative is worse: with no escape hatch,
+#: whoever runs the proxy without a key database — and therefore with no way to have a
+#: `proxy_admin` — would be locked out and would end up mounting the sub-app by hand, with
+#: no guard at all and without knowing it.
 #:
-#: O nome diz o que faz. Ninguém escreve isto por engano.
+#: The name says what it does. Nobody writes this by accident.
 OPT_OUT_ENV = "MYSUBS_DISABLE_AUTH"
 
-#: Papel exigido. Escrito à mão em vez de importado: `LitellmUserRoles` vive em
-#: `litellm.proxy._types`, um módulo privado, e o valor é estável na API pública do proxy.
+#: The required role. Written out by hand instead of imported: `LitellmUserRoles` lives in
+#: `litellm.proxy._types`, a private module, and the value is stable in the proxy's public
+#: API.
 ADMIN_ROLE = "proxy_admin"
 
 
-#: Nome do cookie de sessão da UI do LiteLLM.
+#: Name of the LiteLLM UI session cookie.
 SESSION_COOKIE = "token"
 
 
 class AuthUnavailableError(RuntimeError):
-    """O proxy não expõe a dependência de autenticação."""
+    """The proxy does not expose the authentication dependency."""
 
 
 def session_user(request: Any) -> Any | None:
-    """O utilizador a partir do cookie de sessão da UI, ou `None`.
+    """The user from the UI session cookie, or `None`.
 
-    O `user_api_key_auth` só lê cabeçalhos — verificado, não há uma única referência a
-    cookies nesse módulo. A dashboard contorna isso lendo o cookie por `document.cookie` e
-    construindo o `Authorization` em JavaScript (o cookie é deliberadamente **não**
-    HttpOnly por essa razão).
+    `user_api_key_auth` only reads headers — verified, there is not a single reference to
+    cookies in that module. The dashboard works around it by reading the cookie through
+    `document.cookie` and building the `Authorization` in JavaScript (the cookie is
+    deliberately **not** HttpOnly for that reason).
 
-    Uma página servida fora da SPA não faz nada disso: o browser envia o cookie e mais
-    nada, e o pedido era recusado com 401 mesmo vindo de uma sessão de administrador
-    válida. Era o que acontecia ao abrir o MySubs pelo menu.
+    A page served outside the SPA does none of that: the browser sends the cookie and
+    nothing else, and the request was refused with 401 even coming from a valid
+    administrator session. That is what happened when opening MySubs from the menu.
 
-    O JWT é HS256 assinado com a `master_key` (`auth/login_utils.py ::
-    encode_ui_session_jwt`), portanto pode ser validado aqui sem tocar na base de dados.
+    The JWT is HS256 signed with the `master_key` (`auth/login_utils.py ::
+    encode_ui_session_jwt`), so it can be validated here without touching the database.
     """
     raw = None
     cookies = getattr(request, "cookies", None)
@@ -60,7 +63,7 @@ def session_user(request: Any) -> Any | None:
     try:
         import jwt
         from litellm.proxy.proxy_server import master_key
-    except ImportError:  # pragma: no cover - depende do ambiente do proxy
+    except ImportError:  # pragma: no cover - depends on the proxy environment
         return None
     if not master_key:
         return None
@@ -68,8 +71,8 @@ def session_user(request: Any) -> Any | None:
     try:
         claims = jwt.decode(raw, master_key, algorithms=["HS256"])
     except Exception:
-        # Assinatura inválida ou expirada é ausência de sessão, não erro a propagar: o
-        # caminho normal segue para o `user_api_key_auth`, que dá a mensagem certa.
+        # An invalid or expired signature is an absent session, not an error to propagate:
+        # the normal path goes on to `user_api_key_auth`, which gives the right message.
         return None
 
     from types import SimpleNamespace
@@ -93,51 +96,53 @@ def _forbidden(detail: str) -> Exception:
 
 
 def require_admin(user: Any) -> Any:
-    """Deixa passar só um administrador do proxy.
+    """Lets only a proxy administrator through.
 
-    Recebe o que o `user_api_key_auth` devolve. Um papel em falta é recusa, não omissão
-    tolerada: uma chave sem papel atribuído não é prova de privilégio.
+    It takes what `user_api_key_auth` returns. A missing role is a refusal, not a tolerated
+    omission: a key with no role assigned is no proof of privilege.
     """
     role = getattr(user, "user_role", None)
     value = getattr(role, "value", role)
     if value != ADMIN_ROLE:
         raise _forbidden(
-            "MySubs é só para administradores do proxy: liga subscrições pessoais e "
-            f"altera os modelos servidos. Papel actual: {value or 'nenhum'}."
+            "MySubs is for proxy admins only: it connects personal subscriptions and "
+            f"changes the models being served. Current role: {value or 'none'}."
         )
     return user
 
 
 def admin_dependency() -> Any:
-    """A dependência a pôr na sub-app, ou `None` quando a guarda está desligada.
+    """The dependency to put on the sub-app, or `None` when the guard is turned off.
 
-    Levanta se o proxy não tiver `user_api_key_auth` — montar sem guarda e sem avisar seria
-    exactamente o modo de falha que esta função existe para evitar.
+    It raises if the proxy has no `user_api_key_auth` — mounting with no guard and no
+    warning would be exactly the failure mode this function exists to prevent.
     """
     if auth_disabled():
         return None
 
     try:
         import litellm.proxy.auth.user_api_key_auth  # noqa: F401
-    except ImportError as error:  # pragma: no cover - depende da versão do proxy
+    except ImportError as error:  # pragma: no cover - depends on the proxy version
         raise AuthUnavailableError(
-            "o LiteLLM instalado não expõe `user_api_key_auth`: actualiza o proxy ou "
-            f"define {OPT_OUT_ENV}=1 se a instalação for de confiança"
+            "the installed LiteLLM does not expose `user_api_key_auth`: upgrade the "
+            f"proxy, or set {OPT_OUT_ENV}=1 if the installation is trusted"
         ) from error
 
     from fastapi import Depends, Request
 
     async def cookie_first(request: Request) -> Any:
-        """Tenta o cookie; só pede a chave se não houver sessão.
+        """Tries the cookie; only asks for the key when there is no session.
 
-        O `user_api_key_auth` **só lê cabeçalhos** — verificado, nem uma referência a
-        cookies nesse módulo. A dashboard contorna-o lendo o cookie por `document.cookie` e
-        construindo o `Authorization` em JavaScript (por isso o cookie não é HttpOnly). Uma
-        página servida fora da SPA não faz nada disso: o browser envia o cookie e mais
-        nada, e uma sessão de administrador válida era recusada com 401.
+        `user_api_key_auth` **only reads headers** — verified, not one reference to cookies
+        in that module. The dashboard works around it by reading the cookie through
+        `document.cookie` and building the `Authorization` in JavaScript (which is why the
+        cookie is not HttpOnly). A page served outside the SPA does none of that: the
+        browser sends the cookie and nothing else, and a valid administrator session was
+        refused with 401.
 
-        Quando há sessão, a dependência da chave **não** é resolvida: declará-la sempre
-        faria o `user_api_key_auth` correr e levantar em quem só traz cookie.
+        When there is a session, the key dependency is **not** resolved: declaring it
+        unconditionally would make `user_api_key_auth` run and raise for whoever brings only
+        a cookie.
         """
         user = session_user(request)
         if user is not None:
@@ -146,25 +151,26 @@ def admin_dependency() -> Any:
 
     cookie_first.__annotations__["request"] = Request
 
-    # `from __future__ import annotations` torna as anotações strings, e o FastAPI não as
-    # resolve numa função aninhada: sem repor, ele lia `request: "Request"` como parâmetro
-    # de query e respondia 422 `Field required` a todos os pedidos.
+    # `from __future__ import annotations` turns the annotations into strings, and FastAPI
+    # does not resolve them in a nested function: without restoring it, it read
+    # `request: "Request"` as a query parameter and answered 422 `Field required` to every
+    # request.
     return Depends(cookie_first)
 
 
-#: Mensagem única da recusa por ausência de credencial.
+#: The single refusal message for a missing credential.
 _NO_CREDENTIALS = (
-    "MySubs precisa de sessão de administrador na UI do LiteLLM, "
-    "ou de uma chave de administrador no cabeçalho Authorization."
+    "MySubs needs an admin session in the LiteLLM UI, "
+    "or an admin key in the Authorization header."
 )
 
 
 async def _resolve_key_user(request: Any) -> Any:
-    """O utilizador da chave, resolvendo as dependências do proxy como o FastAPI faz.
+    """The key's user, resolving the proxy's dependencies the way FastAPI does.
 
-    `solve_dependencies` é o que preenche os `Security(...)`; sem ele a chamada directa
-    rebenta. Não é elegante, mas é o que permite tratar a ausência de chave como um caso
-    normal em vez de uma excepção — e o cookie precisa disso para ter a sua vez.
+    `solve_dependencies` is what fills in the `Security(...)`; without it the direct call
+    blows up. It is not elegant, but it is what allows treating an absent key as a normal
+    case instead of an exception — and the cookie needs that to get its turn.
     """
     from contextlib import AsyncExitStack
 
@@ -187,8 +193,8 @@ async def _resolve_key_user(request: Any) -> Any:
         except HTTPException:
             raise
         except Exception as error:
-            # "No api key passed in." é o caso normal de quem abre a página sem
-            # credencial; o proxy levanta-o como `Exception` simples, e deixá-lo subir dava
-            # 500 numa recusa perfeitamente esperada.
+            # "No api key passed in." is the normal case for whoever opens the page with no
+            # credential; the proxy raises it as a plain `Exception`, and letting it climb
+            # gave a 500 on a perfectly expected refusal.
             raise HTTPException(status_code=401, detail=str(error) or _NO_CREDENTIALS) from error
     return require_admin(user)

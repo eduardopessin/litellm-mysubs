@@ -5,8 +5,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Called by `publish.yml`: what gets published goes through the same gates.
+  workflow_call:
 
-# Sem isto, um push novo deixa o anterior a correr e a competir por runners.
+# Without this, a new push leaves the previous one running and competing for runners.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -15,7 +17,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
-      # Uma versão partida não deve esconder o estado das outras.
+      # One broken version must not hide the state of the others.
       fail-fast: false
       matrix:
         python: ["3.11", "3.12", "3.13"]
@@ -30,28 +32,28 @@ jobs:
       - name: mypy
         run: mypy
       - name: pytest
-        # --cov-fail-under vem do pyproject: cobertura a cair fica vermelha.
+        # --cov-fail-under comes from pyproject: falling coverage goes red.
         run: pytest --cov=litellm_mysubs --cov-report=term-missing
 
-  # O plugin corre dentro da imagem de outra pessoa e toca em internals do LiteLLM.
-  # Este job é o que transforma um upgrade silenciosamente incompatível em CI vermelho,
-  # em vez de numa avaria em produção.
+  # The plugin runs inside someone else's image and touches LiteLLM internals.
+  # This job is what turns a silently incompatible upgrade into a red CI run,
+  # instead of a production outage.
   litellm-contract:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # A versao fixada e a que a instalacao de referencia corre; "latest" apanha
-        # incompatibilidades antes de elas chegarem la.
+        # The pinned version is the one the reference installation runs; "latest" catches
+        # incompatibilities before they reach it.
         litellm: ["1.101.0", "latest"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: instalar litellm ${{ matrix.litellm }}
-        # Os extras do proxy são precisos: route_llm_request importa fastapi, e é aí que
-        # a rota /v1/responses é apanhada.
+      - name: install litellm ${{ matrix.litellm }}
+        # The proxy extras are required: route_llm_request imports fastapi, and that is
+        # where the /v1/responses route is intercepted.
         run: |
           pip install -e ".[dev]"
           if [ "${{ matrix.litellm }}" = "latest" ]; then
@@ -59,12 +61,14 @@ jobs:
           else
             pip install "litellm[proxy]==${{ matrix.litellm }}"
           fi
-      - name: símbolos de que o patch depende
-        # Sem --no-cov: este job corre um subconjunto e o gate de cobertura é do job test.
+      - name: symbols the patch depends on
+        # No --no-cov: this job runs a subset and the coverage gate belongs to the test job.
         run: pytest tests/test_litellm_contract.py -v --no-cov
 
-  # O wiring é do OMP. Um rename do lado deles deixa as âncoras `# omp:` a apontar para
-  # nada, e ninguém dá por isso até alguém tentar seguir uma.
+  # The wiring comes from OMP. A rename on their side leaves the `# omp:` anchors pointing
+  # at nothing, and the `# omp=` ones catch the worse case: the name stays and the **value**
+  # changes - an endpoint path, a client id, a pinned client version. Nothing breaks at
+  # import time then; it breaks in production, against upstream, with CI green.
   omp-anchors:
     runs-on: ubuntu-latest
     steps:
@@ -75,7 +79,7 @@ jobs:
       - run: python tools/check_omp_drift.py
 
   build:
-    # Um artefacto construído à mão esconde um pipeline morto. O que se publica é o do CI.
+    # A hand-built artifact hides a dead pipeline. What gets published is what CI built.
     needs: [test, litellm-contract, omp-anchors]
     runs-on: ubuntu-latest
     steps:

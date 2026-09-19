@@ -1,39 +1,47 @@
-"""Arranque do plugin, por um `CustomLogger` que o `config.yaml` carrega.
+"""Plugin startup, through a `CustomLogger` that `config.yaml` loads.
 
-## Porque não um `.pth` com hook de importação
+## Why not a `.pth` with an import hook
 
-A primeira versão deste módulo registava um finder em `sys.meta_path` a partir de um
-ficheiro `.pth`, para reagir à importação do proxy. Foi medido e abandonado:
+The first version of this module registered a finder in `sys.meta_path` from a `.pth` file,
+so as to react to the proxy being imported. It was measured and abandoned:
 
-    finder que levanta em meta_path[0]  ->  `import secrets` rebenta com RuntimeError
+    finder that raises at meta_path[0]  ->  `import secrets` blows up with RuntimeError
 
-Um `.pth` corre em **todos** os processos Python do ambiente, e um finder em `meta_path[0]`
-vê **todos** os imports. Um defeito nele não parte o plugin — parte o interpretador, para
-`pip`, `pytest` e qualquer script no mesmo ambiente, com o erro a aparecer antes de existir
-qualquer log. Para um pacote cujo objectivo é acrescentar modelos, é risco desproporcionado.
+A `.pth` runs in **every** Python process in the environment, and a finder at
+`meta_path[0]` sees **every** import. A defect in it does not break the plugin — it breaks
+the interpreter, for `pip`, `pytest` and any script in the same environment, with the error
+showing up before any log exists. For a package whose purpose is to add models, that risk
+is out of proportion.
 
-## O que se faz em vez disso
+## What is done instead
 
-`MySubs` é um `litellm.integrations.custom_logger.CustomLogger`, a extensão que o LiteLLM
-documenta. Entra por uma linha no `config.yaml`:
+`MySubs` is a `litellm.integrations.custom_logger.CustomLogger`, the extension LiteLLM
+documents. It goes in as one line in `config.yaml`:
 
     litellm_settings:
       callbacks: ["litellm_mysubs.MySubs"]
 
-O proxy instancia-o durante o arranque, dentro do fluxo dele. Consequências:
+The proxy instantiates it during startup, inside its own flow. Consequences:
 
-- **Não se toca no roteamento existente.** Os deployments do `config.yaml` não são lidos,
-  reordenados nem substituídos. `ModelRegistry.apply` preserva tudo o que não tenha
-  `model_info.managed_by == "mysubs"`, e esta é a única marca que o plugin escreve.
-- **O patch só se aplica se houver o que servir.** Sem credenciais ligadas e sem modelos
-  aplicados, `install()` não corre: o pacote fica presente e inerte.
-- **Desinstalar é apagar a linha.** Sem ficheiros no `site-packages` a caçar.
+- **Existing routing is untouched.** The `config.yaml` deployments are not read, reordered
+  or replaced. `ModelRegistry.apply` preserves everything without
+  `model_info.managed_by == "mysubs"`, and that is the only mark the plugin writes.
+- **The patch is applied only if there is something to serve.** With no connected
+  credentials and no applied models, `install()` does not run: the package is present and
+  inert.
+- **Uninstalling is deleting the line.** No files in `site-packages` to hunt down.
 
-## E a UI
+## And the UI
 
-Montada em `/mysubs` no primeiro pedido, por `app.mount()` — a mesma via que o proxy usa
-para `/ui` e `/swagger`. Montar é acrescentar um prefixo novo; nenhuma rota existente muda
-de destino.
+Mounted at `/mysubs` at startup, by `app.mount()` — the same route the proxy uses for `/ui`
+and `/swagger`. Mounting adds a new prefix; no existing route changes destination.
+
+The moment is the construction of the `CustomLogger`, which the proxy does **inside**
+`proxy_startup_event`, before the `yield` that opens the server to traffic. Measured: by
+the end of the lifespan the callback already exists and `llm_router` is already ready. The
+previous version mounted on the first `async_pre_call_hook`, and that left `/mysubs`
+answering 404 until someone made an inference request — a 404 that teaches nothing to
+whoever restarted the proxy and opened the page first.
 """
 
 from __future__ import annotations
@@ -42,12 +50,19 @@ import os
 import threading
 from typing import Any, Final
 
-#: Desliga tudo sem editar o `config.yaml`. Existe para quando o plugin é o suspeito de um
-#: problema: uma variável de ambiente é mais rápida e reversível do que desinstalar.
+#: Turns everything off without editing `config.yaml`. It exists for when the plugin is the
+#: suspect in a problem: an environment variable is faster and more reversible than
+#: uninstalling.
 DISABLE_ENV: Final = "MYSUBS_DISABLE"
 
-#: Prefixo onde a UI é montada.
-UI_PATH: Final = "/mysubs"
+
+#: Prefix where the UI is mounted. Resolved late, not at import: it is `ui/app.py` that
+#: decides it from the environment, and importing it here at the top would drag FastAPI
+#: into a module that has to be importable without it.
+def ui_path() -> str:
+    from .ui.app import mount_path
+
+    return mount_path()
 
 
 def disabled(environ: dict[str, str] | None = None) -> bool:
@@ -56,10 +71,10 @@ def disabled(environ: dict[str, str] | None = None) -> bool:
 
 
 class Bootstrap:
-    """Aplica o plugin uma só vez, e regista o que correu.
+    """Applies the plugin exactly once, and records what happened.
 
-    Separado do `CustomLogger` para ser testável sem o LiteLLM: o que aqui está é a decisão
-    de *se* e *o quê*, não o encaixe no proxy.
+    Separate from the `CustomLogger` so it is testable without LiteLLM: what lives here is
+    the decision of *whether* and *what*, not the fit into the proxy.
     """
 
     def __init__(self) -> None:
@@ -69,48 +84,49 @@ class Bootstrap:
         self.error = ""
         self._lock = threading.Lock()
 
-    # -- decisão ---------------------------------------------------------------
+    # -- decision ----------------------------------------------------------------
 
     def should_patch(self, store: Any) -> bool:
-        """Se vale a pena mexer no caminho dos pedidos.
+        """Whether it is worth touching the request path.
 
-        Sem nenhuma subscrição ligada não há modelo de subscrição para servir, e o patch só
-        acrescentaria um wrapper que delega sempre no original. Um plugin instalado e sem
-        credenciais tem de ser indistinguível de um plugin ausente.
+        With no subscription connected there is no subscription model to serve, and the
+        patch would only add a wrapper that always delegates to the original. An installed
+        plugin with no credentials has to be indistinguishable from an absent one.
         """
         try:
             return any(store.get(provider) is not None for provider in _providers())
         except Exception:
-            # Um store ilegível não é prova de que há credenciais.
+            # An unreadable store is no proof that credentials exist.
             return False
 
-    # -- aplicação -------------------------------------------------------------
+    # -- application -------------------------------------------------------------
 
     def _inject_menu(self, app: Any) -> None:
-        """Acrescenta o item ao menu do LiteLLM. Falhar aqui não é falhar.
+        """Adds the item to LiteLLM's menu. Failing here is not a failure.
 
-        A página funciona por URL directo; o botão é conveniência. O chunk da UI tem um
-        nome que é hash de build, e uma versão nova do LiteLLM pode não ser reconhecida —
-        nesse caso regista-se a razão e segue-se.
+        The page works by direct URL; the button is a convenience. The UI chunk has a name
+        that is a build hash, and a new LiteLLM version may go unrecognized — in that case
+        the reason is recorded and the run continues.
         """
         try:
             self.menu = _inject_menu_impl(app)
         except Exception as error:
-            self.menu = f"não injectado: {type(error).__name__}: {error}"
+            self.menu = f"not injected: {type(error).__name__}: {error}"
 
     def patch(self, store: Any) -> bool:
-        """Aplica o monkey-patch se houver subscrição ligada. Idempotente."""
+        """Applies the monkey-patch if a subscription is connected. Idempotent."""
         with self._lock:
             if self.patched or disabled() or not self.should_patch(store):
                 return False
             try:
                 from . import plugin
 
-                # Sem isto o plugin não tem de onde tirar a credencial: `_access_token`
-                # devolve "" e o pedido sai com `Authorization: Bearer `, que o httpx
-                # recusa com `Illegal header value b'Bearer '`. O `install()` sozinho põe
-                # o patch e deixa-o inútil — e o sintoma aparece longe da causa, no cliente
-                # do provedor.
+                # Without this the plugin has nowhere to get the credential from:
+                # `_access_token` returns "" and the request goes out with
+                # `Authorization: Bearer `, which httpx refuses with
+                # `Illegal header value b'Bearer '`. `install()` on its own applies the
+                # patch and leaves it useless — and the symptom shows up far from the
+                # cause, in the provider's client.
                 plugin.configure(store=store)
                 plugin.install()
                 self.patched = True
@@ -120,15 +136,15 @@ class Bootstrap:
                 return False
 
     def mount(self, app: Any, store: Any) -> bool:
-        """Monta a UI. Idempotente, e nunca sobre um prefixo já ocupado."""
+        """Mounts the UI. Idempotent, and never over an already occupied prefix."""
         with self._lock:
             if self.mounted or disabled():
                 return False
             try:
-                if _already_mounted(app, UI_PATH):
-                    # Outro processo ou uma montagem manual chegaram primeiro. Montar por
-                    # cima criaria duas sub-apps no mesmo prefixo, com a segunda a apanhar
-                    # os pedidos e a primeira a ficar inalcançável.
+                if _already_mounted(app, ui_path()):
+                    # Another process or a manual mount got there first. Mounting on top
+                    # would create two sub-apps on the same prefix, with the second
+                    # catching the requests and the first left unreachable.
                     self.mounted = True
                     return False
                 from .ui.install import install as install_ui

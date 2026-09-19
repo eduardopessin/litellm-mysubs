@@ -1,19 +1,19 @@
-"""`mysubs-setup` — liga o plugin ao LiteLLM que já está instalado.
+"""`mysubs-setup` — connects the plugin to the LiteLLM that is already installed.
 
-Uma execução, sem editar YAML à mão. O que faz:
+One run, with no YAML edited by hand. What it does:
 
-1. encontra o `litellm` do ambiente e o `config.yaml` que ele usa;
-2. acrescenta `litellm_mysubs.MySubs` a `litellm_settings.callbacks`;
-3. diz o URL da página.
+1. finds the environment's `litellm` and the `config.yaml` it uses;
+2. adds `litellm_mysubs.MySubs` to `litellm_settings.callbacks`;
+3. prints the page's URL.
 
-O que **não** faz, de propósito:
+What it does **not** do, on purpose:
 
-- não toca em `model_list`, `router_settings` nem `general_settings` — o roteamento que já
-  existe não é negócio deste instalador;
-- não reescreve o ficheiro sem uma cópia de segurança ao lado;
-- não instala nada no `site-packages` (nem `.pth` nem `sitecustomize.py`): desinstalar é
-  apagar uma linha, e um plugin que se enxerta no interpretador é difícil de remover e
-  fácil de culpar quando outra coisa parte.
+- it does not touch `model_list`, `router_settings` or `general_settings` — the routing that
+  already exists is none of this installer's business;
+- it does not rewrite the file without leaving a backup copy beside it;
+- it installs nothing into `site-packages` (no `.pth`, no `sitecustomize.py`): uninstalling
+  is deleting one line, and a plugin grafted into the interpreter is hard to remove and easy
+  to blame when something else breaks.
 """
 
 from __future__ import annotations
@@ -25,25 +25,25 @@ import sys
 from pathlib import Path
 from typing import Any
 
-#: A instância, não a classe: o proxy recusa uma classe com `ValueError` no arranque.
+#: The instance, not the class: the proxy refuses a class with `ValueError` at startup.
 CALLBACK_PATH = "litellm_mysubs.proxy_handler_instance"
 
-#: O item de menu é injectado num chunk que o Next.js serve com `max-age` de um ano e
-#: `immutable`. Uma entrada já em cache não volta ao servidor, por isso o `no-store` da
-#: resposta nova nunca chega a ser lido: quem já usou a UI antes de instalar continua a
-#: receber o bundle antigo, sem o botão.
+#: The menu item is injected into a chunk that Next.js serves with a one-year `max-age` and
+#: `immutable`. An already cached entry never goes back to the server, so the new response's
+#: `no-store` is never read: whoever used the UI before installing keeps getting the old
+#: bundle, without the button.
 #:
-#: Podia patchar-se também o `index.html` para mudar o URL do script, mas isso é mais um
-#: ficheiro gerado a acompanhar em cada versão do LiteLLM. Uma limpeza de cache, uma vez
-#: por instalação, custa menos do que essa manutenção.
+#: `index.html` could be patched too, to change the script's URL, but that is one more
+#: generated file to track on every LiteLLM version. One cache clear, once per installation,
+#: costs less than that maintenance.
 CACHE_HINT = (
-    "Se o item não aparecer no menu, limpa a cache do browser (Ctrl+Shift+R):\n"
-    "  a UI guarda os chunks por um ano e o teu ainda é o de antes da instalação.\n"
-    "  A página funciona na mesma em <url-do-proxy>/mysubs."
+    "If the item does not show up in the menu, clear the browser cache (Ctrl+Shift+R):\n"
+    "  the UI keeps chunks for a year and yours is still the one from before the install.\n"
+    "  The page works either way at <proxy-url>/mysubs."
 )
 
-#: Sítios onde um `config.yaml` costuma estar, por ordem de probabilidade. A variável de
-#: ambiente ganha porque é o que o container define.
+#: Places a `config.yaml` usually lives, in order of likelihood. The environment variable
+#: wins because it is what the container sets.
 CANDIDATES: tuple[str, ...] = (
     "config.yaml",
     "config.yml",
@@ -54,7 +54,7 @@ CANDIDATES: tuple[str, ...] = (
 
 
 def find_litellm() -> tuple[str, str] | None:
-    """`(versão, caminho)` do LiteLLM instalado, ou `None`."""
+    """`(version, path)` of the installed LiteLLM, or `None`."""
     try:
         import litellm
     except ImportError:
@@ -64,15 +64,15 @@ def find_litellm() -> tuple[str, str] | None:
 
         installed = version("litellm")
     except Exception:
-        installed = "desconhecida"
+        installed = "unknown"
     return installed, str(Path(litellm.__file__).parent)
 
 
 def find_config(explicit: str | None = None) -> Path | None:
-    """O `config.yaml` em uso.
+    """The `config.yaml` in use.
 
-    Não se adivinha quando há dúvida: sem candidato encontrado devolve-se `None` e o
-    utilizador indica o caminho. Escrever no ficheiro errado é pior do que perguntar.
+    No guessing when in doubt: with no candidate found, `None` is returned and the user
+    gives the path. Writing to the wrong file is worse than asking.
     """
     if explicit:
         path = Path(explicit).expanduser()
@@ -93,11 +93,11 @@ def already_installed(config: dict[str, Any]) -> bool:
 
 
 def add_callback(config: dict[str, Any]) -> dict[str, Any]:
-    """Acrescenta o callback preservando tudo o resto.
+    """Adds the callback while preserving everything else.
 
-    Modifica a estrutura carregada em vez de reescrever o ficheiro de raiz: um `config.yaml`
-    real tem comentários, ordem e chaves que este instalador não conhece, e regenerá-lo
-    perderia-os.
+    Modifies the loaded structure instead of rewriting the file from scratch: a real
+    `config.yaml` has comments, ordering and keys this installer does not know about, and
+    regenerating it would lose them.
     """
     settings = dict(config.get("litellm_settings") or {})
     callbacks = list(settings.get("callbacks") or [])
@@ -114,26 +114,26 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
     loaded = yaml.safe_load(path.read_text("utf-8")) or {}
     if not isinstance(loaded, dict):
-        raise ValueError(f"{path} não contém um mapeamento YAML")
+        raise ValueError(f"{path} does not contain a YAML mapping")
     return loaded
 
 
 def patch_text(original: str) -> str:
-    """Acrescenta o callback **editando o texto**, não regenerando o YAML.
+    """Adds the callback by **editing the text**, not by regenerating the YAML.
 
-    Um `safe_dump` da estrutura carregada produz um ficheiro equivalente e ilegível: perde
-    comentários, reindenta as listas todas e reescreve `["a"]` como bloco. Medido num
-    `config.yaml` de exemplo: 20 linhas alteradas para acrescentar uma. Quem abrir o
-    ficheiro a seguir não reconhece o que era seu, e um `git diff` do repositório de
-    configuração fica ilegível.
+    A `safe_dump` of the loaded structure produces an equivalent, unreadable file: it loses
+    comments, reindents every list and rewrites `["a"]` as a block. Measured on an example
+    `config.yaml`: 20 lines changed to add one. Whoever opens the file next does not
+    recognize what was theirs, and a `git diff` of the configuration repository becomes
+    unreadable.
 
-    Três casos, por ordem:
+    Four cases, in order:
 
-    1. já existe `callbacks:` em lista de bloco -> acrescenta-se um item com a mesma
-       indentação do primeiro;
-    2. existe `callbacks: [...]` em linha -> insere-se antes do fecho;
-    3. existe `litellm_settings:` sem `callbacks` -> cria-se a chave lá dentro;
-    4. não existe nada -> acrescenta-se o bloco no fim.
+    1. `callbacks:` already exists as a block list -> an item is added with the same
+       indentation as the first;
+    2. `callbacks: [...]` exists inline -> it is inserted before the closing bracket;
+    3. `litellm_settings:` exists without `callbacks` -> the key is created inside it;
+    4. nothing exists -> the block is appended at the end.
     """
     lines = original.splitlines()
     entry = CALLBACK_PATH
@@ -146,15 +146,21 @@ def patch_text(original: str) -> str:
         indent = len(line) - len(line.lstrip())
 
         if value.startswith("["):
-            if value.rstrip().endswith("]"):
+            # The `]` may not be the end of the line: `callbacks: ["langfuse"]  # comment`
+            # is valid YAML and showed up in a real configuration. Looking for the closing
+            # bracket instead of requiring the line to end with it is what keeps the patch
+            # from falling into the block branch and producing a duplicate `callbacks:` —
+            # which `_verify` caught, but only after refusing to write, leaving the user
+            # with no installation and no idea why.
+            if "]" in line:
                 closing = line.rindex("]")
                 inner = line[line.index("[") + 1 : closing].strip()
                 joined = f'{inner}, "{entry}"' if inner else f'"{entry}"'
-                lines[index] = f"{line[: line.index('[')]}[{joined}]"
+                lines[index] = f"{line[: line.index('[')]}[{joined}]{line[closing + 1 :]}"
                 return "\n".join(lines) + ("\n" if original.endswith("\n") else "")
             continue
 
-        # Lista de bloco: usa-se a indentação do primeiro item, não uma inventada.
+        # Block list: the first item's indentation is used, not an invented one.
         item_indent = indent + 2
         insert_at = index + 1
         for offset in range(index + 1, len(lines)):
@@ -179,7 +185,7 @@ def patch_text(original: str) -> str:
 
 
 def _write_yaml(path: Path, original: str) -> Path:
-    """Escreve com cópia de segurança. Devolve o caminho da cópia."""
+    """Writes with a backup copy. Returns the copy's path."""
     patched = patch_text(original)
     _verify(patched)
     backup = path.with_suffix(path.suffix + ".mysubs-bak")
@@ -189,53 +195,92 @@ def _write_yaml(path: Path, original: str) -> Path:
 
 
 def _verify(text: str) -> None:
-    """Recusa-se a escrever um ficheiro que já não carrega.
+    """Refuses to write a file that no longer loads.
 
-    Editar YAML por texto é rápido e frágil. Esta verificação é o que torna a fragilidade
-    aceitável: um erro de indentação é apanhado **antes** de o ficheiro chegar ao disco, em
-    vez de o proxy não arrancar no reinício seguinte.
+    Editing YAML as text is fast and fragile. This check is what makes the fragility
+    acceptable: an indentation error is caught **before** the file reaches the disk, instead
+    of the proxy failing to start on the next restart.
     """
     import yaml
 
     loaded = yaml.safe_load(text)
     if not isinstance(loaded, dict):
-        raise ValueError("o resultado não é um mapeamento YAML")
+        raise ValueError("the result is not a YAML mapping")
     callbacks = (loaded.get("litellm_settings") or {}).get("callbacks") or []
     if CALLBACK_PATH not in callbacks:
-        raise ValueError("o callback não ficou na configuração")
+        raise ValueError("the callback did not end up in the configuration")
 
 
 def _ask(question: str, *, default: bool = True) -> bool:
-    suffix = "[S/n]" if default else "[s/N]"
+    suffix = "[Y/n]" if default else "[y/N]"
     try:
         answer = input(f"{question} {suffix} ").strip().lower()
     except EOFError:
         return default
     if not answer:
         return default
-    return answer in ("s", "sim", "y", "yes")
+    return answer in ("y", "yes")
+
+
+#: The `config.yaml` for an installation that does not have one yet.
+#:
+#: Minimal on purpose: only what the plugin needs. **No `model_list`** — the subscription
+#: models come in through the page, and inventing entries here would give the user models
+#: they did not choose. No `master_key` either: the key is their decision, and a default
+#: value in a configuration file is the kind of thing that survives into production.
+_TEMPLATE = f"""# Created by mysubs-setup.
+# The subscription models are added by the /mysubs page, not here.
+litellm_settings:
+  callbacks:
+    - {CALLBACK_PATH}
+"""
+
+
+def _create_config(path: Path) -> Path | None:
+    """Creates a minimal `config.yaml`. `None` if that is not possible.
+
+    It exists because a fresh installation has no file at all, and telling the user to write
+    YAML by hand before they can run the command that exists to spare them exactly that
+    would trade one step for two.
+
+    **It only creates what does not exist.** A file that is present is always edited by
+    `patch_text`, which preserves comments and indentation — never replaced.
+    """
+    if path.exists():
+        return path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_TEMPLATE, encoding="utf-8")
+    except OSError as error:
+        print(f"\nCould not create {path}: {error}", file=sys.stderr)
+        print("Give a path with --config, or add this by hand:")
+        print("  litellm_settings:")
+        print(f'    callbacks: ["{CALLBACK_PATH}"]')
+        return None
+    print(f"\nThere was no config.yaml; created one at {path}")
+    return path
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="mysubs-setup",
-        description="Liga o litellm-mysubs ao LiteLLM instalado neste ambiente.",
+        description="Connects litellm-mysubs to the LiteLLM installed in this environment.",
     )
-    parser.add_argument("--config", help="caminho do config.yaml (senão, procura-se)")
-    parser.add_argument("--sim", action="store_true", help="não perguntar nada")
-    parser.add_argument("--estado", action="store_true", help="mostrar o estado e sair")
+    parser.add_argument("--config", help="path to config.yaml (otherwise it is searched for)")
+    parser.add_argument("--yes", action="store_true", help="do not ask anything")
+    parser.add_argument("--status", action="store_true", help="show the status and exit")
     args = parser.parse_args(argv)
 
     found = find_litellm()
     if found is None:
-        print("LiteLLM não encontrado neste ambiente.", file=sys.stderr)
-        print("Instala-o primeiro, ou corre o mysubs-setup no ambiente onde ele vive.")
+        print("LiteLLM not found in this environment.", file=sys.stderr)
+        print("Install it first, or run mysubs-setup in the environment where it lives.")
         return 1
     installed, location = found
     print(f"LiteLLM {installed}")
-    print(f"  em {location}")
+    print(f"  at {location}")
 
-    if args.estado:
+    if args.status:
         from . import MySubs
 
         for key, value in MySubs().status.items():
@@ -244,44 +289,41 @@ def main(argv: list[str] | None = None) -> int:
 
     config_path = find_config(args.config)
     if config_path is None:
-        print("\nNão encontrei o config.yaml.", file=sys.stderr)
-        print("Indica-o com --config /caminho/para/config.yaml")
-        print("\nOu acrescenta à mão:")
-        print("  litellm_settings:")
-        print(f'    callbacks: ["{CALLBACK_PATH}"]')
-        return 1
+        config_path = _create_config(Path(args.config) if args.config else Path("config.yaml"))
+        if config_path is None:
+            return 1
     print(f"  config {config_path}")
 
     try:
         config = _load_yaml(config_path)
     except Exception as error:
-        print(f"\nNão consegui ler {config_path}: {error}", file=sys.stderr)
+        print(f"\nCould not read {config_path}: {error}", file=sys.stderr)
         return 1
 
     if already_installed(config):
-        print("\nJá está ligado. Nada a fazer.")
-        print("A página fica em  <url-do-proxy>/mysubs")
+        print("\nAlready connected. Nothing to do.")
+        print("The page is at  <proxy-url>/mysubs")
         return 0
 
     models = len(config.get("model_list") or [])
-    print(f"\nVou acrescentar o callback. Os teus {models} modelos não são tocados.")
-    if not args.sim and not _ask("Continuar?"):
-        print("Cancelado.")
+    print(f"\nAdding the callback. Your existing models ({models}) are not touched.")
+    if not args.yes and not _ask("Continue?"):
+        print("Cancelled.")
         return 1
 
     try:
         backup = _write_yaml(config_path, config_path.read_text("utf-8"))
     except Exception as error:
-        print(f"\nNão consegui escrever: {error}", file=sys.stderr)
+        print(f"\nCould not write: {error}", file=sys.stderr)
         return 1
 
-    print(f"\nFeito. Cópia do original em {backup.name}")
-    print("\nA seguir:")
-    print("  1. reinicia o proxy")
-    print("  2. abre a UI e entra como administrador")
+    print(f"\nDone. Copy of the original at {backup.name}")
+    print("\nNext:")
+    print("  1. restart the proxy")
+    print("  2. open the UI and sign in as an administrator")
     print("  3. Experimental -> MySubs")
     print(f"\n{CACHE_HINT}")
-    print("\nA página aceita a sessão da UI; por fora, precisa de uma chave proxy_admin.")
+    print("\nThe page accepts the UI session; from outside, it needs a proxy_admin key.")
     return 0
 
 

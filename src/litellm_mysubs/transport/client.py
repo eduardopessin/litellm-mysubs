@@ -1,18 +1,19 @@
-"""Camada HTTP assíncrona: a única parte do pacote que abre sockets.
+"""Asynchronous HTTP layer: the only part of the package that opens sockets.
 
-O original abria o stream dentro do próprio tradutor, e a versão "async" era a síncrona
-enrolada num ``run_in_executor``: cada pedido ocupava um worker do pool durante toda a
-resposta — que num stream de subscrição são minutos — e o pedido N+1 ficava em fila sem
-sintoma nenhum do lado de fora. Aqui o transporte é `httpx.AsyncClient` nativo.
+The original opened the stream inside the translator itself, and the "async" version was
+the synchronous one wrapped in a ``run_in_executor``: each request occupied a pool worker
+for the whole response — which on a subscription stream is minutes — and request N+1
+queued with no symptom visible from the outside. Here the transport is a native
+`httpx.AsyncClient`.
 
-Não há âncora ao OMP nesta camada: o OMP fala com o `fetch` do runtime e a forma do laço
-não tem correspondência directa em ``providers/*.ts``. O que **é** portado — a
-classificação de erros e a rotação de endpoints — vive em ``retry.py`` e ``hosts.py``, com
-âncoras lá. Este módulo executa decisões, não as toma.
+There is no OMP anchor in this layer: OMP talks to the runtime `fetch` and the shape of the
+loop has no direct counterpart in ``providers/*.ts``. What **is** ported — error
+classification and endpoint rotation — lives in ``retry.py`` and ``hosts.py``, with anchors
+there. This module executes decisions, it does not take them.
 
-Fronteira: entra um `RequestSpec` (URL, headers e corpo já construídos pelo `wire/`), sai
-um `Response` ou uma sequência de eventos SSE crus. O transporte não sabe o que é uma
-`ModelResponse` nem que modelo substituir por qual.
+Boundary: a `RequestSpec` goes in (URL, headers and body already built by `wire/`), a
+`Response` or a sequence of raw SSE events comes out. The transport does not know what a
+`ModelResponse` is, nor which model to substitute for which.
 """
 
 from __future__ import annotations
@@ -28,13 +29,13 @@ from . import sse
 from .hosts import HostRotation
 from .retry import Action, Decision, decide_antigravity, decide_codex
 
-#: Watchdogs do omp: 300 s para o primeiro evento e 300 s de inactividade entre eventos.
-#: O `read` do httpx é exactamente o segundo; o total tem de ser ``None`` — um stream
-#: legítimo de raciocínio longo passa dos limites de um timeout global.
+#: omp watchdogs: 300 s for the first event and 300 s of inactivity between events. The
+#: httpx `read` timeout is exactly the second one; the total has to be ``None`` — a
+#: legitimate long-reasoning stream exceeds the bounds of any global timeout.
 TIMEOUT: Final = httpx.Timeout(None, connect=30.0, read=300.0, write=60.0)
 
-#: Recebe o nome do provedor, devolve um access token novo ou ``None`` se não for
-#: renovável. Assíncrono porque a renovação é ela própria um pedido HTTP.
+#: Takes the provider name, returns a fresh access token or ``None`` when it is not
+#: refreshable. Asynchronous because the refresh is itself an HTTP request.
 RefreshCallback = Callable[[str], Awaitable[str | None]]
 
 Provider = Literal["codex", "antigravity"]
@@ -42,7 +43,7 @@ Provider = Literal["codex", "antigravity"]
 
 @dataclass(frozen=True, slots=True)
 class RequestSpec:
-    """Um pedido já traduzido para o fio do provedor."""
+    """A request already translated to the provider wire."""
 
     url: str
     headers: Mapping[str, str]
@@ -53,7 +54,7 @@ class RequestSpec:
 
 @dataclass(frozen=True, slots=True)
 class Response:
-    """Resposta não-streaming, por interpretar."""
+    """Non-streaming response, still uninterpreted."""
 
     status: int
     headers: Mapping[str, str]
@@ -61,10 +62,10 @@ class Response:
 
 
 class UpstreamError(Exception):
-    """Erro propagado do upstream, com o estado e o corpo **reais**.
+    """Error propagated from the upstream, with the **real** status and body.
 
-    Nunca se inventa um número: um 500 fabricado por cima de um 429 apaga a única
-    informação que diz ao utilizador que a quota acabou.
+    A number is never invented: a 500 fabricated on top of a 429 erases the only piece of
+    information that tells the user the quota has run out.
     """
 
     __slots__ = ("body", "status")
@@ -75,41 +76,41 @@ class UpstreamError(Exception):
         self.body = body
 
 
-class RemapRequired(UpstreamError):  # noqa: N818 — nome fixado pelo contrato da fronteira
-    """A conta não serve este nome de modelo, e o nome pode ser um alias resolúvel.
+class RemapRequired(UpstreamError):  # noqa: N818 — name fixed by the boundary contract
+    """The account does not serve this model name, and the name may be a resolvable alias.
 
-    Deriva de `UpstreamError` de propósito: quem não a trate propaga o erro real do
-    upstream em vez de um erro inventado pelo transporte. Que modelo usar — se algum — é
-    decisão do `plugin.py`.
+    It derives from `UpstreamError` on purpose: whoever does not handle it propagates the
+    real upstream error instead of one invented by the transport. Which model to use — if
+    any — is `plugin.py`'s decision.
     """
 
     __slots__ = ()
 
 
-class RedeemRequired(UpstreamError):  # noqa: N818 — nome fixado pelo contrato da fronteira
-    """Quota esgotada; pode haver crédito de reset por resgatar.
+class RedeemRequired(UpstreamError):  # noqa: N818 — name fixed by the boundary contract
+    """Quota exhausted; there may be reset credit left to redeem.
 
-    Mesma regra: resgatar crédito é um efeito com custo, não é decisão do transporte.
+    Same rule: redeeming credit is an effect that costs money, not a transport decision.
     """
 
     __slots__ = ()
 
 
 def _drain(pending: list[str]) -> Iterator[str]:
-    """Iterável que se esvazia à medida que é consumido: o que sobrar é observável."""
+    """Iterable that empties as it is consumed: whatever is left over is observable."""
     while pending:
         yield pending.pop(0)
 
 
 def _decode(line: str) -> tuple[list[dict[str, Any]], bool]:
-    """Eventos de uma linha, e se o stream terminou.
+    """The events of one line, and whether the stream has ended.
 
-    `sse.iter_events` assinala o ``[DONE]`` **parando**, não devolvendo marca nenhuma —
-    do lado de fora é indistinguível de uma linha sem dados. Acrescenta-se por isso uma
-    linha em branco a seguir à real: se ela ficar por consumir, o `iter_events` parou a
-    meio, o que só acontece no ``[DONE]``.
+    `sse.iter_events` signals ``[DONE]`` by **stopping**, not by returning any marker —
+    from the outside that is indistinguishable from a line with no data. So a blank line is
+    appended after the real one: if it is left unconsumed, `iter_events` stopped early,
+    which only happens at ``[DONE]``.
 
-    Uma linha rende no máximo um evento, logo materializá-los não bufferiza nada.
+    One line yields at most one event, so materialising them buffers nothing.
     """
     pending = [line, ""]
     events = list(sse.iter_events(_drain(pending)))
@@ -117,7 +118,7 @@ def _decode(line: str) -> tuple[list[dict[str, Any]], bool]:
 
 
 class Transport:
-    """Abre ligações, aplica a decisão de `retry.py` e roda endpoints via `hosts.py`."""
+    """Opens connections, applies the `retry.py` decision and rotates hosts via `hosts.py`."""
 
     __slots__ = ("_client", "_owns_client", "_refresh", "_rotation")
 
@@ -128,8 +129,9 @@ class Transport:
         refresh: RefreshCallback | None = None,
         rotation: HostRotation | None = None,
     ) -> None:
-        #: Um cliente injectado é de quem o injectou — fechá-lo partia o dono, que pode
-        #: ainda ter pedidos em voo. Só se fecha o que se criou aqui.
+        #: An injected client belongs to whoever injected it — closing it would break
+        #: the owner, who may still have requests in flight. Only what was created here
+        #: gets closed.
         self._owns_client = client is None
         self._client = httpx.AsyncClient(timeout=TIMEOUT) if client is None else client
         self._refresh = refresh
@@ -151,7 +153,7 @@ class Transport:
             await self._client.aclose()
 
     async def request(self, spec: RequestSpec) -> Response:
-        """Pedido não-streaming: abre, lê o corpo todo e fecha."""
+        """Non-streaming request: open, read the whole body, close."""
         response = await self._open(spec)
         try:
             text = (await response.aread()).decode("utf-8", "replace")
@@ -165,13 +167,13 @@ class Transport:
         )
 
     async def stream(self, spec: RequestSpec) -> AsyncIterator[dict[str, Any]]:
-        """Eventos SSE crus, pela ordem em que chegam.
+        """Raw SSE events, in the order they arrive.
 
-        O laço de abertura — com renovação de token e failover — corre **antes** do
-        primeiro `yield`, e só uma vez. Depois de o chamador ter visto um evento não há
-        volta atrás: reabrir noutro host ou com outro token reenviava o prefixo que ele já
-        consumiu. Um corpo cortado a meio termina o iterador com os eventos completos que
-        chegaram; a linha truncada não produz evento nenhum.
+        The opening loop — with token refresh and failover — runs **before** the first
+        `yield`, and only once. Once the caller has seen an event there is no way back:
+        reopening on another host or with another token would resend the prefix it has
+        already consumed. A body cut in half ends the iterator with the complete events
+        that did arrive; the truncated line produces no event at all.
         """
         response = await self._open(spec)
         try:
@@ -187,17 +189,19 @@ class Transport:
             await response.aclose()
 
     async def _open(self, spec: RequestSpec) -> httpx.Response:
-        """Resposta 200 ainda por ler; fechá-la é de quem chama.
+        """A 200 response still unread; closing it is the caller's job.
 
-        Um 401 renova o token e repete **uma** vez no mesmo endpoint — repetir sem limite
-        com uma credencial que o servidor recusa é um laço de rejeições à velocidade da
-        rede. Esgotado o endpoint, tenta-se o seguinte enquanto `hosts.py` o autorizar.
+        A 401 refreshes the token and repeats **once** on the same endpoint — repeating
+        without a limit using a credential the server rejects is a loop of rejections at
+        network speed. Once the endpoint is exhausted, the next one is tried for as long as
+        `hosts.py` allows it.
         """
         headers = dict(spec.headers)
         urls = self._candidate_urls(spec)
-        # Este pedido ainda não emitiu nada, e a rotação sobrevive ao pedido anterior:
-        # sem repor a marca, um stream completo deixava o `can_failover` a `False` para
-        # sempre e o pedido seguinte perdia o failover em silêncio.
+        # This request has emitted nothing yet, and the rotation outlives the previous
+        # request: without resetting the flag, one complete stream would leave
+        # `can_failover` at `False` forever and the next request would silently lose
+        # failover.
         self._clear_started()
         last = 0, ""
         for position, url in enumerate(urls):
@@ -228,31 +232,32 @@ class Transport:
                 last = status, body
                 break
 
-            # Guarda da invariante de `hosts.py`: enquanto `_open` corre antes do
-            # primeiro `yield`, `started` é sempre falso aqui e o `is_last` já é imposto
-            # pelo `for` — a condição é hoje redundante das duas maneiras. Fica porque é
-            # a única coisa que impede a invariante de se perder em silêncio se alguém
-            # vier a chamar `_open` a meio de um stream: aí a resposta certa é parar, não
-            # reabrir noutro host e duplicar o que o cliente já viu.
+            # Guard for the `hosts.py` invariant: as long as `_open` runs before the
+            # first `yield`, `started` is always false here and `is_last` is already
+            # enforced by the `for` — the condition is redundant both ways today. It stays
+            # because it is the only thing stopping the invariant from being lost silently
+            # if someone ever calls `_open` mid-stream: there the right answer is to stop,
+            # not to reopen on another host and duplicate what the client has already
+            # seen.
             if not self._can_failover(is_last=position == len(urls) - 1):
                 break
         raise UpstreamError(*last)
 
     def _decide(self, spec: RequestSpec, status: int, body: str) -> Decision:
-        """Classificação delegada; aqui não se decide nada sobre o conteúdo do erro.
+        """Classification is delegated; nothing about the error content is decided here.
 
-        ``can_remap``/``can_redeem`` vão a ``True``: são capacidades do chamador, e o
-        transporte não conhece os aliases nem tem autoridade para gastar crédito. Ao
-        passá-las afirmativas, a possibilidade chega ao `plugin.py` como excepção própria
-        — que, por derivar de `UpstreamError`, ainda propaga o estado e o corpo reais se
-        ninguém a tratar.
+        ``can_remap``/``can_redeem`` go in as ``True``: they are capabilities of the
+        caller, and the transport knows neither the aliases nor has authority to spend
+        credit. Passing them affirmatively makes the possibility reach `plugin.py` as a
+        dedicated exception — which, by deriving from `UpstreamError`, still propagates the
+        real status and body if nobody handles it.
         """
         if spec.provider == "codex":
             return decide_codex(status, body, can_remap=True, can_redeem=True)
         return decide_antigravity(status)
 
     def _candidate_urls(self, spec: RequestSpec) -> list[str]:
-        """URLs a tentar, por ordem. Sem rotação, só a que veio no pedido."""
+        """URLs to try, in order. With no rotation, only the one that came in the request."""
         if self._rotation is None:
             return [spec.url]
         for host in self._rotation.hosts:
@@ -268,16 +273,16 @@ class Transport:
             self._rotation.mark_started()
 
     def _clear_started(self) -> None:
-        """Repõe a marca de emissão no início de cada pedido.
+        """Reset the emission flag at the start of each request.
 
-        `hosts.py` não expõe um reset — a marca lá é o campo `started`, e a rotação
-        existe para ser reutilizada entre pedidos. Escreve-se o campo directamente em vez
-        de acrescentar um método a um ficheiro já verificado.
+        `hosts.py` exposes no reset — the flag there is the `started` field, and the
+        rotation exists to be reused across requests. The field is written directly instead
+        of adding a method to an already verified file.
         """
         if self._rotation is not None:
             self._rotation.started = False
 
     def _commit(self, response: httpx.Response) -> None:
-        """Memoriza o endpoint só depois de a resposta ter sido consumida por inteiro."""
+        """Remember the endpoint only after the response has been consumed in full."""
         if self._rotation is not None:
             self._rotation.commit(str(response.request.url))

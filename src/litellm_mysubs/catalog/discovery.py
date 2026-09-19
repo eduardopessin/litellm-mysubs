@@ -1,32 +1,33 @@
-"""Descoberta dos modelos que uma subscrição serve, para o utilizador escolher.
+"""Discovery of the models a subscription serves, for the user to choose from.
 
-A capacidade real difere por provedor, e o desenho reflecte isso em vez de fingir uma
-interface uniforme:
+Real capability differs per provider, and the design reflects that instead of pretending a
+uniform interface:
 
-* **Google Antigravity** tem catálogo consultável (``:fetchAvailableModels``). A resposta
-  é a verdade da conta, incluindo as variantes que já não respondem
-  (``deprecatedModelIds``). O desconto é feito por `ModelCatalog.update`, não aqui.
-* **Anthropic** e **OpenAI Codex** não têm catálogo. ``/v1/models`` devolve 401 com um
-  token de subscrição, e o conjunto servido **não é derivável** da lista pública:
-  ``claude-sonnet-4-20250514`` existe na API da Anthropic e devolve 404 numa conta Max.
-  Resta uma lista curada de nomes medidos e uma sonda real a cada um.
+* **Google Antigravity** has a queryable catalog (``:fetchAvailableModels``). The response
+  is the account's truth, including the variants that no longer answer
+  (``deprecatedModelIds``). Subtracting those is `ModelCatalog.update`'s job, not this
+  module's.
+* **Anthropic** and **OpenAI Codex** have no catalog. ``/v1/models`` returns 401 with a
+  subscription token, and the served set **is not derivable** from the public list:
+  ``claude-sonnet-4-20250514`` exists in the Anthropic API and returns 404 on a Max
+  account. What is left is a curated list of measured names and a real probe of each one.
 
-Três regras governam o resultado, e todas vêm do mesmo princípio — nunca inventar um facto
-sobre a conta de outra pessoa:
+Three rules govern the result, and all of them come from the same principle — never invent
+a fact about someone else's account:
 
-1. ``verified=True`` só quando o upstream respondeu mesmo. Um nome que ninguém conseguiu
-   perguntar aparece com ``verified=False`` e com a razão em ``note``.
-2. Uma sonda que falha **por rede** não marca o modelo como não servido. "O upstream disse
-   que não" e "não consegui perguntar" são factos diferentes: só o primeiro remove o
-   modelo da lista, o segundo deixa-o lá por verificar.
-3. Um catálogo inalcançável não produz uma lista plausível. Ou se devolve o instantâneo
-   real etiquetado com a idade, ou se levanta `DiscoveryError`.
+1. ``verified=True`` only when the upstream actually answered. A name nobody managed to ask
+   about shows up with ``verified=False`` and the reason in ``note``.
+2. A probe that fails **for network reasons** does not mark the model as unserved. "The
+   upstream said no" and "I could not ask" are different facts: only the first removes the
+   model from the list, the second leaves it there as unverified.
+3. An unreachable catalog does not produce a plausible list. Either the real snapshot is
+   returned labelled with its age, or `DiscoveryError` is raised.
 
-Nota sobre o OMP: o `pi-catalog` tem `discovery/codex.ts :: fetchCodexModels`, que lê
-``/backend-api/codex/models``. Não é usado aqui porque o que esse endpoint anuncia não foi
-medido contra uma conta de subscrição nesta instalação, e a medição que existe é a
-contrária (o catálogo público não prevê o que a sub serve). A sonda mede; a lista do
-upstream, por enquanto, seria suposição.
+Note about OMP: `pi-catalog` has `discovery/codex.ts :: fetchCodexModels`, which reads
+``/backend-api/codex/models``. It is not used here because what that endpoint advertises
+has not been measured against a subscription account on this installation, and the
+measurement that does exist says the opposite (the public catalog does not predict what the
+subscription serves). The probe measures; the upstream list would, for now, be a guess.
 """
 
 from __future__ import annotations
@@ -40,56 +41,88 @@ from typing import Any, Final
 import httpx
 
 from ..credentials.store import Credential
-from ..transport import hosts
+from ..transport import hosts, sse
 from ..transport.retry import is_unsupported_model
 from ..wire import anthropic, codex
+from ..wire.antigravity import is_retired_response
 from ..wire.antigravity_models import BROKEN_WIRE, ModelCatalog
 
-#: Sondas em voo ao mesmo tempo. O limite existe porque uma lista curada dispara um pedido
-#: por nome contra o mesmo backend: sem tecto, ligar uma subscrição abria meia dúzia de
-#: ligações simultâneas ao upstream só para desenhar um ecrã de selecção.
+#: Probes in flight at once. The limit exists because a curated list fires one request per
+#: name against the same backend: without a ceiling, connecting a subscription opened half a
+#: dozen simultaneous connections to the upstream just to draw a selection screen.
 PROBE_CONCURRENCY: Final = 4
 
-#: Endpoint de inferência da Anthropic. Duplica o valor que o `plugin.py` deriva através do
-#: LiteLLM; importá-lo de lá traria o LiteLLM inteiro para dentro da descoberta, que é
-#: precisamente a dependência que este pacote separa.
+#: Wait ceiling per Antigravity probe. Short on purpose: what the probe produces is a mark
+#: on a selection screen, not a response for the user to read. Anything exceeding this is a
+#: fact about this machine's network, and the verdict for those is always "could not
+#: probe" — never "not served".
+PROBE_TIMEOUT_S: Final = 10.0
+
+#: Output ceiling for Antigravity probes. Each probe is a billed turn; the verdict comes
+#: from the status and the in-band warning, not from the generated text, so there is no
+#: reason to pay for more than a handful of tokens per catalog name.
+PROBE_MAX_OUTPUT_TOKENS: Final = 8
+
+#: Anthropic inference endpoint. It duplicates the value `plugin.py` derives through
+#: LiteLLM; importing it from there would drag the whole of LiteLLM into discovery, which is
+#: precisely the dependency this package keeps apart.
 ANTHROPIC_MESSAGES_URL: Final = "https://api.anthropic.com/v1/messages"
 
-#: Valor de ``anthropic-version``. Fixado em `providers/anthropic.ts` do OMP (não leva
-#: âncora porque o verificador de âncoras só aceita símbolos identificadores).
+#: Value of ``anthropic-version``. Fixed in OMP's `providers/anthropic.ts` (it carries no
+#: anchor because the anchor checker only accepts identifier symbols).
 ANTHROPIC_API_VERSION: Final = "2023-06-01"
 
-#: Responses API servida pela subscrição ChatGPT. Mesma razão de duplicação que acima:
-#: `plugin.py` tem a constante gémea e importa o LiteLLM.
+#: Responses API served by the ChatGPT subscription. Same reason for the duplication as
+#: above: `plugin.py` has the twin constant and imports LiteLLM.
 CODEX_RESPONSES_URL: Final = "https://chatgpt.com/backend-api/codex/responses"
 
 # omp: wire/gemini-headers.ts :: getAntigravityUserAgent
-#: O backend do Cloud Code Assist fecha a disponibilidade de modelos contra a versão do
-#: cliente; o `cl` não é validado.
+#: The Cloud Code Assist backend gates model availability on the client version; `cl` is
+#: not validated.
 ANTIGRAVITY_USER_AGENT: Final = (
     "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
 )
 
-#: Marca textual da recusa de nome pela Anthropic. O estado sozinho não chega: a rota OAuth
-#: devolve 404 também para caminhos errados, e é o corpo que nomeia o modelo.
+#: Textual marker of Anthropic refusing a name. The status alone is not enough: the OAuth
+#: route returns 404 for wrong paths too, and it is the body that names the model.
 ANTHROPIC_NOT_FOUND_MARKER: Final = "not_found_error"
 
-# Lista curada da Anthropic: **só** nomes com resposta 200 medida contra um token de
-# subscrição. A fonte de cada um está no próprio pacote, o que faz desta lista uma
-# consequência de medições e não de uma escolha de gosto:
+#: Antigravity catalog ``modelProvider`` -> model family.
+#:
+#: Antigravity is a reseller: it serves three model families, and it is the family — not
+#: who serves it — that decides the pricing prefix in LiteLLM. Measured on the real
+#: account: of the catalog's 32 models, `claude-sonnet-4-6` and `claude-opus-4-6-thinking`
+#: come as ``MODEL_PROVIDER_ANTHROPIC``, `gpt-oss-120b-medium` comes as
+#: ``MODEL_PROVIDER_OPENAI``, and the rest as ``MODEL_PROVIDER_GOOGLE`` — including opaque
+#: names such as `chat_23310` and `tab_flash_lite_preview`, which no name-based heuristic
+#: would classify.
+#:
+#: An enum outside this table yields an empty family, never a guessed one: the consumer
+#: (`catalog/deployments.py`) has a safe fallback prefix for that case, and a guess here
+#: would only trade a zero price for a wrong one.
+MODEL_FAMILY_BY_PROVIDER: Final[dict[str, str]] = {
+    "MODEL_PROVIDER_GOOGLE": "google",
+    "MODEL_PROVIDER_ANTHROPIC": "anthropic",
+    "MODEL_PROVIDER_OPENAI": "openai",
+}
+
+# Curated Anthropic list: **only** names with a measured 200 response against a
+# subscription token. The source of each one is inside the package itself, which makes this
+# list a consequence of measurements and not of taste:
 #
 #   opus-5, fable-5, sonnet-5, opus-4-8, opus-4-6, sonnet-4-6, opus-4-5, sonnet-4-5,
-#   haiku-4-5  -> `wire/anthropic.py`, tabela de `ADAPTIVE_EFFORT`, onde cada linha traz os
-#                 caracteres de raciocínio que o upstream devolveu. Um modelo que não
-#                 responde não produz essa contagem.
-#   opus-4-8    -> também o modelo do bootstrap do Claude Code
+#   haiku-4-5  -> `wire/anthropic.py`, the `ADAPTIVE_EFFORT` table, where every row carries
+#                 the reasoning characters the upstream returned. A model that does not
+#                 answer does not produce that count.
+#   opus-4-8    -> also the Claude Code bootstrap model
 #                  (`registry/oauth/anthropic.ts :: CLAUDE_CODE_BOOTSTRAP_MODEL`).
-#   haiku-4-5   -> o modelo que o original usa na sonda de saúde do proxy.
+#   haiku-4-5   -> the model the original uses in the proxy health probe.
 #
-# Fora de propósito: `claude-sonnet-4-20250514` (existe na API pública, 404 na conta Max —
-# é o contra-exemplo que justifica este módulo) e os nomes do catálogo do OMP sem medição
-# nossa (`claude-mythos-5`, `claude-fable-5-1`, ...). Acrescentá-los é uma linha, depois de
-# medidos; pô-los cá agora fazia a sonda parecer confirmação de um palpite.
+# Deliberately out: `claude-sonnet-4-20250514` (it exists in the public API, 404 on the Max
+# account — the counter-example that justifies this module) and the OMP catalog names with
+# no measurement of ours (`claude-mythos-5`, `claude-fable-5-1`, ...). Adding them is one
+# line, once measured; putting them here now would make the probe look like confirmation of
+# a guess.
 CURATED_ANTHROPIC: Final[tuple[str, ...]] = (
     "claude-opus-5",
     "claude-sonnet-5",
@@ -102,20 +135,20 @@ CURATED_ANTHROPIC: Final[tuple[str, ...]] = (
     "claude-haiku-4-5",
 )
 
-# Lista curada do Codex:
+# Curated Codex list:
 #
-#   gpt-5.5       -> alvo dos aliases `gpt-5`/`gpt5`/`codex` em `wire/codex.py`, e o modelo
-#                    da sonda de saúde do original. Servido, medido.
-#   gpt-6-astra   -> alvo dos aliases `gpt-6`/`gpt6` na mesma tabela.
+#   gpt-5.5       -> target of the `gpt-5`/`gpt5`/`codex` aliases in `wire/codex.py`, and
+#                    the model of the original's health probe. Served, measured.
+#   gpt-6-astra   -> target of the `gpt-6`/`gpt6` aliases in the same table.
 #   gpt-5.6-luna, gpt-5.6-sol, gpt-5.6-terra, gpt-daybreak-blue-latest
-#                 -> únicas entradas do provedor `openai-codex` no catálogo agregado do OMP
-#                    (`pi-catalog`, models.json). É um catálogo específico do backend da
-#                    subscrição, não da API pública — evidência mais fraca que uma medição
-#                    nossa, e por isso a sonda é que decide.
+#                 -> the only `openai-codex` provider entries in OMP's aggregated catalog
+#                    (`pi-catalog`, models.json). That is a catalog specific to the
+#                    subscription backend, not to the public API — weaker evidence than a
+#                    measurement of ours, which is why the probe decides.
 #
-# Fora de propósito: `gpt-5.4` e `gpt-5.4-mini`. Medido: "The 'gpt-5.4' model is not
-# supported when using Codex with a ChatGPT account". Estavam no original a apontar para
-# gpt-5.5 e o cliente era facturado contra um modelo que nunca correu.
+# Deliberately out: `gpt-5.4` and `gpt-5.4-mini`. Measured: "The 'gpt-5.4' model is not
+# supported when using Codex with a ChatGPT account". They were in the original pointing at
+# gpt-5.5, and the client was billed against a model that never ran.
 CURATED_CODEX: Final[tuple[str, ...]] = (
     "gpt-5.5",
     "gpt-6-astra",
@@ -127,54 +160,65 @@ CURATED_CODEX: Final[tuple[str, ...]] = (
 
 
 class DiscoveryError(RuntimeError):
-    """Não foi possível saber o que a conta serve.
+    """It was not possible to learn what the account serves.
 
-    Levantada só onde a alternativa seria inventar: um catálogo inalcançável e sem
-    instantâneo anterior não tem resposta honesta em forma de lista.
+    Raised only where the alternative would be to invent: an unreachable catalog with no
+    earlier snapshot has no honest answer in list form.
     """
 
 
 @dataclass(frozen=True, slots=True)
 class DiscoveredModel:
-    """Um modelo que a subscrição pode servir.
+    """A model the subscription may serve.
 
-    ``verified`` é a única coisa que distingue um facto de uma hipótese, e é por isso que
-    ``note`` é obrigatório na prática sempre que ``verified`` é falso: um ecrã de selecção
-    que mostre os dois casos iguais transforma a lista curada em promessa.
+    ``verified`` is the only thing that separates a fact from a hypothesis, which is why
+    ``note`` is in practice mandatory whenever ``verified`` is false: a selection screen
+    that shows both cases alike turns the curated list into a promise.
     """
 
     wire_name: str
-    """Nome tal como vai no fio. Nu, sem prefixo de provedor."""
+    """Name exactly as it goes on the wire. Bare, with no provider prefix."""
 
     suggested_name: str
-    """Nome público sugerido no LiteLLM. Sugestão: o utilizador muda-o na UI."""
+    """Suggested public name in LiteLLM. A suggestion: the user changes it in the UI."""
 
     verified: bool
-    """Se o upstream respondeu mesmo a este nome nesta descoberta."""
+    """Whether the upstream actually answered this name during this discovery."""
 
     note: str = ""
-    """Porque não foi verificado, quando aplicável."""
+    """Why it was not verified, where applicable."""
+
+    family: str = ""
+    """Model family: ``"google"``, ``"anthropic"``, ``"openai"``, or ``""``.
+
+    Not who serves it, but what is being served — the distinction only shows up in
+    Antigravity, which resells all three. It is what decides the pricing prefix in
+    `catalog/deployments.py`: measured with `litellm.completion_cost`, `gemini-2.5-pro`
+    only has a table under ``gemini/`` (or ``vertex_ai/``) and `claude-sonnet-4-6` under
+    ``anthropic/``; under ``openai/`` both cost zero. Empty means "I don't know", and the
+    default is empty so that older callers do not start asserting a family nobody measured.
+    """
 
 
 def suggested_name(wire_name: str) -> str:
-    """Nome público a partir do nome de fio: ``anthropic/claude-opus-5`` -> ``claude-opus-5``.
+    """Public name from the wire name: ``anthropic/claude-opus-5`` -> ``claude-opus-5``.
 
-    O prefixo de provedor pertence a ``litellm_params["model"]``, não ao ``model_name``: é
-    o ``model_name`` que ecoa no spend log, e um nome prefixado aí nomeia algo que o
-    cliente nunca pediu.
+    The provider prefix belongs in ``litellm_params["model"]``, not in ``model_name``: it
+    is ``model_name`` that echoes in the spend log, and a prefixed name there names
+    something the client never asked for.
     """
     return str(wire_name).split("/")[-1]
 
 
 @dataclass(frozen=True, slots=True)
 class _Probe:
-    """Resultado de uma sonda. ``served=None`` é "não consegui perguntar"."""
+    """The result of a probe. ``served=None`` means "I could not ask"."""
 
     served: bool | None
     note: str = ""
 
 
-#: Uma sonda: cliente, credencial, nome de fio -> veredicto.
+#: A probe: client, credential, wire name -> verdict.
 Probe = Callable[[httpx.AsyncClient, Credential, str], Awaitable[_Probe]]
 
 
@@ -184,23 +228,46 @@ async def discover(
     client: httpx.AsyncClient,
     catalog: ModelCatalog | None = None,
     now: float | None = None,
+    probe: bool = False,
 ) -> list[DiscoveredModel]:
-    """Modelos que esta subscrição serve.
+    """The models this subscription serves.
 
-    ``catalog`` só é usado pelo Google: passar o catálogo vivo do processo é o que permite
-    que uma resposta vazia do endpoint não apague o que já se sabia. ``now`` existe para
-    tornar a idade do instantâneo determinística nos testes.
+    ``catalog`` is only used by Google: passing the process's live catalog is what keeps an
+    empty response from the endpoint from erasing what was already known. ``now`` exists to
+    make the snapshot age deterministic in tests.
+
+    ``probe`` only affects Google, and it **spends quota**: it fires a minimal
+    ``:streamGenerateContent`` turn per catalog name — on the measured account that is 32
+    names, hence 32 billed turns per discovery. That is why it is off by default: the
+    unprobed list is what the account advertises, which is legitimate information, only
+    unconfirmed. Turned on, it replaces that advertisement with measurement — it is the only
+    way to tell `gemini-3.5-flash-lite` (answers "2 + 2 = 4") from `gemini-3.5-flash-low`
+    (200 with a retirement warning), or `tab_flash_lite_preview` (answers) from
+    `tab_jump_flash_lite_preview` (400). Neither pair is separable by name, and no model is
+    removed from the list because of the probe — see `_discover_google`.
+
+    The probe lives here as a parameter and not as a separate `probe_models(...)` because
+    the verdict has to land on the same `DiscoveredModel` the catalog produces: a separate
+    function returned a second object every caller would have to match up with the first,
+    and a caller that forgot went back to showing the catalog as truth — the very defect
+    this corrects.
     """
     if credential.provider == "google-antigravity":
         return await _discover_google(
-            credential, client=client, catalog=catalog or ModelCatalog(), now=now
+            credential, client=client, catalog=catalog or ModelCatalog(), now=now, probe=probe
         )
     if credential.provider == "anthropic":
-        return await _discover_probed(credential, CURATED_ANTHROPIC, _probe_anthropic, client)
-    return await _discover_probed(credential, CURATED_CODEX, _probe_codex, client)
+        # These two have no catalog with ``modelProvider``, and they do not need one: the
+        # one who serves is the owner of the family. The Max subscription only serves
+        # `claude-*`, the Codex one only serves `gpt-*`. The constant here is measured by
+        # the curated list above.
+        return await _discover_probed(
+            credential, CURATED_ANTHROPIC, _probe_anthropic, client, family="anthropic"
+        )
+    return await _discover_probed(credential, CURATED_CODEX, _probe_codex, client, family="openai")
 
 
-# -- Google Antigravity: catálogo real -----------------------------------------
+# -- Google Antigravity: real catalog ------------------------------------------
 
 
 # omp: discovery/antigravity.ts :: fetchAntigravityDiscoveryModels
@@ -210,23 +277,31 @@ async def _discover_google(
     client: httpx.AsyncClient,
     catalog: ModelCatalog,
     now: float | None,
+    probe: bool = False,
 ) -> list[DiscoveredModel]:
-    """Catálogo da conta, com os dois endpoints por ordem.
+    """The account's catalog, trying both endpoints in order.
 
-    Só o desconto de `BROKEN_WIRE` é feito aqui: o de ``deprecatedModelIds`` é do
-    `ModelCatalog`, que é onde a forma do payload está verificada.
+    Only the `BROKEN_WIRE` subtraction happens here: the ``deprecatedModelIds`` one belongs
+    to `ModelCatalog`, which is where the payload shape is verified.
+
+    With ``probe``, ``verified`` stops coming from the catalog and starts coming from the
+    response: the catalog advertises `chat_23310` (400 INVALID_ARGUMENT) next to
+    `tab_flash_lite_preview` (answers), and being advertised was never proof of being
+    served. No name leaves the list because of the probe — the user sees what the account
+    advertises, marked with what was measured; hiding an advertised model would be deciding
+    for them.
     """
     moment = time.time() if now is None else now
     payload = await _fetch_catalog(credential, client=client)
 
-    # O que conta é se o catálogo *absorveu* alguma coisa, não se houve resposta: um
-    # payload cujos modelos estão todos em ``deprecatedModelIds`` é uma resposta 200 que
-    # não acrescenta nada, e `ModelCatalog.update` deixa o instantâneo anterior intacto
-    # de propósito. Compara-se o par (ids, instante) porque nenhum dos dois sozinho
-    # distingue os casos. Degenerescência conhecida: um chamador que passe ``now`` igual
-    # ao instante da recolha anterior *e* receba exactamente os mesmos ids vê a lista
-    # rotulada como instantâneo de 0 s. Com um relógio real não acontece, e o erro é para
-    # o lado seguro — etiqueta a mais, nunca modelo a mais.
+    # What counts is whether the catalog *absorbed* anything, not whether there was a
+    # response: a payload whose models are all in ``deprecatedModelIds`` is a 200 that adds
+    # nothing, and `ModelCatalog.update` leaves the earlier snapshot intact on purpose. The
+    # pair (ids, instant) is compared because neither alone distinguishes the cases. Known
+    # degeneracy: a caller that passes ``now`` equal to the instant of the previous
+    # collection *and* receives exactly the same ids sees the list labelled as a 0 s
+    # snapshot. With a real clock it does not happen, and the error falls on the safe side
+    # — a label too many, never a model too many.
     before = catalog.ids, catalog.fetched_at
     if payload is not None:
         catalog.update(payload, now=moment)
@@ -234,53 +309,83 @@ async def _discover_google(
 
     if not catalog.ids:
         raise DiscoveryError(
-            "Google Antigravity: o catálogo não respondeu e não há instantâneo anterior; "
-            "listar modelos aqui seria inventá-los"
+            "Google Antigravity: the catalog did not respond and there is no earlier "
+            "snapshot; listing models here would mean inventing them"
         )
 
     age = ""
     if not absorbed:
-        # Há instantâneo anterior e o endpoint não o renovou. Devolvê-lo é legítimo — foi
-        # medido —, mas sem a idade passaria por actual, que é exactamente o número
-        # plausível que este pacote não inventa.
+        # There is an earlier snapshot and the endpoint did not refresh it. Returning it
+        # is legitimate — it was measured — but without the age it would pass for current,
+        # which is exactly the plausible number this package does not invent.
         seconds = int(max(0.0, moment - catalog.fetched_at))
         reason = (
-            "o endpoint não respondeu"
+            "the endpoint did not respond"
             if payload is None
-            else "o endpoint respondeu sem modelos utilizáveis"
+            else "the endpoint responded with no usable models"
         )
-        age = f"instantâneo do catálogo com {seconds} s; {reason} agora"
+        age = f"catalog snapshot {seconds} s old; {reason} now"
+
+    verdicts = await _probe_catalog(credential, catalog.ids, client=client) if probe else {}
 
     discovered: list[DiscoveredModel] = []
     for wire in catalog.ids:
         notes = [age] if age else []
-        broken = wire in BROKEN_WIRE
-        if broken:
-            # O catálogo anuncia-as e o streamGenerateContent recusa-as. Escondê-las
-            # perderia informação real; anunciá-las como servidas repetia o defeito.
-            notes.append(
-                "o catálogo anuncia-o mas o streamGenerateContent devolve 400 "
-                "INVALID_ARGUMENT para esta variante"
-            )
+        verdict = verdicts.get(wire)
+        if verdict is None:
+            broken = wire in BROKEN_WIRE
+            if broken:
+                # The catalog advertises them and streamGenerateContent refuses them.
+                # Hiding them would lose real information; advertising them as served would
+                # repeat the defect.
+                notes.append(
+                    "the catalog advertises it but streamGenerateContent returns 400 "
+                    "INVALID_ARGUMENT for this variant"
+                )
+            served = not broken
+        else:
+            # Measured beats advertised, both ways: a `BROKEN_WIRE` name that answers
+            # becomes verified, and a clean name that returns the retirement warning does
+            # not. The name decides nothing here.
+            served = verdict.served is True
+            if verdict.note:
+                notes.append(verdict.note)
         discovered.append(
             DiscoveredModel(
                 wire_name=wire,
                 suggested_name=suggested_name(wire),
-                verified=not broken,
+                verified=served,
                 note="; ".join(notes),
+                family=_catalog_family(catalog.info.get(wire)),
             )
         )
     return discovered
 
 
+def _catalog_family(entry: Any) -> str:
+    """The family of a catalog entry, from its ``modelProvider``.
+
+    ``modelProvider`` is read and not ``apiProvider``: the second says which way Antigravity
+    speaks (measured: ``API_PROVIDER_GOOGLE_GEMINI`` even for the `claude-*` ones), the
+    first says whose the model is — and the LiteLLM pricing table depends on whose the model
+    is. An entry with an unexpected shape or an enum outside the table gives ``""``: the
+    caller has a fallback prefix, and inventing a family here would trade zero cost for
+    wrong cost.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    return MODEL_FAMILY_BY_PROVIDER.get(str(entry.get("modelProvider") or ""), "")
+
+
 # omp: discovery/antigravity.ts :: FETCH_AVAILABLE_MODELS_PATH
+# omp= discovery/antigravity.ts :: FETCH_AVAILABLE_MODELS_PATH = "/v1internal:fetchAvailableModels"
 async def _fetch_catalog(
     credential: Credential, *, client: httpx.AsyncClient
 ) -> dict[str, Any] | None:
-    """Payload de ``:fetchAvailableModels``, ou ``None`` se nenhum endpoint respondeu.
+    """The ``:fetchAvailableModels`` payload, or ``None`` if no endpoint answered.
 
-    Percorre os dois hosts como o resto do pacote: um host em baixo não é uma conta sem
-    modelos.
+    It walks both hosts like the rest of the package: a host being down is not an account
+    with no models.
     """
     headers = {
         "Authorization": f"Bearer {credential.access_token}",
@@ -303,7 +408,141 @@ async def _fetch_catalog(
     return None
 
 
-# -- Anthropic e Codex: lista curada + sonda -----------------------------------
+async def _probe_catalog(
+    credential: Credential,
+    wires: tuple[str, ...],
+    *,
+    client: httpx.AsyncClient,
+) -> dict[str, _Probe]:
+    """Probe every catalog name, in parallel and under the same ceiling as the curated list.
+
+    The ceiling matters more here than on the curated path: the measured account's catalog
+    has 32 names, and without a semaphore connecting the subscription opened 32 connections
+    at once to the same backend — which Google treats as a spike and answers with 503.
+    """
+    limit = asyncio.Semaphore(PROBE_CONCURRENCY)
+
+    async def guarded(wire: str) -> _Probe:
+        async with limit:
+            return await _probe_antigravity(client, credential, wire)
+
+    results = await asyncio.gather(*(guarded(wire) for wire in wires))
+    return dict(zip(wires, results, strict=True))
+
+
+async def _probe_antigravity(
+    client: httpx.AsyncClient, credential: Credential, wire: str
+) -> _Probe:
+    """Minimal ``:streamGenerateContent`` turn for one catalog name.
+
+    ``"2 + 2"`` is sent rather than a lone character because the difference only shows up
+    with an answerable request: measured, `gemini-3.5-flash-lite` returns "2 + 2 = 4" with
+    12 tokens, while `gemini-3.5-flash-low` returns, for the same request and with HTTP
+    200, "Gemini 3.5 Flash is no longer available. Please switch to Gemini 3.7 Flash..."
+    with usage at zero. An empty prompt left the two indistinguishable — both "answered
+    200".
+
+    Four verdicts, and the distinction between them is this module's value:
+
+    * 200 with real content -> served;
+    * 200 with the retirement warning and usage at zero -> not served, with its own note;
+    * 400 INVALID_ARGUMENT (measured: `chat_23310`, `chat_20706`,
+      `tab_jump_flash_lite_preview`) -> not served, the upstream refused;
+    * anything else — 503 "No capacity available" (measured on `gpt-oss-120b-medium` and
+      `gemini-2.5-pro`), a timeout, the network being down — -> unprobed. That is Google's
+      capacity or this machine's network, never a fact about the account, and treating it
+      as a refusal switched off a good model until the next discovery.
+    """
+    body = {
+        "project": credential.project_id,
+        "requestId": _probe_request_id(wire),
+        "model": wire,
+        "userAgent": "antigravity",
+        "requestType": "agent",
+        "request": {
+            "contents": [{"role": "user", "parts": [{"text": "2 + 2"}]}],
+            "generationConfig": {"maxOutputTokens": PROBE_MAX_OUTPUT_TOKENS},
+        },
+    }
+    headers = {
+        "Authorization": f"Bearer {credential.access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": ANTIGRAVITY_USER_AGENT,
+        "accept": "text/event-stream",
+    }
+    url = hosts.HOSTS[0] + hosts.STREAM_PATH
+    try:
+        async with client.stream(
+            "POST", url, json=body, headers=headers, timeout=PROBE_TIMEOUT_S
+        ) as response:
+            if response.status_code != 200:
+                return _antigravity_status(response.status_code)
+            lines = [line async for line in response.aiter_lines()]
+    except httpx.HTTPError as exc:
+        return _unprobed(f"{type(exc).__name__}: {exc}")
+
+    return _antigravity_stream(lines)
+
+
+def _antigravity_status(status: int) -> _Probe:
+    """Verdict from a status that is not 200."""
+    if status == 400:
+        # CCA refusing a name. Measured: `chat_23310` and `tab_jump_flash_lite_preview`
+        # give this, while `tab_flash_lite_preview` — same prefix — answers.
+        return _Probe(False, "upstream refused: HTTP 400")
+    return _Probe(
+        None,
+        f"could not probe: upstream responded HTTP {status}, which does not distinguish "
+        f"an unserved model from a temporary outage",
+    )
+
+
+def _antigravity_stream(lines: list[str]) -> _Probe:
+    """Verdict from the events of a stream with HTTP 200.
+
+    The text of every event is joined before deciding because the retirement warning arrives
+    split across several ``parts`` like any other response: looking only at the first event
+    classified a dead model as alive.
+    """
+    text: list[str] = []
+    usage: dict[str, Any] | None = None
+    for event in sse.iter_events(lines):
+        if isinstance(error := event.get("error"), dict) and int(error.get("code") or 0) >= 400:
+            # In-band error: CCA returns it inside a 200, as `plugin.py` documents. The
+            # status alone said "served".
+            return _Probe(False, f"upstream refused: HTTP {error.get('code')} in band")
+        payload = event.get("response") or {}
+        if isinstance(meta := payload.get("usageMetadata"), dict):
+            usage = meta
+        for candidate in payload.get("candidates") or []:
+            for part in (candidate.get("content") or {}).get("parts") or []:
+                text.append(str(part.get("text") or ""))
+
+    joined = "".join(text)
+    if is_retired_response(joined, usage):
+        return _Probe(False, "model retired by upstream")
+    if joined.strip():
+        return _Probe(True)
+    # A 200 with no text at all. Measured: `gemini-pro-agent` answers empty to "hi" and is
+    # still served, so this is not a refusal — it is a probe that measured nothing.
+    return _Probe(None, "could not probe: the stream closed with no content")
+
+
+def _unprobed(detail: str) -> _Probe:
+    """Transport failure on a catalog probe: unprobed, never "not served"."""
+    return _Probe(None, f"could not probe: {detail}")
+
+
+def _probe_request_id(wire: str) -> str:
+    """``requestId`` in the format CCA requires (`plugin.py :: _request_id`).
+
+    The step is the probed name instead of a counter: the probes run in parallel and a
+    shared counter would impose no order at all, only different ids.
+    """
+    return f"agent/mysubs-discovery/{int(time.time() * 1000)}/probe/{wire}"
+
+
+# -- Anthropic and Codex: curated list + probe ---------------------------------
 
 
 async def _discover_probed(
@@ -311,12 +550,15 @@ async def _discover_probed(
     curated: tuple[str, ...],
     probe: Probe,
     client: httpx.AsyncClient,
+    *,
+    family: str,
 ) -> list[DiscoveredModel]:
-    """Sonda a lista curada, em paralelo e com tecto de concorrência.
+    """Probe the curated list, in parallel and under a concurrency ceiling.
 
-    Um nome recusado pelo upstream sai da lista — não é servido, e oferecê-lo produzia um
-    deployment que só sabe dar 404. Um nome que a sonda não conseguiu perguntar fica, com
-    ``verified=False`` e a razão: a rede desta máquina não é um facto sobre a conta.
+    A name the upstream refuses leaves the list — it is not served, and offering it produced
+    a deployment that only knows how to return 404. A name the probe could not ask about
+    stays, with ``verified=False`` and the reason: this machine's network is not a fact
+    about the account.
     """
     limit = asyncio.Semaphore(PROBE_CONCURRENCY)
 
@@ -336,6 +578,7 @@ async def _discover_probed(
                 suggested_name=suggested_name(wire),
                 verified=result.served is True,
                 note=result.note,
+                family=family,
             )
         )
     return discovered
@@ -348,10 +591,10 @@ async def _post_status(
     body: dict[str, Any],
     headers: dict[str, str],
 ) -> tuple[int, str]:
-    """Estado, e corpo apenas quando não é 200.
+    """The status, and the body only when it is not 200.
 
-    Em stream para que uma sonda bem sucedida feche a ligação logo a seguir aos
-    cabeçalhos: o que interessa é o veredicto, não os tokens gerados.
+    Streamed so that a successful probe closes the connection right after the headers: what
+    matters is the verdict, not the generated tokens.
     """
     async with client.stream("POST", url, json=body, headers=headers) as response:
         if response.status_code == 200:
@@ -360,19 +603,19 @@ async def _post_status(
 
 
 def _unreachable(exc: httpx.HTTPError) -> _Probe:
-    """Falha de transporte: por verificar, e nunca "não servido"."""
+    """Transport failure: unverified, and never "not served"."""
     return _Probe(
         None,
-        f"a sonda não chegou ao upstream ({type(exc).__name__}: {exc}); "
-        f"por verificar, não recusado",
+        f"the probe did not reach the upstream ({type(exc).__name__}: {exc}); "
+        f"unverified, not refused",
     )
 
 
 async def _probe_anthropic(client: httpx.AsyncClient, credential: Credential, wire: str) -> _Probe:
-    """Pedido mínimo de mensagens: ``max_tokens=1`` e um turno de um caractere.
+    """Minimal messages request: ``max_tokens=1`` and a one-character turn.
 
-    O bloco de identidade tem de vir primeiro mesmo numa sonda — medido: ``system`` só com
-    o prompt do cliente devolve 429, e um 429 aqui era indistinguível de quota.
+    The identity block has to come first even in a probe — measured: a ``system`` carrying
+    only the client prompt returns 429, and a 429 here was indistinguishable from quota.
     """
     body: dict[str, Any] = {
         "model": wire,
@@ -398,20 +641,20 @@ async def _probe_anthropic(client: httpx.AsyncClient, credential: Credential, wi
     if status == 200:
         return _Probe(True)
     if status == 404 and ANTHROPIC_NOT_FOUND_MARKER in text:
-        return _Probe(False, "o upstream recusou o nome com not_found_error")
+        return _Probe(False, "upstream refused the name with not_found_error")
     return _Probe(
         None,
-        f"o upstream respondeu HTTP {status}, que não distingue modelo inexistente de "
-        f"recusa temporária; por verificar",
+        f"upstream responded HTTP {status}, which does not distinguish a nonexistent "
+        f"model from a temporary refusal; unverified",
     )
 
 
 async def _probe_codex(client: httpx.AsyncClient, credential: Credential, wire: str) -> _Probe:
-    """Turno mínimo na Responses API, com o raciocínio desligado.
+    """Minimal turn on the Responses API, with reasoning switched off.
 
-    A recusa de nome do Codex é um 400 com marca própria, e é `transport.retry` que a
-    reconhece — a mesma função que o transporte usa em produção, para que a sonda e o
-    caminho real não possam divergir na definição de "não servido".
+    Codex refusing a name is a 400 with its own marker, and it is `transport.retry` that
+    recognises it — the same function the transport uses in production, so that the probe
+    and the real path cannot diverge on the definition of "not served".
     """
     body = codex.build_request_body(
         wire,
@@ -431,18 +674,18 @@ async def _probe_codex(client: httpx.AsyncClient, credential: Credential, wire: 
     if status == 200:
         return _Probe(True)
     if status == 404 or (status == 400 and is_unsupported_model(text)):
-        return _Probe(False, "a conta ChatGPT não serve este modelo")
+        return _Probe(False, "this ChatGPT account does not serve this model")
     return _Probe(
         None,
-        f"o upstream respondeu HTTP {status}, que não distingue modelo inexistente de "
-        f"recusa temporária; por verificar",
+        f"upstream responded HTTP {status}, which does not distinguish a nonexistent "
+        f"model from a temporary refusal; unverified",
     )
 
 
 def _probe_window_id(credential: Credential) -> str:
-    """Identidade de janela das sondas.
+    """Window identity of the probes.
 
-    Derivada da conta e não aleatória: o backend usa o ``window_id`` para o cache de
-    prompt, e um id novo por sonda envelhecia o cache da sessão real do utilizador.
+    Derived from the account and not random: the backend uses ``window_id`` for the prompt
+    cache, and a new id per probe aged the cache of the user's real session.
     """
     return f"mysubs-discovery-{codex.account_id(credential.access_token) or 'anon'}"

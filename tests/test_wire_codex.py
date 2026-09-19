@@ -1,7 +1,8 @@
-"""Contrato de wire do Codex (Responses API).
+"""Codex wire contract (Responses API).
 
-O corpo é construído de raiz, não ajustado: cada campo que falta é um comportamento que
-desaparece em silêncio (reasoning sem eventos, cache sem hits, multimodal sem imagem).
+The body is built from scratch, not adjusted: every missing field is a behaviour that
+disappears silently (reasoning with no events, cache with no hits, multimodal with no
+image).
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from litellm_mysubs.wire import codex
 
 
 def jwt(payload: dict[str, Any]) -> str:
-    """JWT sem assinatura: só o corpo importa, e não se verifica nada ao lê-lo."""
+    """Unsigned JWT: only the body matters, and nothing is verified when reading it."""
     body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
     return f"header.{body}.signature"
 
@@ -37,13 +38,13 @@ class TestAliases:
         [("gpt-5", "gpt-5.5"), ("codex", "gpt-5.5"), ("gpt-6", "gpt-6-astra")],
     )
     def test_family_aliases_resolve(self, requested: str, wire: str) -> None:
-        """Nomes de família não prometem versão, logo resolvê-los é honesto."""
+        """Family names promise no version, so resolving them is honest."""
         assert codex.resolve_model(requested) == wire
 
     @pytest.mark.parametrize("name", ["gpt-5.4", "gpt-5.4-mini"])
     def test_version_names_are_not_remapped(self, name: str) -> None:
-        """Nomeiam uma versão que a conta não serve: remapear facturava o cliente contra
-        um modelo que nunca correu. A recusa do upstream é a resposta correcta."""
+        """They name a version the account does not serve: remapping would bill the client
+        against a model that never ran. The upstream refusal is the correct answer."""
         assert codex.resolve_model(name) == name
 
     def test_provider_prefix_stripped(self) -> None:
@@ -67,9 +68,9 @@ class TestTokenClaims:
         token = jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-1"}})
         assert codex.account_id(token) == "acct-1"
 
-    @pytest.mark.parametrize("token", ["", "nao-e-jwt", "a.b", "a.!!!.c"])
+    @pytest.mark.parametrize("token", ["", "not-a-jwt", "a.b", "a.!!!.c"])
     def test_malformed_token_is_empty(self, token: str) -> None:
-        """Um token partido não pode rebentar a construção do pedido."""
+        """A broken token must not blow up building the request."""
         assert codex.token_claims(token) == {}
         assert codex.account_id(token) is None
 
@@ -83,16 +84,16 @@ class TestHeaders:
         assert headers["session_id"] == "w-1"
 
     def test_installation_id_is_not_sent(self) -> None:
-        """O OMP apaga-o explicitamente dos cabeçalhos; viaja só no envelope."""
+        """OMP deletes it from the headers explicitly; it travels only in the envelope."""
         assert "x-codex-installation-id" not in codex.build_headers(jwt({}), window_id="w")
 
     def test_request_kind_is_from_the_vocabulary(self) -> None:
-        """ "chat" não pertence ao conjunto "turn" | "prewarm" | "compaction"."""
+        """ "chat" does not belong to the set "turn" | "prewarm" | "compaction"."""
         headers = codex.build_headers(jwt({}), window_id="w")
         assert json.loads(headers["x-codex-turn-metadata"])["request_kind"] == "turn"
 
     def test_routing_hint_carries_the_model(self) -> None:
-        """O backend usa-a para escolher a rota; sem ela o encaminhamento é o default."""
+        """The backend uses it to pick the route; without it routing is the default."""
         headers = codex.build_headers(jwt({}), window_id="w", model="gpt-5.5")
         assert headers["x-codex-routing-hint"] == "model=gpt-5.5"
 
@@ -107,7 +108,7 @@ class TestHeaders:
         assert headers["session_id"] == "s-token"
 
     def test_turn_state_echoed_when_present(self) -> None:
-        """O backend devolve-o e espera-o de volta no turno seguinte."""
+        """The backend returns it and expects it back on the next turn."""
         headers = codex.build_headers(jwt({}), window_id="w", turn_state="st-1")
         assert headers["x-codex-turn-state"] == "st-1"
 
@@ -116,8 +117,8 @@ class TestHeaders:
         assert "x-codex-turn-state" not in headers
 
     def test_residency_header_only_for_constrained_workspaces(self) -> None:
-        """401 "Workspace is not authorized in this region" quando falta; contas
-        pessoais não têm a claim e o header não deve viajar."""
+        """401 "Workspace is not authorized in this region" when it is missing; personal
+        accounts do not have the claim and the header must not travel."""
         constrained = codex.build_headers(
             jwt({"https://api.openai.com/auth": {"chatgpt_data_residency": "eu"}}),
             window_id="w",
@@ -147,14 +148,14 @@ class TestMultimodal:
         }
 
     def test_detail_original_survives_when_host_supports_it(self) -> None:
-        """`original` é o único nível que preserva a resolução nativa de uma screenshot;
-        forçá-lo sempre a "auto" degradava-a contra hosts que o servem."""
+        """`original` is the only level that preserves a screenshot's native resolution;
+        always forcing it to "auto" degraded it against hosts that do serve it."""
         part = codex.image_part({"image_url": {"url": "u", "detail": "original"}})
         assert part is not None and part["detail"] == "original"
 
     def test_detail_original_degrades_when_host_rejects_it(self) -> None:
-        """Hosts como o GitHub Copilot devolvem 400 a `original`; degradar salva o pedido
-        em vez de o perder."""
+        """Hosts such as GitHub Copilot return 400 for `original`; degrading saves the
+        request instead of losing it."""
         part = codex.image_part(
             {"image_url": {"url": "u", "detail": "original"}}, supports_detail_original=False
         )
@@ -165,8 +166,8 @@ class TestMultimodal:
         assert part is not None and part["detail"] == "auto"
 
     def test_image_by_file_id_is_not_discarded(self) -> None:
-        """Uma imagem já carregada no backend não tem url; sem este ramo desaparecia em
-        silêncio e o modelo respondia sobre algo que nunca viu."""
+        """An image already uploaded to the backend has no url; without this branch it
+        disappeared silently and the model answered about something it never saw."""
         part = codex.image_part({"type": "input_image", "image_url": {"file_id": "file-7"}})
         assert part == {"type": "input_image", "detail": "auto", "file_id": "file-7"}
 
@@ -189,19 +190,19 @@ class TestMultimodal:
         assert codex.file_part({"file": {}}) is None
 
     def test_parts_preserve_image_alongside_text(self) -> None:
-        """Antes disto o pedido chegava só com o texto e o modelo falava de uma imagem
-        que nunca viu."""
+        """Before this the request arrived with the text only and the model talked about
+        an image it never saw."""
         parts = codex.content_to_parts(
             [
-                {"type": "text", "text": "que cor?"},
+                {"type": "text", "text": "what colour?"},
                 {"type": "image_url", "image_url": {"url": "u"}},
             ]
         )
         assert [p["type"] for p in parts] == ["input_text", "input_image"]
 
     def test_assistant_parts_use_output_text(self) -> None:
-        parts = codex.content_to_parts("resposta", assistant=True)
-        assert parts == [{"type": "output_text", "text": "resposta"}]
+        parts = codex.content_to_parts("answer", assistant=True)
+        assert parts == [{"type": "output_text", "text": "answer"}]
 
     def test_empty_content_yields_no_parts(self) -> None:
         assert codex.content_to_parts("") == []
@@ -210,7 +211,7 @@ class TestMultimodal:
 
 class TestCallIds:
     def test_composite_joins_pair(self) -> None:
-        """Sem o par exacto, chamadas paralelas desalinham-se no replay."""
+        """Without the exact pair, parallel calls go out of alignment on replay."""
         assert codex.composite_call_id("call-1", "item-9") == "call-1|item-9"
 
     def test_identical_ids_not_doubled(self) -> None:
@@ -228,9 +229,9 @@ class TestCallIds:
 
 class TestToolPairRepair:
     def test_orphan_output_becomes_message(self) -> None:
-        """Um histórico truncado traz outputs sem a chamada; o Responses rejeita-os."""
+        """A truncated history brings outputs without the call; Responses rejects them."""
         items = codex.repair_tool_pairs(
-            [{"type": "function_call_output", "call_id": "orphan", "output": "perdido"}]
+            [{"type": "function_call_output", "call_id": "orphan", "output": "lost"}]
         )
         assert items[0]["type"] == "message"
         assert "orphan" in items[0]["content"]
@@ -250,16 +251,16 @@ class TestToolPairRepair:
         assert codex.repair_tool_pairs(pair) == pair
 
     def test_orphan_custom_tool_call_gets_custom_output(self) -> None:
-        """Um `custom_tool_call` órfão dava 400 por não ser indexado; e o output que o
-        fecha tem de ser do mesmo tipo, senão o 400 volta."""
+        """An orphan `custom_tool_call` gave 400 for not being indexed; and the output
+        that closes it has to be of the same kind, otherwise the 400 comes back."""
         items = codex.repair_tool_pairs(
             [{"type": "custom_tool_call", "call_id": "c2", "name": "f", "input": "x"}]
         )
         assert [i["type"] for i in items] == ["custom_tool_call", "custom_tool_call_output"]
 
     def test_orphan_computer_call_becomes_note(self) -> None:
-        """A screenshot que faltou não se sintetiza: a chamada passa a nota, com o texto
-        exacto que o OMP usa."""
+        """The missing screenshot is not synthesised: the call becomes a note, with the
+        exact text OMP uses."""
         items = codex.repair_tool_pairs([{"type": "computer_call", "call_id": "c3"}])
         assert items == [
             {
@@ -272,8 +273,8 @@ class TestToolPairRepair:
         ]
 
     def test_mismatched_kinds_do_not_pair(self) -> None:
-        """Emparelhar por `call_id` só fazia um `custom` output "fechar" um `function`
-        call; o backend recusa a troca e ambas as metades precisam de reparação."""
+        """Pairing by `call_id` alone made a `custom` output "close" a `function` call; the
+        backend refuses the swap and both halves need repair."""
         items = codex.repair_tool_pairs(
             [
                 {"type": "function_call", "call_id": "c4", "name": "f", "arguments": "{}"},
@@ -296,19 +297,19 @@ class TestToolPairRepair:
 
 class TestMessagesToInput:
     def test_first_system_prompt_goes_to_instructions(self) -> None:
-        """`instructions` é o prompt base que o backend cacheia; mandá-lo como item
-        developer perde o tratamento e o hit de cache."""
-        instructions, items = codex.messages_to_input([{"role": "system", "content": "regra"}])
-        assert instructions == "regra"
+        """`instructions` is the base prompt the backend caches; sending it as a developer
+        item loses that treatment and the cache hit."""
+        instructions, items = codex.messages_to_input([{"role": "system", "content": "rule"}])
+        assert instructions == "rule"
         assert not any(i.get("role") == "developer" for i in items)
 
     def test_extra_system_prompts_become_developer_items(self) -> None:
-        """`instructions` é uma string: o segundo prompt não cabe lá e perdia-se."""
+        """`instructions` is a string: the second prompt does not fit there and was lost."""
         instructions, items = codex.messages_to_input(
             [
                 {"role": "system", "content": "base"},
                 {"role": "system", "content": "extra"},
-                {"role": "user", "content": "olá"},
+                {"role": "user", "content": "hello"},
             ]
         )
         assert instructions == "base"
@@ -320,42 +321,42 @@ class TestMessagesToInput:
         assert items[1]["role"] == "user"
 
     def test_developer_only_input_promotes_last_instruction_to_user(self) -> None:
-        """Sem um turno visível o backend devolve resposta vazia; promover a última
-        instrução dá-lhe algo a que responder."""
+        """Without a visible turn the backend returns an empty response; promoting the
+        last instruction gives it something to answer."""
         _, items = codex.messages_to_input(
             [
                 {"role": "system", "content": "base"},
-                {"role": "system", "content": "faz isto"},
+                {"role": "system", "content": "do this"},
             ]
         )
         assert items[-1] == {
             "type": "message",
             "role": "user",
-            "content": [{"type": "input_text", "text": "faz isto"}],
+            "content": [{"type": "input_text", "text": "do this"}],
         }
 
     def test_single_system_prompt_promotes_instructions_to_user(self) -> None:
-        """Só um system prompt: `instructions` é o único texto que existe, e o input
-        ficaria vazio."""
-        instructions, items = codex.messages_to_input([{"role": "system", "content": "regra"}])
-        assert instructions == "regra"
+        """Only one system prompt: `instructions` is the only text there is, and the input
+        would be left empty."""
+        instructions, items = codex.messages_to_input([{"role": "system", "content": "rule"}])
+        assert instructions == "rule"
         assert items == [
             {
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": "regra"}],
+                "content": [{"type": "input_text", "text": "rule"}],
             }
         ]
 
     def test_user_turn_suppresses_promotion(self) -> None:
-        """Com turno de utilizador não se duplica a instrução no input."""
+        """With a user turn the instruction is not duplicated into the input."""
         _, items = codex.messages_to_input(
-            [{"role": "system", "content": "base"}, {"role": "user", "content": "olá"}]
+            [{"role": "system", "content": "base"}, {"role": "user", "content": "hello"}]
         )
-        assert [i["content"][0]["text"] for i in items] == ["olá"]
+        assert [i["content"][0]["text"] for i in items] == ["hello"]
 
     def test_unknown_role_falls_back_to_user(self) -> None:
-        _, items = codex.messages_to_input([{"role": "bizarro", "content": "x"}])
+        _, items = codex.messages_to_input([{"role": "weird", "content": "x"}])
         assert items[0]["role"] == "user"
 
     def test_tool_message_becomes_function_call_output(self) -> None:
@@ -371,13 +372,13 @@ class TestMessagesToInput:
                         }
                     ],
                 },
-                {"role": "tool", "tool_call_id": "c1", "content": "resultado"},
+                {"role": "tool", "tool_call_id": "c1", "content": "result"},
             ]
         )
         assert [i["type"] for i in items] == ["function_call", "function_call_output"]
 
     def test_dict_arguments_are_serialised(self) -> None:
-        """O Responses exige arguments como string JSON."""
+        """Responses requires arguments as a JSON string."""
         _, items = codex.messages_to_input(
             [
                 {
@@ -405,7 +406,7 @@ class TestTools:
         ]
 
     def test_hosted_tool_passes_with_own_spec(self) -> None:
-        """Não têm `function` e eram descartadas antes disto."""
+        """They have no `function` and were discarded before this."""
         tools = codex.tools_to_codex_tools([{"type": "web_search"}])
         assert tools == [{"type": "web_search"}]
 
@@ -428,38 +429,39 @@ class TestTools:
 
 class TestRequestBody:
     def test_reasoning_object_always_present(self) -> None:
-        """Sem ele, zero eventos response.reasoning_summary_text.delta."""
+        """Without it, zero response.reasoning_summary_text.delta events."""
         body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
         assert body["reasoning"] == {"effort": "medium", "summary": "auto"}
 
     def test_all_turns_context_is_not_forced(self) -> None:
-        """O OMP só o força no transporte Lite e apaga-o nos modelos que não o suportam."""
+        """OMP only forces it on the Lite transport and deletes it on models that do not
+        support it."""
         body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
         assert "context" not in body["reasoning"]
 
     def test_encrypted_reasoning_is_requested(self) -> None:
-        """Sem isto não há replay de raciocínio num histórico stateless."""
+        """Without this there is no reasoning replay in a stateless history."""
         body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
         assert body["include"] == ["reasoning.encrypted_content"]
 
     def test_effort_none_adds_juice_item_on_new_generations(self) -> None:
-        """GPT-5.6+ continua a reservar juice com o reasoning desligado.
+        """GPT-5.6+ still reserves juice with reasoning turned off.
 
-        O valor é o do effort pedido, não zero: desligar o raciocínio não significa que o
-        modelo deva ficar sem orçamento nenhum.
+        The value is the one of the requested effort, not zero: turning reasoning off does
+        not mean the model should be left with no budget at all.
         """
         body = codex.build_request_body(
             "gpt-5.6-terra", [{"role": "user", "content": "x"}], extra={"reasoning_effort": "none"}
         )
         assert "reasoning" not in body
-        # `none` é o pedido explícito de desligar; o juice segue esse valor.
+        # `none` is the explicit request to turn it off; the juice follows that value.
         assert (
             body["input"][-1]["content"][0]["text"] == f"# Juice: {codex.JUICE['none']} !important"
         )
 
     def test_juice_follows_a_separate_effort_when_given(self) -> None:
-        """No OMP o desligar é um flag à parte do effort: quem pede `high` e desliga o
-        raciocínio continua a reservar o orçamento de `high`."""
+        """In OMP turning it off is a flag separate from the effort: whoever asks for
+        `high` and turns reasoning off still reserves the `high` budget."""
         body = codex.build_request_body(
             "gpt-5.6-terra",
             [{"role": "user", "content": "x"}],
@@ -471,7 +473,7 @@ class TestRequestBody:
 
     def test_juice_defaults_to_medium(self) -> None:
         assert codex.juice_for(None) == codex.JUICE["medium"]
-        assert codex.juice_for("inventado") == codex.JUICE["medium"]
+        assert codex.juice_for("made-up") == codex.JUICE["medium"]
 
     def test_juice_follows_the_requested_effort(self) -> None:
         assert codex.juice_for("high") == 48
@@ -488,7 +490,7 @@ class TestRequestBody:
         body = codex.build_request_body(
             "gpt-5.5",
             [{"role": "user", "content": "x"}],
-            extra={"reasoning_effort": {"effort": "high", "summary": "inventado"}},
+            extra={"reasoning_effort": {"effort": "high", "summary": "made-up"}},
         )
         assert body["reasoning"]["summary"] == "auto"
 
@@ -497,25 +499,25 @@ class TestRequestBody:
         assert body["stream"] is True and body["store"] is False
 
     def test_cache_key_is_the_session_identity(self) -> None:
-        """Derivar do conteúdo fazia duas conversas com o mesmo prompt de sistema
-        partilharem chave — entre sessões e entre utilizadores."""
+        """Deriving it from the content made two conversations with the same system prompt
+        share a key — across sessions and across users."""
         body = codex.build_request_body(
-            "gpt-5.5", [{"role": "user", "content": "x"}], session_id="sessao-1"
+            "gpt-5.5", [{"role": "user", "content": "x"}], session_id="session-1"
         )
-        assert body["prompt_cache_key"] == "sessao-1"
+        assert body["prompt_cache_key"] == "session-1"
 
     def test_cache_key_survives_history_edits(self) -> None:
-        """A mesma sessão mantém o hit mesmo com a cabeça da conversa editada."""
+        """The same session keeps the hit even with the head of the conversation edited."""
         first = codex.build_request_body(
             "gpt-5.5", [{"role": "user", "content": "original"}], session_id="s"
         )
         later = codex.build_request_body(
-            "gpt-5.5", [{"role": "user", "content": "editada"}], session_id="s"
+            "gpt-5.5", [{"role": "user", "content": "edited"}], session_id="s"
         )
         assert first["prompt_cache_key"] == later["prompt_cache_key"]
 
     def test_cache_can_be_disabled(self) -> None:
-        """Sem isto não havia forma de o chamador dispensar o cache."""
+        """Without this there was no way for the caller to opt out of the cache."""
         body = codex.build_request_body(
             "gpt-5.5",
             [{"role": "user", "content": "x"}],

@@ -1,8 +1,8 @@
-"""Leitura de Server-Sent Events.
+"""Server-Sent Events reading.
 
-Separado do transporte porque é a parte que engana: um evento partido a meio, um `[DONE]`
-com espaços, um comentário de keep-alive. Cada um destes já custou um stream a alguém, e
-nenhum precisa de socket para ser testado.
+Kept apart from the transport because this is the deceptive part: an event split in half, a
+`[DONE]` with stray spaces, a keep-alive comment. Each of these has already cost someone a
+stream, and none of them needs a socket to be tested.
 """
 
 from __future__ import annotations
@@ -16,13 +16,13 @@ DONE: Final = "[DONE]"
 
 
 def parse_line(line: str) -> tuple[bool, Any]:
-    """Interpreta uma linha de SSE.
+    """Parse one SSE line.
 
-    Devolve ``(terminou, payload)``. ``payload`` é ``None`` quando a linha não traz dados
-    utilizáveis — comentário, linha em branco, ou JSON que não abre.
+    Returns ``(done, payload)``. ``payload`` is ``None`` when the line carries no usable
+    data — a comment, a blank line, or JSON that does not parse.
 
-    Um evento malformado é ignorado, não levanta: o upstream intercala keep-alives e
-    fragmentos, e matar o stream por causa de um deles perdia a resposta inteira.
+    A malformed event is ignored, not raised: the upstream interleaves keep-alives and
+    fragments, and killing the stream over one of them would lose the whole response.
     """
     stripped = line.strip()
     if not stripped.startswith(DATA_PREFIX):
@@ -41,7 +41,7 @@ def parse_line(line: str) -> tuple[bool, Any]:
 
 
 def iter_events(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
-    """Eventos decodificados, parando no ``[DONE]``."""
+    """Decoded events, stopping at ``[DONE]``."""
     for line in lines:
         done, event = parse_line(line)
         if done:
