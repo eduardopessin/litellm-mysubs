@@ -3,6 +3,10 @@
 Serve your Claude Max, ChatGPT Plus (Codex) and Google Antigravity subscriptions as ordinary
 OpenAI-compatible models through [LiteLLM](https://github.com/BerriAI/litellm).
 
+The wire protocols are a Python port of [`@oh-my-pi/pi-ai`](https://github.com/can1357/oh-my-pi) —
+see [where the wiring comes from](#where-the-wiring-comes-from). What is built here is the
+LiteLLM side: the plugin, the UI, and the credential handling.
+
 [![PyPI](https://img.shields.io/pypi/v/litellm-mysubs.svg)](https://pypi.org/project/litellm-mysubs/)
 [![Python](https://img.shields.io/pypi/pyversions/litellm-mysubs.svg)](https://pypi.org/project/litellm-mysubs/)
 [![CI](https://github.com/eduardopessin/litellm-mysubs/actions/workflows/ci.yml/badge.svg)](https://github.com/eduardopessin/litellm-mysubs/actions/workflows/ci.yml)
@@ -201,11 +205,21 @@ upgrade into a red build instead of a production outage.
 
 ## Where the wiring comes from
 
-The protocol work is a Python port of [`@oh-my-pi/pi-ai`](https://www.npmjs.com/package/@oh-my-pi/pi-ai)
-and its sibling packages ([`can1357/oh-my-pi`](https://github.com/can1357/oh-my-pi)) — the
+The protocol layer is a Python port of [`@oh-my-pi/pi-ai`](https://www.npmjs.com/package/@oh-my-pi/pi-ai)
+and its sibling packages ([`can1357/oh-my-pi`](https://github.com/can1357/oh-my-pi)): the
 headers each provider expects, the client versions they check, the endpoint paths, the
-shape of every stream event. That is published work, and this package does not pretend to
-have discovered it.
+schema normalisation, the shape of every stream event. That is published work, and this
+package does not pretend to have discovered any of it. **If you want the wire logic
+itself, go there — it is the source of truth, and when a provider changes, the fix appears
+there first.**
+
+Concretely, 13 of the 45 modules carry `# omp:` anchors and are ported — everything under
+`wire/`, plus `credentials/oauth.py`, `catalog/discovery.py`, `catalog/usage.py`,
+`catalog/usage_probe.py` and `transport/hosts.py`. That is roughly half the source by line
+count. The other half is what makes it a LiteLLM plugin rather than a library: the
+streaming patch and dispatch (`plugin.py`), the mounted UI and its OAuth pairing (`ui/`),
+credential storage and cross-process refresh (`credentials/`, minus `oauth.py`), Router
+injection and persistence, and the installer.
 
 What the port adds is traceability. Every borrowed constant carries an anchor naming its
 source:
