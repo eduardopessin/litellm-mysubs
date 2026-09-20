@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documented
+
+- **Known incompatibility with `store_model_in_db: true`.** The proxy schedules an
+  `add_deployment` reconcile every 30s whose cleanup step deletes every Router entry that
+  is in neither the database nor `config.yaml` — unconditionally, and without logging
+  anything. The deployments this plugin injects live in memory, so they are evicted within
+  seconds of being applied. Measured on 1.101.0: 37 models at t+5s, 0 at t+15s.
+
+  The README now carries the diagnosis, the workaround (`store_model_in_db: false`, plus
+  the `STORE_MODEL_IN_DB` environment variable that overrides the YAML), and the
+  three-line upstream change — honouring `model_info.managed_by` in the cleanup loop —
+  that would let a database catalog and a plugin coexist. See `docs/DECISIONS.md` (D11)
+  for why it is not worked around in-tree.
+
 ## [0.1.1] - 2026-09-19
 
 Two installation bugs found by installing from a clean clone into an empty `HOME` —
