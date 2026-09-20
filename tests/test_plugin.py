@@ -921,3 +921,117 @@ class TestDispatchHonoursTheDeclaredProvider:
 
         assert foreign.get("api_key") != "sk-ant-secret", "the Anthropic token went elsewhere"
         assert ours.get("api_key") == "sk-ant-secret", "the legitimate injection stopped"
+
+
+class TestStreamedCallsCarryACostableIdentity:
+    """A streamed call has to be priceable, or the spend log records it as free.
+
+    The regression these guard: `_wrap_stream` handed the wrapper the public model name
+    and `custom_openai`, neither of which has a rate, so `response_cost_calculator`
+    returned `0.0` for every streamed request. Measured on a live proxy: 74 of 89
+    billable calls logged at zero.
+    """
+
+    @pytest.mark.parametrize(
+        ("public", "wire", "expected"),
+        [
+            (
+                "mysubs/claudecode/claude-opus-5",
+                "anthropic/claude-opus-5",
+                ("anthropic/claude-opus-5", "anthropic"),
+            ),
+            ("mysubs/codex/gpt-5.5", "openai/gpt-5.5", ("openai/gpt-5.5", "openai")),
+            (
+                "mysubs/antigravity/gemini-2.5-pro",
+                "gemini/gemini-2.5-pro",
+                ("gemini/gemini-2.5-pro", "gemini"),
+            ),
+        ],
+    )
+    def test_the_wire_pair_is_what_reaches_the_cost_calculation(
+        self, public: str, wire: str, expected: tuple[str, str]
+    ) -> None:
+        assert plugin._cost_identity(public, {plugin._WIRE_MODEL_KEY: wire}) == expected
+
+    def test_without_a_deployment_the_name_is_not_guessed(self) -> None:
+        """A direct `litellm.acompletion` call has no Router to ask.
+
+        Guessing a family from the name would price the call against another model's
+        rate, which is worse than not pricing it.
+        """
+        assert plugin._cost_identity("gpt-5.5", {}) == ("gpt-5.5", "custom_openai")
+
+    def test_the_wrapper_is_built_with_the_wire_identity(self) -> None:
+        """What the wrapper is given is what the cost calculation sees."""
+
+        async def chunks() -> AsyncIterator[Any]:
+            if False:  # pragma: no cover - an empty stream is enough here
+                yield None
+
+        wrapper = plugin._wrap_stream(
+            chunks(),
+            "mysubs/codex/gpt-5.5",
+            {plugin._WIRE_MODEL_KEY: "openai/gpt-5.5", "messages": []},
+        )
+        # The wrapper keeps the prefix; what matters is that the pair is the priceable
+        # one, not the public name with `custom_openai`.
+        assert wrapper.model == "openai/gpt-5.5"
+        assert wrapper.custom_llm_provider == "openai"
+
+
+class TestTheWireModelIsReadOffOurOwnDeployments:
+    def test_our_deployment_yields_its_wire_name(self) -> None:
+        router = SimpleNamespace(
+            model_list=[
+                {
+                    "model_name": "mysubs/codex/gpt-5.5",
+                    "litellm_params": {"model": "openai/gpt-5.5"},
+                    "model_info": {"mysubs_provider": "openai-codex"},
+                }
+            ]
+        )
+        assert plugin.wire_model_of_deployment(router, "mysubs/codex/gpt-5.5") == "openai/gpt-5.5"
+
+    def test_a_deployment_without_our_mark_is_not_read(self) -> None:
+        """Pricing a call this plugin never served would attribute someone else's cost."""
+        router = SimpleNamespace(
+            model_list=[
+                {
+                    "model_name": "gpt-4",
+                    "litellm_params": {"model": "openai/gpt-4"},
+                    "model_info": {},
+                }
+            ]
+        )
+        assert plugin.wire_model_of_deployment(router, "gpt-4") is None
+
+    def test_an_unknown_name_yields_nothing(self) -> None:
+        assert plugin.wire_model_of_deployment(SimpleNamespace(model_list=[]), "x") is None
+
+
+class TestThePrivateKwargNeverReachesTheProvider:
+    """`mysubs_wire_model` is private to the hop between the Router and the wrapper.
+
+    An unknown kwarg reaching the provider client raises `unexpected keyword argument`
+    and the whole request is lost — a worse failure than the missing cost it fixes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_delegated_call_does_not_receive_it(self, monkeypatch: Any) -> None:
+        seen: dict[str, Any] = {}
+
+        async def fake_original(**kwargs: Any) -> str:
+            seen.update(kwargs)
+            return "delegated"
+
+        monkeypatch.setattr(plugin._state, "original_acompletion", fake_original)
+        monkeypatch.setattr(plugin._state, "store", FakeStore())
+
+        out = await plugin._wrapped_acompletion(
+            model="some-other-model",
+            messages=[{"role": "user", "content": "hi"}],
+            **{plugin._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+
+        assert out == "delegated"
+        assert plugin._WIRE_MODEL_KEY not in seen
