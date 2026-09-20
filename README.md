@@ -157,6 +157,66 @@ local store.
   snapshot labelled with its age. A model name the subscription does not serve returns the
   upstream error — it is never silently answered by a different model.
 
+## Known incompatibility: `store_model_in_db: true`
+
+**The applied models appear and then vanish from the Router within 30 seconds.** If that is
+what you are seeing, this is why, and it is not something the plugin can fix on its own.
+
+With `general_settings.store_model_in_db: true`, the proxy schedules an `add_deployment`
+job every `proxy_config_reload_interval_seconds` — 30 by default. That job reconciles the
+Router against the database, and its cleanup step is unconditional
+(`proxy_server.py :: _delete_deployment`):
+
+```python
+combined_id_list = [ids from the db] + [ids from config.yaml]
+
+for model_id in router_model_ids:
+    if model_id not in combined_id_list:
+        llm_router.delete_deployment(id=model_id)
+```
+
+Anything in the Router that is in neither the database nor `config.yaml` is deleted. The
+deployments this plugin injects live in memory by design — see
+[`registry.py`](src/litellm_mysubs/registry.py) for why `POST /model/new` is not used — so
+they are evicted on the next reconcile. The models in `config.yaml` are unaffected, which
+is what makes the symptom look selective.
+
+Measured on LiteLLM 1.101.0: 37 applied models present 5s after Apply, 0 after 15s, **with
+nothing logged**. The silence is the worst part — there is no error to search for.
+
+### What to do
+
+| | |
+|---|---|
+| **Set `store_model_in_db: false`** | The job is never scheduled (`if store_model_in_db is True:` guards it) and the problem disappears. Virtual keys, spend logs and users still come from the database — only the *model catalog* stops doing so. If you do not create models through the LiteLLM UI, this costs nothing. |
+| **Keep it `true`** | Then the plugin's models cannot currently survive. Pick one or the other. |
+
+If you set it in `config.yaml`, check the environment too: `STORE_MODEL_IN_DB` overrides the
+config file, and a stale `"True"` there will keep the job alive no matter what the YAML says.
+
+### Why this is not worked around here
+
+The plugin already marks every deployment it owns with `model_info.managed_by = "mysubs"`.
+The cleanup loop never looks at it — `Router.delete_deployment()` deletes by id and has no
+notion of an external owner. Honouring that marker upstream would be a three-line change and
+would let both mechanisms coexist:
+
+```python
+for model_id in router_model_ids:
+    if model_id in combined_id_list:
+        continue
+    deployment = llm_router.get_deployment(model_id=model_id)
+    if (deployment.model_info or {}).get("managed_by"):
+        continue          # declared external owner — not an orphan
+    llm_router.delete_deployment(id=model_id)
+```
+
+This is not specific to this package: **any** plugin that injects into the Router through
+`set_model_list` is silently undone while `store_model_in_db` is on. Patching the proxy from
+here would mean monkey-patching a reconcile loop that is entitled to delete what it does not
+recognise — and getting that wrong evicts *your* models, not ours. The honest boundary is to
+document the conflict and fix it upstream.
+
 ### Turning it off
 
 | | |
