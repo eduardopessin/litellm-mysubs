@@ -169,18 +169,26 @@ local store.
 
 | Provider | Model prefix | Wire protocol | Quota reported |
 |---|---|---|---|
-| Claude Max | `mysubs/claudecode/` | Messages | 5h / 7d, from headers + `/api/oauth/usage` |
-| ChatGPT Plus (Codex) | `mysubs/codex/` | Responses API | 5h / 7d, from headers + `wham/usage` |
-| Google Antigravity | `mysubs/antigravity/` | Cloud Code | `:retrieveUserQuotaSummary` only |
+| Claude Max | `mysubs/claudecode/` | Messages | 5h / 7d, from response headers + `/api/oauth/usage` |
+| ChatGPT Plus (Codex) | `mysubs/codex/` | Responses API | 5h / 7d, from response headers + `wham/usage` |
+| Google Antigravity | `mysubs/antigravity/` | Cloud Code | `:retrieveUserQuotaSummary`, falling back to the catalog |
 
 On the wire that means `api.anthropic.com/v1/messages`,
-`chatgpt.com/backend-api/codex/responses`, and `v1internal:streamGenerateContent`.
-Antigravity is the one case where the quota endpoint is the only source: measured against
-the real backend, it returns no rate-limit headers at all.
+`chatgpt.com/backend-api/codex/responses`, and `:streamGenerateContent` on
+`daily-cloudcode-pa.googleapis.com`, with the sandbox host as a fallback.
+
+Antigravity is the one provider that returns no rate-limit headers at all — measured
+against the real backend — so its usage has to be asked for. `:retrieveUserQuotaSummary`
+is tried first, because it is what Antigravity's own UI consults; when it comes back with
+nothing usable, the model catalog carries per-model `quotaInfo` and that is read instead.
+Measured, the catalog gives the three families (Anthropic, Google, OpenAI) the Quota
+Dashboard shows, and for those it is the only source.
 
 Anthropic and Codex have no catalog endpoint for subscription tokens, so their model lists
-come from a curated set of measured names plus a live probe of each one. Antigravity has a
-real catalog (`:fetchAvailableModels`) and it is used directly.
+come from a curated set of measured names, each one probed live against your account before
+it is offered. Antigravity has a real catalog (`:fetchAvailableModels`); its names are read
+from there and then probed the same way, because a name in the catalog is not a promise
+that the account serves it.
 
 ## Development
 
@@ -190,7 +198,7 @@ pytest                  # unit tests
 ruff check . && mypy    # lint and types
 ```
 
-1629 tests, 86% branch coverage (the suite fails below 85%), `ruff` and `mypy --strict`
+1632 tests, 86% branch coverage (the suite fails below 85%), `ruff` and `mypy --strict`
 clean. Tests that touch real LiteLLM internals need the proxy extras:
 
 ```bash
@@ -249,6 +257,8 @@ src/litellm_mysubs/
 ├── transport/     HTTP client, SSE, host failover, retry
 ├── catalog/       discovery of the models a subscription actually serves, quota
 ├── ui/            the `/mysubs` sub-app: cards, pairing, apply
+├── callback.py    the `CustomLogger` that `config.yaml` names — the entry point
+├── bootstrap.py   startup: mounts the UI, applies the patch once a credential exists
 ├── login_cli.py   `mysubs-login` — the interceptor, run on your own machine
 ├── setup_cli.py   `mysubs-setup` — the one-line config edit
 ├── registry.py    Router injection and guards against phantom deployments
