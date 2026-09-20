@@ -526,3 +526,99 @@ gives a signal — only a real request does, and that is what `usage_probe` is f
 OMP starting to publish the wire values in a data file (JSON, KDL) instead of TypeScript
 constants. Then the check stops being textual and becomes a structure comparison, which is
 stronger.
+
+
+---
+
+## D11 — The `store_model_in_db` conflict is documented, not worked around
+
+**Date:** 2026-09-20 · **Against:** `litellm[proxy]` 1.101.0 · **Status:** decided
+
+### The question
+
+With `general_settings.store_model_in_db: true`, the models the plugin applies disappear
+from the Router within 30 seconds. The Apply succeeds, `/v1/models` shows them, and the
+next reconcile removes them. Should the plugin defend itself against that?
+
+### What was measured
+
+On a stock LiteLLM 1.101.0 (`ghcr.io/berriai/litellm-database:v1.101.0`) in Kubernetes,
+with three subscriptions connected:
+
+| moment | `/v1/models` |
+|---|---|
+| before Apply | 2 total, 0 `mysubs/` |
+| t+5s | 39 total, **37** `mysubs/` |
+| t+15s | 2 total, **0** `mysubs/` |
+
+**Nothing is logged.** No error, no warning, no trace of the removal.
+
+The cause is `proxy_server.py :: _delete_deployment`, reached from the `add_deployment`
+job that is scheduled only when `store_model_in_db` is on
+(`if store_model_in_db is True:`), every `proxy_config_reload_interval_seconds` —
+`PROXY_CONFIG_RELOAD_INTERVAL_SECONDS = 30`:
+
+```python
+combined_id_list = [ids from the db] + [ids from config.yaml]
+
+for model_id in router_model_ids:
+    if model_id not in combined_id_list:
+        llm_router.delete_deployment(id=model_id)
+```
+
+The cleanup is unconditional. There is no allowlist and no hook. The two models declared in
+`config.yaml` survived every reconcile, which is what makes the symptom look selective and
+sends the user looking at the plugin.
+
+Also measured, because it decides the workaround: the instance had **0 rows** in
+`LiteLLM_ProxyModelTable`. `store_model_in_db` was serving nothing and only feeding the
+loop. Turning it off left virtual keys (2) and spend logs (26) untouched — they do not
+depend on it. After the change, 46 applied models stayed in the Router across four
+consecutive reconcile windows, and `mysubs/claudecode/claude-sonnet-5` answered a real
+request.
+
+One trap worth recording: the `STORE_MODEL_IN_DB` environment variable **overrides** the
+YAML. Setting `store_model_in_db: false` in `config.yaml` while the container still exports
+`"True"` changes nothing.
+
+### The decision
+
+Document the conflict in the README and do **not** patch the proxy from inside the plugin.
+
+The marker is already there — every injected deployment carries
+`model_info.managed_by = "mysubs"`, and `registry.py` uses it. The cleanup loop never reads
+it: `Router.delete_deployment()` deletes by id and has no notion of an external owner.
+Honouring the marker upstream is three lines and makes both mechanisms coexist, which is
+what a user who wants some models in the database and others from a plugin actually needs:
+
+```python
+for model_id in router_model_ids:
+    if model_id in combined_id_list:
+        continue
+    deployment = llm_router.get_deployment(model_id=model_id)
+    if (deployment.model_info or {}).get("managed_by"):
+        continue          # declared external owner — not an orphan
+    llm_router.delete_deployment(id=model_id)
+```
+
+(`ModelInfo` accepts extra fields and supports `.get()` — verified in the running pod, so
+the snippet works as written.)
+
+Why not do it here anyway: the workaround would mean monkey-patching a reconcile loop whose
+job is to delete what it does not recognise. Getting the predicate wrong evicts the
+**operator's** models, not ours, and the failure would be as silent as the one it replaces.
+That is a bad trade for a plugin to make on someone else's proxy.
+
+The scope is also wider than this package: **any** plugin injecting through
+`set_model_list` is silently undone while `store_model_in_db` is on. That makes it an
+upstream defect worth reporting on its own merits, without mentioning this package at all.
+
+### What would reopen this
+
+LiteLLM honouring `managed_by` (or any equivalent ownership marker) in the cleanup loop —
+then the README caveat is deleted and nothing else changes. Alternatively, an installation
+that genuinely needs both the database catalog **and** the plugin: at that point the cost of
+the caveat stops being zero, and persisting through `POST /model/new` becomes worth
+revisiting. `registry.py` rejected that path because `supported_db_objects` without
+`"models"` makes the endpoint a silent no-op — but that is a property of the installation,
+not a universal one, and an installation without that restriction could use it.
