@@ -15,6 +15,21 @@ from __future__ import annotations
 import re
 from typing import Any, Final
 
+
+def _version() -> str:
+    """The installed version, or a marker that it is not installed.
+
+    Imported lazily so that this module keeps working when the package is on the path but
+    not installed — running the test suite from a source checkout, mostly.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("litellm-mysubs")
+    except PackageNotFoundError:  # pragma: no cover - source tree without an install
+        return "0.0.0.dev0"
+
+
 # omp: providers/claude-code-fingerprint.ts :: claudeCodeSystemInstruction
 #: Identity block that the Claude Code runtime prepends.
 #:
@@ -203,7 +218,12 @@ CLAUDE_CODE_VERSION: Final = "2.1.257"
 #: actually gates on. So the claim of being another program bought nothing, and claiming
 #: it anyway is the one thing every discussion of this mechanism asks implementations not
 #: to do. This one says what it is.
-USER_AGENT: Final = "litellm-mysubs/0.1.0 (+https://github.com/eduardopessin/litellm-mysubs)"
+#:
+#: The version is read from the installed metadata rather than written here: two places
+#: holding the same number drift, and the one that lies is always the copy.
+USER_AGENT: Final = (
+    f"litellm-mysubs/{_version()} (+https://github.com/eduardopessin/litellm-mysubs)"
+)
 
 CLIENT_HEADERS: Final[dict[str, str]] = {
     "User-Agent": USER_AGENT,
