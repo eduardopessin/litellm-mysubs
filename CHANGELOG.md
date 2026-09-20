@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Streamed calls were logged with zero cost.** `_wrap_stream` handed
+  `CustomStreamWrapper` the public model name and `custom_llm_provider="custom_openai"`.
+  Neither has a price table, so `response_cost_calculator` returned `0.0` for every
+  streamed request, while the non-streaming path — which gets the wire pair from the
+  Router — priced the same usage correctly.
+
+  Measured on a live proxy, controlled pair, same prompt, same cache, same key, same
+  model, only `stream: true` differing:
+
+  | | prompt | cache_read | spend |
+  |---|---|---|---|
+  | non-streaming | 40049 | 40035 | `0.0202475` |
+  | streaming | 40054 | 40035 | `0` |
+
+  On the installation where this was found, **74 of 89 billable calls (83%)** were
+  recorded as free, including 3.8M prompt tokens of `claude-opus-5`. Since agent clients
+  stream by default, this was most of the traffic.
+
+  The wire name is read off the deployment in `_wrapped_router_acompletion`, where the
+  Router still has it, and travels to the streaming path under a private kwarg popped
+  before any delegation upstream.
+
+  Still zero, and upstream data rather than dispatch: Antigravity models absent from
+  LiteLLM's price map (`gemini-3.x-flash-*` report `input=0`/`output=0`).
+
 ### Documented
 
 - **Known incompatibility with `store_model_in_db: true`.** The proxy schedules an

@@ -227,6 +227,13 @@ def is_gemini_model(model: str) -> bool:
 #: Reading that mark is the difference between knowing and assuming.
 _PROVIDER_KEY: Final = "mysubs_provider"
 
+#: Wire model carried from the Router to the streaming path, for cost calculation.
+#:
+#: Private to this hop: it is popped before anything is delegated upstream, because an
+#: unknown kwarg reaches the provider client and ``acompletion() got an unexpected keyword
+#: argument`` is the whole request lost, not a missing cost.
+_WIRE_MODEL_KEY: Final = "mysubs_wire_model"
+
 
 def provider_of_deployment(router: Any, model: str) -> ProviderId | None:
     """The provider declared for `model`, or `None` if it is not one of our entries.
@@ -244,6 +251,25 @@ def provider_of_deployment(router: Any, model: str) -> ProviderId | None:
         declared = info.get(_PROVIDER_KEY)
         if declared in _PROVIDER_IDS.values():
             return declared
+    return None
+
+
+def wire_model_of_deployment(router: Any, model: str) -> str | None:
+    """`litellm_params.model` of our deployment for `model`, or `None`.
+
+    Only entries carrying our mark are read: taking the wire name off someone else's
+    deployment would price a call this plugin never served.
+    """
+    for deployment in getattr(router, "model_list", None) or []:
+        if not isinstance(deployment, dict):
+            continue
+        if deployment.get("model_name") != model:
+            continue
+        info = deployment.get("model_info") or {}
+        if info.get(_PROVIDER_KEY) not in _PROVIDER_IDS.values():
+            continue
+        wire = (deployment.get("litellm_params") or {}).get("model")
+        return str(wire) if wire else None
     return None
 
 
@@ -805,6 +831,37 @@ async def dispatch(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
     return None
 
 
+def _cost_identity(model: str, kwargs: dict[str, Any]) -> tuple[str, str]:
+    """The ``(model, provider)`` pair the cost calculation needs.
+
+    ``model`` arrives here as the **public** name (``mysubs/codex/gpt-5.5``) — what the
+    client asked for and what the Router resolved. No rate exists under that name, and
+    ``custom_openai`` has no price table either, so every streamed call was logged at
+    ``0.0``. Measured on ``litellm[proxy]`` 1.101.0, identical usage:
+
+    ===================================== ============
+    ``(model, custom_llm_provider)``       cost
+    ===================================== ============
+    ``("mysubs/codex/gpt-5.5", "custom_openai")``  ``0.0``
+    ``("openai/gpt-5.5", "openai")``               ``0.0202325``
+    ===================================== ============
+
+    The wire name is already on the deployment, in ``litellm_params.model``, carrying the
+    family prefix ``to_deployment`` picked from ``modelProvider``. It is the same pair the
+    non-streaming path gets from the Router — which is why only streaming lost the cost,
+    and why 83% of real calls were logged as free.
+
+    Without a deployment there is nothing to look up: a direct ``litellm.acompletion``
+    call has no Router. The old pair is kept for that case rather than guessing a family
+    from the name, because a wrong guess prices the call against another model's rate.
+    """
+    wire = str(kwargs.get(_WIRE_MODEL_KEY) or "")
+    if not wire:
+        return model, "custom_openai"
+    family = wire.split("/", 1)[0] if "/" in wire else "openai"
+    return wire, family
+
+
 def _wrap_stream(
     chunks: AsyncIterator[ModelResponseStream], model: str, kwargs: dict[str, Any]
 ) -> litellm.CustomStreamWrapper:
@@ -812,12 +869,18 @@ def _wrap_stream(
 
     Returning the raw generator gave the client objects without the protocol the
     ``/v1/chat/completions`` route expects — and no spend log callback would fire.
+
+    The model and provider handed to the wrapper are the **wire** ones, not the public
+    name: see ``_cost_identity``. The client still sees the name it asked for, because the
+    spend log records ``model_group`` for that, but the cost calculation now gets a pair
+    it can price.
     """
+    cost_model, cost_provider = _cost_identity(model, kwargs)
     return litellm.CustomStreamWrapper(
         completion_stream=chunks,
-        model=model,
-        custom_llm_provider="custom_openai",
-        logging_obj=kwargs.get("litellm_logging_obj") or _logging_obj(model, kwargs),
+        model=cost_model,
+        custom_llm_provider=cost_provider,
+        logging_obj=kwargs.get("litellm_logging_obj") or _logging_obj(cost_model, kwargs),
     )
 
 
@@ -846,6 +909,7 @@ async def _wrapped_acompletion(*args: Any, **kwargs: Any) -> Any:
         return served
     original = _state.original_acompletion
     assert original is not None
+    kwargs.pop(_WIRE_MODEL_KEY, None)
     return await original(**await _delegate_kwargs(kwargs))
 
 
@@ -862,6 +926,7 @@ def _wrapped_completion(*args: Any, **kwargs: Any) -> Any:
         return served
     original = _state.original_completion
     assert original is not None
+    kwargs.pop(_WIRE_MODEL_KEY, None)
     return original(**_run_sync(_delegate_kwargs(kwargs)))
 
 
@@ -952,8 +1017,16 @@ async def _wrapped_router_acompletion(
     # has the information, and it is the only way to tell Anthropic's `claude-sonnet-4-6`
     # from the namesake served by Antigravity.
     declared = provider_of_deployment(self, model)
+    # Read here because this is where the Router still has the deployment: the streaming
+    # path needs the wire name to price the call, and by then the deployment is gone.
+    wire = wire_model_of_deployment(self, model)
     served = await dispatch(
-        provider=declared, model=model, messages=messages, stream=stream, **kwargs
+        provider=declared,
+        model=model,
+        messages=messages,
+        stream=stream,
+        **{_WIRE_MODEL_KEY: wire},
+        **kwargs,
     )
     if served is not None:
         return served
@@ -964,6 +1037,7 @@ async def _wrapped_router_acompletion(
     )
     delegated.pop("model", None)
     delegated.pop("messages", None)
+    delegated.pop(_WIRE_MODEL_KEY, None)
     return await original(self, model=model, messages=messages, stream=stream, **delegated)
 
 
