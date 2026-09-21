@@ -547,6 +547,10 @@ async def dispatch_messages(*, provider: ProviderId | None = None, **kwargs: Any
     if provider == "anthropic" or (provider is None and anthropic.is_anthropic_model(model)):
         return None
 
+    # Stamped before serving, as on the other two routes: the spend log reads the identity
+    # off the logging object, and without it the row lands with the public name and no
+    # provider — no icon, and no rate in the price map to bill it against.
+    _stamp_logging_identity(model, kwargs)
     payload = dict(kwargs)
     converted = dict(kwargs)
     converted["messages"] = messages.to_chat_messages(payload)

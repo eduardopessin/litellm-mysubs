@@ -7,6 +7,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/v1/messages` serves every subscription.** Anthropic-native clients speak Messages,
+  and answering only chat-completions and Responses made each of them adapt — which is
+  what a proxy exists to avoid. Measured on the live gateway, two of the three columns
+  were 401s:
+
+  | | chat | responses | messages |
+  |---|---|---|---|
+  | `mysubs/claudecode/*` | 200 | 200 | **401** |
+  | `mysubs/codex/*` | 200 | 200 | **401** |
+  | `mysubs/antigravity/*` | 200 | 200 | 200 (LiteLLM's own adapter, not this plugin) |
+
+  The 401 is the failure mode the Responses route had before 0.1.3, for the same reason:
+  with no interception the request reaches LiteLLM's native client, and the credential is
+  OAuth — it lives in the store, not in `config.yaml`.
+
+  Only the **envelope** is translated. The turns converge on the canonical list `dispatch`
+  already consumes and each provider keeps its own wire, so Codex still goes out as
+  Responses and Antigravity as Cloud Code, both inheriting every fix below. A defect fixed
+  on one route cannot leave another behind.
+
+  Claude Max is the deliberate gap: Messages *is* its wire, so the translation is declined
+  and the native path answers it. Two things that declining does **not** excuse, both found
+  by deploying and both now covered by tests: the OAuth token still has to be injected
+  (`401 Missing Anthropic API Key`), and the Claude Code identity belongs in the top-level
+  `system` rather than in `messages[0]` (`400 messages.0: use the top-level 'system'
+  parameter`). Placement is a parameter on `build_request` now, because both callers are
+  legitimate and only the route knows which is which.
+
+  Streaming replays the finished turn as the Anthropic event sequence. The upstreams do
+  not speak it, so translating mid-flight would mean inventing block indices; producing
+  the turn first keeps them contiguous, which is what a client tracking them needs.
+
+### Fixed
+
+- **Claude served by Antigravity lost its tool call ids.** `supports_function_ids` gated
+  the id on the model name starting with `gemini-3`. Antigravity also serves Anthropic,
+  and those run on Vertex, where `tool_use.id` is required — so every Claude served there
+  sent `functionCall` with no id. The first turn passes, and the one carrying the result
+  back is refused:
+
+  ```
+  HTTP 400 messages.1.content.0.tool_use.id: Field required
+  ```
+
+  Measured over one omp run: 76 failures on `claude-opus-4-6-thinking` and 70 on
+  `claude-sonnet-4-6`, every one on the second turn, while the same models served natively
+  by Anthropic were fine. Any agent that uses tools was broken on those two.
+
+- **The thinking budget ignored the caller's output ceiling.** `maxOutputTokens` and
+  `thinkingBudget` travelled independently — the ceiling is the client's, the budget comes
+  from the catalog — and on the Anthropic backend they are not independent. Two bounds
+  apply at once and they close on each other:
+
+  ```
+  max_tokens     > budget_tokens    (the ceiling has to leave room)
+  budget_tokens >= 1024             (Anthropic's own minimum)
+  ```
+
+  So a ceiling of 1024 or less admits no valid budget at all; capping at three quarters —
+  the first attempt — merely swapped one rejection for the other. Such a turn is now served
+  with thinking off rather than failing: the caller asked for a ceiling, not for reasoning.
+  Above that the budget is capped at `ceiling - 1`, never below the floor.
+
+- **A quota refusal reached the client as HTTP 500.** `UpstreamError` carries the real 429,
+  but the proxy has no class for it, so an unrecognised exception is reported as
+  `internal_server_error` and the status survives only as text inside the message. A client
+  cannot back off on a 500, and backing off is the one correct response here. A 429 is now
+  raised as `litellm.exceptions.RateLimitError` on both the streaming and non-streaming
+  paths; nothing else is remapped, and `RemapRequired`/`RedeemRequired` stay as they are —
+  they are signals to `plugin.py`, not answers to the client.
+
+- **A 429 tried the second Antigravity host for nothing.** Failover exists for endpoint
+  faults, and a quota refusal is not one: both hosts front the same account and the same
+  quota, so the second request repeats a refusal already known. It turned an ~11 s failure
+  into ~22 s and changed nothing else. 404 and 503 still fail over.
+
+- **`/v1/responses` turns produced no spend row.** There are three paths, not two, and the
+  Responses route had neither of the other two's logging. It is the path that matters most
+  in practice: a client that discovers models through LiteLLM routes every OpenAI-backed
+  model here, because the plugin declares `providers: ['openai']` on those deployments.
+
+  Measured on the live gateway: an omp run exercising all five Codex models end to end left
+  no Codex row of any kind, while Anthropic and Gemini — which go through chat — logged 33
+  and 50 over the same minutes. Same accounting hole 0.1.5 closed for chat:
+  `x-litellm-key-spend` undercounts and per-key budgets never see these calls.
+
+### Changed
+
+- **`plugin.py` split by responsibility.** It had grown to 1807 lines covering six
+  unrelated jobs, and the Messages route was about to add a seventh. Only one of those is
+  "plugin" in the sense of coupling to LiteLLM; the rest is logic that does not need to sit
+  next to a monkey-patch.
+
+  | module | lines | job |
+  |---|---|---|
+  | `plugin.py` | 1807 → 459 | install/uninstall, `bind_*`, Router wrappers |
+  | `routes.py` | 631 | the three `dispatch*` and the turn builders |
+  | `turns.py` | 392 | event readers, chunks, `_model_response` |
+  | `specs.py` | 299 | process state, credential, per-wire specs |
+  | `observability.py` | 254 | logging, cost identity, error mapping |
+
+  No behaviour change: the suite passes untouched except for pointing `plugin._x` at the
+  module that now owns it, which is the point. Two seams needed care — `turns.py` writes
+  thought signatures through an injected sink rather than importing the state back, which
+  would close a cycle, and `_WIRE_MODEL_KEY` moved to `observability.py`, which is what
+  reads it.
+
 ## [0.1.5] - 2026-09-21
 
 ### Added

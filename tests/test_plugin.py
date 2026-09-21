@@ -1859,3 +1859,79 @@ class TestEveryDialectReachesEverySubscription:
         assert kinds[-1] == "message_stop"
         assert "content_block_start" in kinds
         assert "message_delta" in kinds
+
+
+class TestEveryRouteRecordsAPriceableIdentity:
+    """The wire pair has to reach the spend log on all three routes, not just chat.
+
+    `_stamp_logging_identity` rewrites the identity from `_cost_identity`, which reads
+    `_WIRE_MODEL_KEY` — and only the chat wrapper was injecting it. Measured on the live
+    gateway, the same five Codex models appear twice under different names:
+
+        openai/gpt-5.5          prov=openai    <- chat
+        mysubs/codex/gpt-5.5    prov=          <- responses, messages
+
+    An empty provider is what leaves the row without an icon, and the public name has no
+    rate in the price map, so those rows also priced at zero. Same defect the chat route
+    already fixed, on the two routes that did not inherit it.
+    """
+
+    @staticmethod
+    def _router(attr: str) -> Any:
+        async def original(**kwargs: Any) -> str:
+            return "original"
+
+        return SimpleNamespace(
+            **{attr: original},
+            model_list=[
+                {
+                    "model_name": "mysubs/codex/gpt-5.5",
+                    "litellm_params": {"model": "openai/gpt-5.5"},
+                    "model_info": {"mysubs_provider": "openai-codex"},
+                }
+            ],
+        )
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.model_call_details: dict[str, Any] = {
+                "model": "mysubs/codex/gpt-5.5",
+                "custom_llm_provider": None,
+            }
+
+        async def async_success_handler(self, **_: Any) -> None:
+            return None
+
+    @pytest.mark.asyncio
+    async def test_the_responses_route_stamps_the_wire_pair(self) -> None:
+        install_transport(FakeTransport(codex_responses_events()))
+        router = self._router("aresponses")
+        log = self.Recorder()
+        plugin.bind_responses_route(router)
+        try:
+            await router.aresponses(
+                model="mysubs/codex/gpt-5.5", input="hi", litellm_logging_obj=log
+            )
+        finally:
+            plugin.unbind_responses_route()
+
+        assert log.model_call_details["model"] == "openai/gpt-5.5"
+        assert log.model_call_details["custom_llm_provider"] == "openai"
+
+    @pytest.mark.asyncio
+    async def test_the_messages_route_stamps_the_wire_pair(self) -> None:
+        install_transport(FakeTransport(codex_events()))
+        router = self._router("aanthropic_messages")
+        log = self.Recorder()
+        plugin.bind_messages_route(router)
+        try:
+            await router.aanthropic_messages(
+                model="mysubs/codex/gpt-5.5",
+                messages=[{"role": "user", "content": "hi"}],
+                litellm_logging_obj=log,
+            )
+        finally:
+            plugin.unbind_messages_route()
+
+        assert log.model_call_details["model"] == "openai/gpt-5.5"
+        assert log.model_call_details["custom_llm_provider"] == "openai"

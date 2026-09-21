@@ -324,7 +324,13 @@ def bind_responses_route(router: Any) -> bool:
         # reason this guard exists rather than deferring to `dispatch_responses` alone.
         if declared is None:
             return await original(**kwargs)
-        served = await dispatch_responses(provider=declared, **kwargs)
+        # Read here for the same reason the chat wrapper does: this is where the Router
+        # still has the deployment, and without the wire name the spend log records the
+        # public one with no provider — no icon, and no rate to price it against.
+        wire = wire_model_of_deployment(router, model)
+        served = await dispatch_responses(
+            provider=declared, **{_WIRE_MODEL_KEY: wire}, **kwargs
+        )
         if served is not None:
             return served
         return await original(**kwargs)
@@ -385,7 +391,12 @@ def bind_messages_route(router: Any) -> bool:
             # subscription.
             if declared is None:
                 return await original(**kwargs)
-            served = await dispatch_messages(provider=declared, **kwargs)
+            # Same as the other two routes: the wire name is only available here, and the
+            # spend log needs it to price the call and draw a provider icon.
+            wire = wire_model_of_deployment(router, model)
+            served = await dispatch_messages(
+                provider=declared, **{_WIRE_MODEL_KEY: wire}, **kwargs
+            )
             if served is not None:
                 return served
             # Claude Max declines translation because Messages is already its wire — but
