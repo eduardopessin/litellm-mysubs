@@ -1377,15 +1377,17 @@ class TestTheNonStreamingPathIsLogged:
         async def async_success_handler(
             self, result: Any = None, start_time: Any = None, end_time: Any = None
         ) -> None:
+            payload = getattr(result, "response", None) or result
             self.calls.append(
                 {
                     "model": self.model_call_details.get("model"),
                     "provider": self.model_call_details.get("custom_llm_provider"),
-                    "usage": getattr(result, "usage", None),
+                    "usage": getattr(payload, "usage", None),
                     "cost": self.model_call_details.get("response_cost"),
                     "start": start_time,
                     "end": end_time,
                     "first_token": self.model_call_details.get("completion_start_time"),
+                    "result": result,
                 }
             )
 
@@ -1687,6 +1689,46 @@ class TestTheResponsesRouteIsLogged:
 
         missing = sorted(name for name in expected if not hasattr(stream, name))
         assert not missing, f"inherited methods read these: {missing}"
+
+
+    @pytest.mark.asyncio
+    async def test_the_handler_is_given_the_terminal_event_not_the_response(self) -> None:
+        """`Logging._get_assembled_streaming_response` keys off the event type::
+
+            elif isinstance(result, (ResponseCompletedEvent, ResponseIncompleteEvent,
+                                     ResponseFailedEvent)):
+                return result.response
+            else:
+                return None
+
+        Handing it `result.response` takes the `else`, returns `None`, and writes no row.
+        Measured on the live gateway: the plugin logged `responses stream finished,
+        terminal=True` with no exception, and the row still did not exist.
+
+        The proxy wants the opposite shape on `completed_response`, so both are kept.
+        """
+        from litellm.types.llms.openai import ResponseCompletedEvent
+
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+        log = self.Recorder("mysubs/codex/gpt-5.5")
+
+        stream = await plugin.dispatch_responses(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            input="hi",
+            stream=True,
+            litellm_logging_obj=log,
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+        async for _ in stream:
+            pass
+
+        assert isinstance(log.calls[0]["result"], ResponseCompletedEvent), (
+            "the handler drops a result that is not the terminal event"
+        )
+        assert not isinstance(stream.completed_response, ResponseCompletedEvent), (
+            "the proxy wants the response, not the event"
+        )
 
     @pytest.mark.asyncio
     async def test_the_stream_carries_the_finished_turn_on_itself(self) -> None:

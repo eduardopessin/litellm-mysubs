@@ -224,6 +224,8 @@ class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
 
         #: The terminal event's response, where the proxy looks for the finished turn.
         self.completed_response: Any = None
+        #: The terminal event itself, which is the shape the success handler requires.
+        self._terminal_event: Any = None
         self.response: Any = None
         self.model = str(kwargs.get("model") or "")
         self.logging_obj: Any = kwargs.get("litellm_logging_obj")
@@ -255,7 +257,16 @@ class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
         if self._first_token_at is None:
             self._first_token_at = datetime.datetime.now()
         if getattr(event, "type", None) in ("response.completed", "response.incomplete"):
+            # Two consumers, two shapes, and they are not the same object.
+            # `completed_response` is read by the proxy, which wants the **response**.
+            # `async_success_handler(result=...)` is read by
+            # `Logging._get_assembled_streaming_response`, whose streaming branch is
+            # `isinstance(result, (ResponseCompletedEvent, ResponseIncompleteEvent,
+            # ResponseFailedEvent))` and returns `None` for anything else — no assembled
+            # response, no row. Passing the response to both is why the turn logged
+            # nothing while reporting `terminal=True` and raising no error.
             self.completed_response = getattr(event, "response", None) or event
+            self._terminal_event = event
             await self._emit()
         return event
 
@@ -269,23 +280,21 @@ class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
         if self._emitted:
             return
         self._emitted = True
-        _LOG.warning(
-            "mysubs: responses stream finished, model=%s terminal=%s",
-            self._kwargs.get("model"),
-            self.completed_response is not None,
-        )
         logging_obj = self._kwargs.get("litellm_logging_obj")
         handler = getattr(logging_obj, "async_success_handler", None)
         if handler is None:
             _LOG.warning("mysubs: no async_success_handler on the responses stream turn")
             return
-        terminal = self.completed_response
-        if terminal is not None:
-            _stamp_cost(logging_obj, terminal, self._kwargs)
+        if self.completed_response is not None:
+            _stamp_cost(logging_obj, self.completed_response, self._kwargs)
         _stamp_first_token(logging_obj, self._first_token_at)
         try:
+            # The **event**, not the response: the handler's streaming branch keys off
+            # `isinstance(result, ResponseCompletedEvent)` and drops anything else.
             await handler(
-                result=terminal, start_time=self._started, end_time=datetime.datetime.now()
+                result=self._terminal_event,
+                start_time=self._started,
+                end_time=datetime.datetime.now(),
             )
         except Exception:
             # Still swallowed — the subscription has been charged and the answer must not
