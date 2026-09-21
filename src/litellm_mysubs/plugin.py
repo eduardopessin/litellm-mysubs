@@ -1200,6 +1200,7 @@ async def dispatch_responses(*, provider: ProviderId | None = None, **kwargs: An
     if provider == "google-antigravity" or (provider is None and is_gemini_model(model)):
         return None
     if provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
+        _stamp_logging_identity(model, kwargs)
         if kwargs.get("stream"):
             return _codex_responses_stream(model, kwargs)
         return await _codex_responses_turn(model, kwargs)
@@ -1225,6 +1226,9 @@ async def dispatch(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
     streaming = bool(kwargs.get("stream"))
 
     if provider == "google-antigravity" or (provider is None and is_gemini_model(model)):
+        # Stamped before serving, not after: the spend log reads the identity off the
+        # logging object, and the streaming path hands that object to the wrapper.
+        _stamp_logging_identity(model, kwargs)
         if streaming:
             return _wrap_stream(_antigravity_stream(model, messages, kwargs), model, kwargs)
         return await _antigravity_turn(model, messages, kwargs)
@@ -1232,6 +1236,7 @@ async def dispatch(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
     # After Gemini: `codex.is_codex_model` matches any name containing "gpt-", and a
     # hypothetical "gemini-gpt" belongs to Google.
     if provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
+        _stamp_logging_identity(model, kwargs)
         if streaming:
             return _wrap_stream(_codex_stream(model, messages, kwargs), model, kwargs)
         return await _codex_turn(model, messages, kwargs)
@@ -1271,6 +1276,40 @@ def _cost_identity(model: str, kwargs: dict[str, Any]) -> tuple[str, str]:
         return model, "custom_openai"
     family = wire.split("/", 1)[0] if "/" in wire else "openai"
     return wire, family
+
+
+def _stamp_logging_identity(model: str, kwargs: dict[str, Any]) -> None:
+    """Record the **wire** ``(model, provider)`` pair on the caller's logging object.
+
+    The spend log reads `custom_llm_provider` and `model` from
+    `logging_obj.model_call_details`, not from the deployment. A request this plugin serves
+    never reaches the provider client that would normally fill them in, so without this the
+    row lands with the public name and **no provider at all** — measured on a live gateway:
+    rows served natively read `anthropic/claude-opus-5` + `anthropic`, while rows served
+    here read `mysubs/antigravity/...` with an empty provider.
+
+    That empty provider is what leaves the Logs tab without an icon: the UI maps a provider
+    id to a logo, and there is nothing to map. Declaring `custom_llm_provider` on the
+    deployment fixes the Models tab only, because that one is built from the Router while
+    this one is built per request.
+
+    `model_group` keeps the public name, so the client still sees what it asked for.
+    """
+    logging_obj = kwargs.get("litellm_logging_obj")
+    details = getattr(logging_obj, "model_call_details", None)
+    if not isinstance(details, dict):
+        return
+    wire_model, provider = _cost_identity(model, kwargs)
+    if not wire_model or wire_model == model:
+        # No deployment to read the wire name from: leave what the proxy already set
+        # rather than stamping a guessed family, which would bill against another rate.
+        return
+    details["model"] = wire_model
+    details["custom_llm_provider"] = provider
+    details.setdefault("model_group", model)
+    with contextlib.suppress(Exception):
+        logging_obj.model = wire_model  # type: ignore[union-attr]
+        logging_obj.custom_llm_provider = provider  # type: ignore[union-attr]
 
 
 def _wrap_stream(

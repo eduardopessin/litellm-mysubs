@@ -1275,6 +1275,69 @@ class TestTheResponsesRouteIsServed:
         assert await plugin.dispatch_responses(provider=provider, model=model, input="hi") is None
 
 
+class TestTheSpendLogRecordsAPriceableIdentity:
+    """The Logs tab reads `custom_llm_provider` off the logging object, per request.
+
+    A request this plugin serves never reaches the provider client that would fill those
+    in, so without the stamp the row lands with the public name and no provider at all.
+    Measured on a live gateway: rows served natively read `anthropic/claude-opus-5` +
+    `anthropic`, rows served here read `mysubs/antigravity/...` with an empty provider —
+    and an empty provider is what leaves the row without an icon.
+
+    Declaring `custom_llm_provider` on the deployment fixes the Models tab only: that one
+    is built from the Router, this one is built per request.
+    """
+
+    @staticmethod
+    def _logging_obj(model: str) -> Any:
+        return SimpleNamespace(
+            model_call_details={"model": model, "custom_llm_provider": None}
+        )
+
+    def test_the_wire_pair_reaches_the_logging_object(self) -> None:
+        public = "mysubs/antigravity/gemini-3-flash"
+        log = self._logging_obj(public)
+
+        plugin._stamp_logging_identity(
+            public,
+            {
+                "litellm_logging_obj": log,
+                plugin._WIRE_MODEL_KEY: "gemini/gemini-3-flash",
+            },
+        )
+
+        assert log.model_call_details["model"] == "gemini/gemini-3-flash"
+        assert log.model_call_details["custom_llm_provider"] == "gemini"
+
+    def test_the_public_name_survives_as_the_model_group(self) -> None:
+        """The client asked for the public name; the row still has to show it."""
+        public = "mysubs/codex/gpt-5.5"
+        log = self._logging_obj(public)
+
+        plugin._stamp_logging_identity(
+            public,
+            {"litellm_logging_obj": log, plugin._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+
+        assert log.model_call_details["model_group"] == public
+
+    def test_without_a_deployment_nothing_is_invented(self) -> None:
+        """A direct library call has no Router, so there is no wire name to read.
+
+        Guessing a family would bill the call against another model's rate.
+        """
+        public = "mysubs/codex/gpt-5.5"
+        log = self._logging_obj(public)
+
+        plugin._stamp_logging_identity(public, {"litellm_logging_obj": log})
+
+        assert log.model_call_details["model"] == public
+        assert log.model_call_details["custom_llm_provider"] is None
+
+    def test_a_caller_without_a_logging_object_is_not_a_failure(self) -> None:
+        plugin._stamp_logging_identity("m", {plugin._WIRE_MODEL_KEY: "openai/m"})
+
+
 class TestTheResponsesRouteIsBoundPerRouter:
     """`Router.aresponses` is built per instance, so there is no class attribute to patch.
 
