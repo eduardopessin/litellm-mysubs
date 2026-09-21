@@ -128,7 +128,7 @@ def _start_refresher_with(app: Any, service: MySubsService) -> None:
                     "mysubs: binding %s failed; that route will not log", name
                 )
             else:
-                verbose_proxy_logger.warning(
+                verbose_proxy_logger.info(
                     "mysubs: %s bound=%s router=%s", name, bound, router is not None
                 )
         try:
