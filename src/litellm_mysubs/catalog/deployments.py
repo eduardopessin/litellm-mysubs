@@ -127,10 +127,25 @@ def to_deployment(model: DiscoveredModel, provider: ProviderId) -> dict[str, Any
 
     The `managed_by` mark is set by `ModelRegistry`, not here: whoever injects is the one
     who declares ownership.
+
+    `custom_llm_provider` is declared rather than left for LiteLLM to infer. The inference
+    runs `get_llm_provider` over `model_name`, and that **raises** on both public forms —
+    measured, `BadRequestError` for `mysubs/codex/gpt-5.5` and
+    `mysubs/antigravity/gemini-3-flash`. Nothing consumes the exception, so the UI is left
+    with no provider for the row: the Logs tab showed the generic icon for every
+    subscription model, and OpenAI and Google rows were indistinguishable from each other.
+
+    The value is the same family prefix that already goes on the wire, which is the one
+    that has a price table behind it — so the icon and the cost agree by construction
+    instead of being two independent guesses.
     """
+    family = wire_prefix(model, provider)
     return {
         "model_name": public_name(model, provider),
-        "litellm_params": {"model": f"{wire_prefix(model, provider)}/{model.wire_name}"},
+        "litellm_params": {
+            "model": f"{family}/{model.wire_name}",
+            "custom_llm_provider": family,
+        },
         "model_info": {
             "mysubs_provider": provider,
             "mysubs_verified": model.verified,

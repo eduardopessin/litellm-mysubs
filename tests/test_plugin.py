@@ -1197,15 +1197,67 @@ class TestTheResponsesRouteIsServed:
         assert json.dumps(body["input"]).find("what is 2+2") != -1
 
     @pytest.mark.asyncio
-    async def test_streaming_is_left_to_the_original(self) -> None:
-        """The Responses SSE protocol is its own event sequence, not chat chunks."""
-        install_transport(FakeTransport(codex_responses_events()))
+    async def test_streaming_emits_responses_api_events(self) -> None:
+        """Streaming returns Responses events, not chat chunks.
 
-        out = await plugin.dispatch_responses(
+        Event order captured from this proxy's own native `/v1/responses` path
+        (`qwen-agent-coder`, `stream: true`) rather than assumed.
+        """
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+
+        stream = await plugin.dispatch_responses(
             provider="openai-codex", model="mysubs/codex/gpt-5.5", input="hi", stream=True
         )
 
-        assert out is None
+        assert stream is not None
+        events = [e async for e in stream]
+        kinds = [e.type for e in events]
+
+        assert kinds[0] == "response.created"
+        assert kinds[1] == "response.in_progress"
+        assert "response.output_item.added" in kinds
+        assert "response.content_part.added" in kinds
+        assert "response.output_text.delta" in kinds
+        assert kinds[-1] == "response.completed"
+
+    @pytest.mark.asyncio
+    async def test_every_streamed_event_serialises_to_json(self) -> None:
+        """The proxy serialises a chunk with `.model_dump_json()`.
+
+        A plain dict falls through to `str()` and reaches the client as a Python repr with
+        single quotes, which no JSON parser accepts. Measured against a real proxy.
+        """
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+
+        stream = await plugin.dispatch_responses(
+            provider="openai-codex", model="mysubs/codex/gpt-5.5", input="hi", stream=True
+        )
+
+        async for event in stream:
+            assert hasattr(event, "model_dump_json"), f"{event!r} is not a typed event"
+            json.loads(event.model_dump_json(exclude_none=True, exclude_unset=True))
+
+    @pytest.mark.asyncio
+    async def test_the_streamed_text_matches_the_terminal_payload(self) -> None:
+        """The deltas and the final `output` have to agree."""
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+
+        stream = await plugin.dispatch_responses(
+            provider="openai-codex", model="mysubs/codex/gpt-5.5", input="hi", stream=True
+        )
+        events = [e async for e in stream]
+
+        streamed = "".join(e.delta for e in events if e.type == "response.output_text.delta")
+        final = next(e for e in events if e.type == "response.completed")
+        text = next(
+            part.text
+            for item in final.response.output
+            if getattr(item, "type", None) == "message"
+            for part in item.content
+        )
+
+        assert streamed == "served"
+        assert text == streamed
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

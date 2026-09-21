@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-21
+
+### Added
+
+- **`/v1/responses` now serves streaming for Codex models.** 0.1.3 and 0.1.4 fixed the
+  non-streaming path; a streamed request still fell through to LiteLLM's native OpenAI
+  client and came back `Incorrect API key provided: None`. Agent clients stream by
+  default, so the route stayed unusable for them.
+
+  The event sequence was **captured from this proxy's own native `/v1/responses` path**
+  rather than assumed — a model served by vLLM, `stream: true`, recorded off the wire:
+
+  ```
+  response.created -> response.in_progress
+  -> output_item.added -> content_part.added
+  -> output_text.delta* -> output_text.done -> content_part.done
+  -> output_item.done
+  -> response.completed
+  ```
+
+  Reasoning and tool calls are emitted as completed items once the turn closes, because
+  they are only known then; text streams as it arrives.
+
+  Two defects found by testing against a real proxy before release, not after:
+
+  - **Events must be LiteLLM's typed models, not dicts.** The proxy serialises a chunk
+    with `_serialize_streaming_chunk`, which calls `.model_dump_json()`. A plain dict
+    falls through to `str()` and reaches the client as a Python repr with single quotes,
+    which no JSON parser accepts.
+  - **`ContentPartDoneEvent` requires `logprobs` on the part.** Omitting it raised mid
+    stream and truncated the response after the deltas, with no terminal event.
+
+### Fixed
+
+- **Every subscription model showed the generic icon in the UI.** Deployments did not
+  declare `custom_llm_provider`, so the UI fell back to inferring the provider from
+  `model_name` — and `get_llm_provider` **raises** on the public names this package
+  builds. Measured: `BadRequestError` for `mysubs/codex/gpt-5.5`,
+  `mysubs/claudecode/claude-opus-5` and `mysubs/antigravity/gemini-3-flash`. With no
+  provider resolved, OpenAI and Google rows were indistinguishable in the Logs tab.
+
+  The provider is now declared, using the same family prefix that already goes on the
+  wire:
+
+  | public name | wire | provider |
+  |---|---|---|
+  | `mysubs/codex/gpt-5.5` | `openai/gpt-5.5` | `openai` |
+  | `mysubs/claudecode/claude-opus-5` | `anthropic/claude-opus-5` | `anthropic` |
+  | `mysubs/antigravity/gemini-3-flash` | `gemini/gemini-3-flash` | `gemini` |
+
+  Tying it to the wire prefix is deliberate: that prefix is the one with a price table
+  behind it, so the icon and the cost cannot disagree. A test asserts they stay equal.
+
+### Known issues
+
+- **Antigravity models return `429 RESOURCE_EXHAUSTED`.** Pre-existing, on the chat path,
+  and untouched by this release. Measured with the same payload replayed through `curl`,
+  so it is not client-specific: deterministic on system-message content, not on size
+  (122 KB of filler passes; 1 KB of a real agent prompt fails) and not rate limiting
+  (81 characters passes five times in a row, 82 fails three times with pauses between).
+  One byte flips it at identical length. The upstream returns a quota error for something
+  that is not a quota; this package relays it unchanged.
+
 ## [0.1.4] - 2026-09-21
 
 ### Fixed
@@ -227,7 +290,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.1...v0.1.2

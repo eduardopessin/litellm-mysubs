@@ -45,6 +45,50 @@ class TestDeploymentShape:
         assert to_deployment(model, "anthropic")["litellm_params"]["model"] == "anthropic/x"
         assert to_deployment(model, "google-antigravity")["litellm_params"]["model"] == "openai/x"
 
+    def test_the_provider_is_declared_not_left_to_be_inferred(self) -> None:
+        """The UI reads `custom_llm_provider` to pick the model's icon.
+
+        Without it LiteLLM infers from `model_name`, and `get_llm_provider` **raises** on
+        the public forms — measured, `BadRequestError` for `mysubs/codex/gpt-5.5` and
+        `mysubs/antigravity/gemini-3-flash`. The Logs tab then showed the generic icon for
+        every subscription model, with OpenAI and Google indistinguishable.
+        """
+        cases = [
+            ("openai", "openai-codex", "openai"),
+            ("anthropic", "anthropic", "anthropic"),
+            ("google", "google-antigravity", "gemini"),
+        ]
+        for family, provider, expected in cases:
+            out = to_deployment(
+                DiscoveredModel(
+                    wire_name="m", suggested_name="m", verified=True, family=family
+                ),
+                provider,
+            )
+            assert out["litellm_params"]["custom_llm_provider"] == expected
+
+    def test_the_declared_provider_matches_the_wire_prefix(self) -> None:
+        """Icon and price must not be two independent guesses.
+
+        The wire prefix is the one with a price table behind it (`gemini/` prices,
+        `openai/` does not for a Gemini model), so declaring anything else would make the
+        row show one provider and bill against another.
+        """
+        families = (
+            ("google", "google-antigravity"),
+            ("anthropic", "anthropic"),
+            ("openai", "openai-codex"),
+        )
+        for family, provider in families:
+            out = to_deployment(
+                DiscoveredModel(
+                    wire_name="m", suggested_name="m", verified=True, family=family
+                ),
+                provider,
+            )
+            params = out["litellm_params"]
+            assert params["model"].split("/", 1)[0] == params["custom_llm_provider"]
+
 
 class TestSelection:
     def test_unverified_models_are_kept_by_default(self) -> None:

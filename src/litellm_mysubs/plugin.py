@@ -895,6 +895,256 @@ def _responses_usage(usage: Usage) -> ResponseAPIUsage:
     )
 
 
+async def _codex_responses_stream(
+    model: str, kwargs: dict[str, Any]
+) -> AsyncIterator[Any]:
+    """``/v1/responses`` with ``stream: true``, as Responses API events.
+
+    The Responses SSE protocol is not the chat chunk sequence: a client reads items, not
+    deltas on a choice. The order below was **captured from this proxy's own native path**
+    (`qwen-agent-coder`, `/v1/responses`, `stream: true`) rather than assumed, because the
+    previous attempt at this route shipped a payload shape that the real endpoint never
+    sends:
+
+        response.created -> response.in_progress
+        -> output_item.added -> content_part.added
+        -> output_text.delta* -> output_text.done -> content_part.done
+        -> output_item.done
+        -> response.completed
+
+    `item_id`/`output_index`/`content_index` tie the parts to their item — a client that
+    tracks them needs all three.
+
+    Events are emitted as LiteLLM's **typed** event models, not dicts. The proxy serialises
+    a stream chunk with `_serialize_streaming_chunk`, which calls `.model_dump_json()`; a
+    plain dict falls through to `str()` and reaches the client as a Python repr with single
+    quotes, which no JSON parser accepts. Measured against a real proxy before this was
+    written the second time.
+
+    Text is emitted as it arrives; reasoning and tool calls are emitted as completed items
+    once the turn closes. Reasoning deltas are deliberately not streamed: `_CodexReader`
+    accumulates them for the chat path, and replaying them as `reasoning_text.delta` would
+    mean a second interpretation of the same events — the divergence the module docstring
+    exists to prevent.
+    """
+    spec = await _codex_spec(model, _responses_input(kwargs), kwargs)
+    turn = _Turn()
+    reader = _CodexReader(turn)
+
+    state = _ResponsesStreamState(model=model)
+    for out in state.created():
+        yield out
+
+    async for event in _transport().stream(spec):
+        for chunk in reader.feed(event):
+            text = _chunk_text(chunk)
+            if not text:
+                continue
+            for out in state.open_message():
+                yield out
+            yield state.delta(text)
+    reader.close()
+
+    for out in state.close_message():
+        yield out
+
+    # Reasoning and tool calls are known only once the turn has closed, so they are
+    # announced and completed back to back rather than streamed.
+    for item in _responses_output(turn):
+        if item.get("type") == "message":
+            continue  # already streamed above
+        for out in state.whole_item(item):
+            yield out
+
+    payload = dict(turn.response_payload)
+    payload["model"] = model
+    payload["id"] = state.response_id
+    payload.setdefault("created_at", state.created_at)
+    payload.setdefault("object", "response")
+    payload["status"] = payload.get("status") or "completed"
+    payload["output"] = state.items
+    payload["usage"] = _responses_usage(codex_usage(turn.usage_meta)).model_dump()
+    yield state.completed(payload)
+
+
+def _chunk_text(chunk: ModelResponseStream) -> str:
+    """Visible text on a chunk, ignoring reasoning and tool deltas."""
+    choices = getattr(chunk, "choices", None) or []
+    if not choices:
+        return ""
+    delta = getattr(choices[0], "delta", None)
+    return str(getattr(delta, "content", "") or "") if delta is not None else ""
+
+
+
+class _ResponsesStreamState:
+    """Sequence numbers, item ids and indices for one Responses stream.
+
+    Kept in an object because every event carries `sequence_number`, and a client that
+    reorders on it needs the numbering to be strictly increasing across the whole stream —
+    including the items appended after the text has finished.
+    """
+
+    __slots__ = (
+        "created_at",
+        "items",
+        "message_id",
+        "message_open",
+        "model",
+        "output_index",
+        "response_id",
+        "text",
+    )
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+        self.response_id = f"resp_{uuid.uuid4().hex[:24]}"
+        self.created_at = int(time.time())
+        self.output_index = 0
+        self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
+        self.message_open = False
+        self.text: list[str] = []
+        self.items: list[dict[str, Any]] = []
+
+    def _events(self) -> Any:
+        from litellm.types.llms.openai import ResponsesAPIStreamEvents
+
+        return ResponsesAPIStreamEvents
+
+    def envelope(self, status: str) -> dict[str, Any]:
+        return {
+            "id": self.response_id,
+            "created_at": self.created_at,
+            "model": self.model,
+            "object": "response",
+            "status": status,
+            "output": list(self.items),
+        }
+
+    def created(self) -> list[Any]:
+        from litellm.types.llms.openai import (
+            ResponseCreatedEvent,
+            ResponseInProgressEvent,
+            ResponsesAPIResponse,
+        )
+
+        kinds = self._events()
+        envelope = ResponsesAPIResponse.model_validate(self.envelope("in_progress"))
+        return [
+            ResponseCreatedEvent(type=kinds.RESPONSE_CREATED, response=envelope),
+            ResponseInProgressEvent(type=kinds.RESPONSE_IN_PROGRESS, response=envelope),
+        ]
+
+    def delta(self, text: str) -> Any:
+        from litellm.types.llms.openai import OutputTextDeltaEvent
+
+        self.text.append(text)
+        return OutputTextDeltaEvent(
+            type=self._events().OUTPUT_TEXT_DELTA,
+            item_id=self.message_id,
+            output_index=self.output_index,
+            content_index=0,
+            delta=text,
+        )
+
+    def open_message(self) -> list[Any]:
+        """`output_item.added` + `content_part.added`, once, before the first delta."""
+        if self.message_open:
+            return []
+        from litellm.types.llms.openai import ContentPartAddedEvent, OutputItemAddedEvent
+
+        self.message_open = True
+        kinds = self._events()
+        return [
+            OutputItemAddedEvent(
+                type=kinds.OUTPUT_ITEM_ADDED,
+                output_index=self.output_index,
+                item=({
+                    "id": self.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                }),  # type: ignore[arg-type]  # pydantic coerces the dict; the annotation is narrower
+            ),
+            ContentPartAddedEvent(
+                type=kinds.CONTENT_PART_ADDED,
+                item_id=self.message_id,
+                output_index=self.output_index,
+                content_index=0,
+                part=({"type": "output_text", "text": "", "annotations": [], "logprobs": []}),  # type: ignore[arg-type]  # pydantic coerces the dict; the annotation is narrower
+            ),
+        ]
+
+    def close_message(self) -> list[Any]:
+        """`output_text.done` + `content_part.done` + `output_item.done`."""
+        if not self.message_open:
+            return []
+        from litellm.types.llms.openai import (
+            ContentPartDoneEvent,
+            OutputItemDoneEvent,
+            OutputTextDoneEvent,
+        )
+
+        kinds = self._events()
+        text = "".join(self.text)
+        item: dict[str, Any] = {
+            "id": self.message_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }
+        self.items.append(item)
+        out = [
+            OutputTextDoneEvent(
+                type=kinds.OUTPUT_TEXT_DONE,
+                item_id=self.message_id,
+                output_index=self.output_index,
+                content_index=0,
+                text=text,
+            ),
+            ContentPartDoneEvent(
+                type=kinds.CONTENT_PART_DONE,
+                item_id=self.message_id,
+                output_index=self.output_index,
+                content_index=0,
+                part=({"type": "output_text", "text": text, "annotations": [], "logprobs": []}),  # type: ignore[arg-type]  # pydantic coerces the dict; the annotation is narrower
+            ),
+            OutputItemDoneEvent(
+                type=kinds.OUTPUT_ITEM_DONE, output_index=self.output_index, item=item  # type: ignore[arg-type]
+            ),
+        ]
+        self.output_index += 1
+        self.message_open = False
+        return out
+
+    def whole_item(self, item: dict[str, Any]) -> list[Any]:
+        """An item known only at the end: announced and completed back to back."""
+        from litellm.types.llms.openai import OutputItemAddedEvent, OutputItemDoneEvent
+
+        kinds = self._events()
+        self.items.append(item)
+        out = [
+            OutputItemAddedEvent(
+                type=kinds.OUTPUT_ITEM_ADDED, output_index=self.output_index, item=item  # type: ignore[arg-type]
+            ),
+            OutputItemDoneEvent(
+                type=kinds.OUTPUT_ITEM_DONE, output_index=self.output_index, item=item  # type: ignore[arg-type]
+            ),
+        ]
+        self.output_index += 1
+        return out
+
+    def completed(self, payload: dict[str, Any]) -> Any:
+        from litellm.types.llms.openai import ResponseCompletedEvent, ResponsesAPIResponse
+
+        return ResponseCompletedEvent(
+            type=self._events().RESPONSE_COMPLETED,
+            response=ResponsesAPIResponse.model_validate(payload),
+        )
+
+
 async def _antigravity_turn(
     model: str, messages: list[Any], extra: dict[str, Any]
 ) -> ModelResponse:
@@ -942,16 +1192,16 @@ async def dispatch_responses(*, provider: ProviderId | None = None, **kwargs: An
     returning it through a Responses object would mean inventing item structure the
     upstream never sent; it stays on the route it works on.
 
-    Streaming is not served. The Responses SSE protocol is its own event sequence, not the
-    chat chunks `_wrap_stream` produces, and a half-translated stream is worse than a
-    clean delegation: see the note in `_usage_chunk` about an unguarded `choices[0]`.
+    Streaming returns an async iterator of Responses API events, not chat chunks: see
+    `_codex_responses_stream`, whose event order was captured from this proxy's own native
+    path rather than assumed.
     """
     model = str(kwargs.get("model") or "")
-    if kwargs.get("stream"):
-        return None
     if provider == "google-antigravity" or (provider is None and is_gemini_model(model)):
         return None
     if provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
+        if kwargs.get("stream"):
+            return _codex_responses_stream(model, kwargs)
         return await _codex_responses_turn(model, kwargs)
     return None
 
