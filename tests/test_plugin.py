@@ -1692,3 +1692,123 @@ class TestTheMessagesRouteIsBoundPerRouter:
     def test_a_router_without_the_attribute_is_skipped(self) -> None:
         assert plugin.bind_messages_route(SimpleNamespace()) is False
         assert plugin.bind_messages_route(None) is False
+
+
+class TestEveryDialectReachesEverySubscription:
+    """The matrix a client should never have to think about.
+
+    Three wire dialects, three subscriptions. A client that speaks Messages and one that
+    speaks chat-completions must both reach the same model without adapting, which is the
+    whole reason a proxy sits here. Measured on the live gateway before `/v1/messages` was
+    served, two of the three columns were 401s.
+
+    Claude Max is the deliberate gap in `dispatch_messages`: Messages *is* its wire, so it
+    returns `None` and LiteLLM's native path answers it with the token `_delegate_kwargs`
+    injects — the same routing `dispatch` uses for chat.
+    """
+
+    @pytest.mark.asyncio
+    async def test_messages_reaches_codex(self) -> None:
+        transport = install_transport(FakeTransport(codex_events(text="served")))
+
+        out = await plugin.dispatch_messages(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        assert transport.specs, "the request has to reach the Codex wire"
+        assert out["type"] == "message"
+        assert out["content"][0]["text"] == "served"
+        assert out["stop_reason"] == "end_turn"
+
+    @pytest.mark.asyncio
+    async def test_messages_reaches_antigravity(self) -> None:
+        install_transport(FakeTransport(gemini_events(text="served")))
+
+        out = await plugin.dispatch_messages(
+            provider="google-antigravity",
+            model="mysubs/antigravity/gemini-3-pro",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        assert out["content"][0]["text"] == "served"
+
+    @pytest.mark.asyncio
+    async def test_claude_max_is_left_to_the_native_path(self) -> None:
+        """Messages is Anthropic's own wire; translating it would only lose fidelity."""
+        assert (
+            await plugin.dispatch_messages(
+                provider="anthropic",
+                model="mysubs/claudecode/claude-opus-5",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_system_prompt_is_not_lost(self) -> None:
+        """Messages carries `system` at the top level, the canonical form as a message.
+
+        Dropping it silently would change the answer rather than fail the request, which is
+        the worse failure.
+        """
+        transport = install_transport(FakeTransport(codex_events()))
+
+        await plugin.dispatch_messages(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            system="be terse",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        assert "be terse" in json.dumps(transport.specs[0].body)
+
+    @pytest.mark.asyncio
+    async def test_a_tool_roundtrip_keeps_its_ids(self) -> None:
+        """`tool_use.id` has to survive: Vertex rejects a tool result that cannot name its
+        call, which is the 0.1.5 fix this route must not undo."""
+        transport = install_transport(FakeTransport(codex_events()))
+
+        await plugin.dispatch_messages(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            messages=[
+                {"role": "user", "content": "weather?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "get", "input": {"a": 1}}
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "21C"}
+                    ],
+                },
+            ],
+            tools=[{"name": "get", "description": "d", "input_schema": {"type": "object"}}],
+        )
+
+        body = json.dumps(transport.specs[0].body)
+        assert "toolu_1" in body, "the call id has to reach the wire"
+        assert "21C" in body, "the result has to reach the wire"
+
+    @pytest.mark.asyncio
+    async def test_streaming_replays_the_anthropic_event_sequence(self) -> None:
+        """A Messages client tracks block indices, so they have to be contiguous."""
+        install_transport(FakeTransport(codex_events(text="served")))
+
+        stream = await plugin.dispatch_messages(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+        )
+        kinds = [event["type"] async for event in stream]
+
+        assert kinds[0] == "message_start"
+        assert kinds[-1] == "message_stop"
+        assert "content_block_start" in kinds
+        assert "message_delta" in kinds
