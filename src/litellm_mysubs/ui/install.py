@@ -101,7 +101,17 @@ def _start_refresher_with(app: Any, service: MySubsService) -> None:
         await service.stop_refresher()
 
     def _boot() -> None:
-        """What has to run when the proxy opens: reapply and refresh."""
+        """What has to run when the proxy opens: bind the Responses route, reapply, refresh.
+
+        The bind happens here, and not in `plugin.install()`, because `Router.aresponses` is
+        a per-instance attribute built in `Router.__init__` — there is no class attribute to
+        patch, and by the time this package loads the Router already exists. See
+        `plugin.bind_responses_route`.
+        """
+        from ..plugin import bind_responses_route
+
+        with contextlib.suppress(Exception):
+            bind_responses_route(service.router_source())
         with contextlib.suppress(Exception):
             service.reapply()
         service.start_refresher()

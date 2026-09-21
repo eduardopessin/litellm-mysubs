@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-21
+
+### Fixed
+
+- **`/v1/responses` returned `Incorrect API key provided: None` for Codex models.** The
+  plugin patched `Router.acompletion`, which is the path `/v1/chat/completions` takes. The
+  Responses route goes through `Router.aresponses`, which was never intercepted, so the
+  request reached LiteLLM's native OpenAI client with no `api_key` — the credential is
+  OAuth and lives in the store, not in `config.yaml` — and OpenAI refused it.
+
+  Any client that speaks the Responses API was affected, which includes agent clients that
+  route `gpt-*` models there by default. Reproduced network-free against litellm 1.101.0:
+
+  | route | plugin consulted | result |
+  |---|---|---|
+  | `Router.acompletion` | 1x | served |
+  | `Router.aresponses` | **0x** | `AuthenticationError: api_key: None` |
+
+  Two things made this harder to fix than to find. `Router.aresponses` is **not** a class
+  method: `Router.__init__` builds it per instance with
+  `self.aresponses = self.factory_function(litellm.aresponses, ...)`, capturing the module
+  function by value. Patching the class is a no-op, and patching `litellm.aresponses`
+  afterwards is too late — the factory already holds the old reference. Measured, both
+  orderings:
+
+  | patch timing | effect |
+  |---|---|
+  | before `Router()` | applies |
+  | after `Router()` | **no effect** |
+
+  And after is always: the proxy builds its Router before constructing the `CustomLogger`
+  that loads this package. So the bound attribute is replaced on the live instance instead,
+  by `bind_responses_route`, at the same moment the UI already waits for `llm_router`.
+
+  Codex is served from its own Responses payload rather than a converted chat completion:
+  its endpoint **is** a Responses API, so the terminal event already carries the object the
+  route has to return, and rebuilding it would lose `output` item structure, reasoning
+  items and call ids. Only `id`, `model` and `usage` are normalised.
+
+  Not served here, deliberately: Anthropic, which LiteLLM's native path already answers
+  correctly on this route; Antigravity, which is Gemini-shaped and would need item
+  structure invented for it; and streaming, whose Responses SSE protocol is its own event
+  sequence rather than the chat chunks this plugin emits. All three fall through to the
+  original.
+
+  On the Router the deployment mark decides, and the name heuristic is not consulted:
+  `codex.is_codex_model` matches any name containing `gpt-`, so an operator's own `gpt-4o`
+  deployment would otherwise have been answered from this subscription. Caught by a test,
+  not in production.
+
+  Verified end to end over HTTP against a real proxy with the real route, plus 12 new
+  regression tests.
+
 ## [0.1.2] - 2026-09-20
 
 ### Fixed
@@ -144,6 +197,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/eduardopessin/litellm-mysubs/releases/tag/v0.1.0

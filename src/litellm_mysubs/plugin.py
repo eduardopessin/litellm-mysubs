@@ -40,7 +40,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Coroutine
-from typing import Any, Final, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 import httpx
 import litellm
@@ -53,6 +53,11 @@ from .transport import hosts
 from .transport.client import RequestSpec, Transport
 from .wire import anthropic, antigravity, antigravity_models, codex, planning_leak, thinking_loop
 from .wire.usage import Usage, codex_finish_reason, codex_usage, google_finish_reason, google_usage
+
+if TYPE_CHECKING:
+    # Imported lazily at the call sites: `litellm.types.llms.openai` pulls the OpenAI SDK
+    # response models, and this module has to stay importable without the proxy extras.
+    from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
 
 #: Responses API endpoint served by the ChatGPT subscription.
 CODEX_URL: Final = "https://chatgpt.com/backend-api/codex/responses"
@@ -81,6 +86,7 @@ class _State:
         "original_acompletion",
         "original_completion",
         "original_router_acompletion",
+        "rebound_routers",
         "signatures",
         "step",
         "store",
@@ -92,6 +98,10 @@ class _State:
         self.original_completion: Callable[..., Any] | None = None
         #: The proxy routes through `Router.acompletion`, not the module functions.
         self.original_router_acompletion: Callable[..., Any] | None = None
+        #: Routers whose `aresponses` this module replaced, with the bound attribute it
+        #: replaced. Keyed by `id()` because `Router` is unhashable, and held weakly in
+        #: spirit only: the proxy builds one Router and keeps it for the process.
+        self.rebound_routers: dict[int, tuple[Any, Any]] = {}
         self.store: CredentialStore | None = None
         self.transport: Transport | None = None
         self.signatures: OrderedDict[str, str] = OrderedDict()
@@ -378,7 +388,15 @@ class _Turn:
     made the original's synchronous and asynchronous versions diverge.
     """
 
-    __slots__ = ("finish_raw", "reasoning", "terminal", "text", "tool_calls", "usage_meta")
+    __slots__ = (
+        "finish_raw",
+        "reasoning",
+        "response_payload",
+        "terminal",
+        "text",
+        "tool_calls",
+        "usage_meta",
+    )
 
     def __init__(self) -> None:
         self.text: list[str] = []
@@ -387,6 +405,12 @@ class _Turn:
         self.usage_meta: dict[str, Any] = {}
         self.finish_raw: object = None
         self.terminal = False
+        #: The terminal event's own `response` object, kept verbatim.
+        #:
+        #: Codex speaks the Responses API natively, so `/v1/responses` is served by handing
+        #: this back rather than rebuilding it from the accumulated text — see
+        #: `_codex_responses_turn`. The chat path ignores it.
+        self.response_payload: dict[str, Any] = {}
 
 
 class StreamError(RuntimeError):
@@ -484,6 +508,8 @@ class _CodexReader:
             turn.finish_raw = payload.get("status") or (
                 "incomplete" if kind == "response.incomplete" else "completed"
             )
+            if isinstance(payload, dict):
+                turn.response_payload = payload
             return []
 
         if kind in ("response.failed", "error"):
@@ -757,6 +783,71 @@ async def _codex_turn(model: str, messages: list[Any], extra: dict[str, Any]) ->
     )
 
 
+def _responses_input(kwargs: dict[str, Any]) -> list[Any]:
+    """``/v1/responses`` carries ``input``, not ``messages``.
+
+    A plain string is the documented shorthand for a single user turn, and the item form is
+    already what ``messages_to_input`` produces on the way out, so both are handed to the
+    existing body builder unchanged rather than being converted twice.
+    """
+    value = kwargs.get("input")
+    if isinstance(value, str):
+        return [{"role": "user", "content": value}]
+    if isinstance(value, list):
+        return list(value)
+    return []
+
+
+async def _codex_responses_turn(
+    model: str, kwargs: dict[str, Any]
+) -> ResponsesAPIResponse:
+    """Serves ``/v1/responses`` from the subscription's own Responses payload.
+
+    Codex **is** a Responses API endpoint, so the terminal event already carries the object
+    this route has to return. It is handed back with the public model name restored,
+    instead of being flattened into a chat completion and rebuilt — which is what the chat
+    path does and what would lose `output` item structure, reasoning items and call ids.
+
+    Only the id, model and usage are normalised. Everything else is the upstream's.
+
+    Usage is rebuilt rather than passed through: the upstream sends it in the Responses
+    shape when it sends it at all, and an absent or partial `usage` fails
+    `ResponseAPIUsage` validation, which requires all three counters. Going through
+    `codex_usage` is also what makes this route's spend log match the chat route's.
+    """
+    from litellm.types.llms.openai import ResponsesAPIResponse
+
+    spec = await _codex_spec(model, _responses_input(kwargs), kwargs)
+    turn = _Turn()
+    await _drive(_transport().stream(spec), _CodexReader(turn))
+
+    payload = dict(turn.response_payload)
+    # `model` echoes the wire name; the caller asked for the public one and the spend log
+    # reads this field.
+    payload["model"] = model
+    payload.setdefault("id", f"resp_{uuid.uuid4().hex[:24]}")
+    payload.setdefault("created_at", int(time.time()))
+    payload.setdefault("output", [])
+    payload.setdefault("object", "response")
+    payload["usage"] = _responses_usage(codex_usage(turn.usage_meta))
+    return ResponsesAPIResponse(**payload)
+
+
+def _responses_usage(usage: Usage) -> ResponseAPIUsage:
+    """``ResponseAPIUsage`` counters, which are named differently from the chat ones.
+
+    All three are required by the model, so they are always supplied — a turn whose
+    upstream reported nothing bills zero rather than failing to construct.
+    """
+    from litellm.types.llms.openai import ResponseAPIUsage
+
+    return ResponseAPIUsage(
+        input_tokens=usage.prompt_tokens,
+        output_tokens=usage.completion_tokens,
+        total_tokens=usage.total_tokens,
+    )
+
+
 async def _antigravity_turn(
     model: str, messages: list[Any], extra: dict[str, Any]
 ) -> ModelResponse:
@@ -793,6 +884,29 @@ async def _antigravity_stream(
         yield chunk
     yield _finish_chunk(google_finish_reason(turn.finish_raw, bool(turn.tool_calls)))
     yield _usage_chunk(google_usage(turn.usage_meta))
+
+
+async def dispatch_responses(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
+    """``/v1/responses`` counterpart of `dispatch`; ``None`` means "not mine".
+
+    Only Codex is served here. Anthropic has no branch for the same reason it has none in
+    `dispatch` — LiteLLM's native path serves it with the token `_delegate_kwargs` injects,
+    and that path already answers this route correctly. Antigravity is Gemini-shaped, so
+    returning it through a Responses object would mean inventing item structure the
+    upstream never sent; it stays on the route it works on.
+
+    Streaming is not served. The Responses SSE protocol is its own event sequence, not the
+    chat chunks `_wrap_stream` produces, and a half-translated stream is worse than a
+    clean delegation: see the note in `_usage_chunk` about an unguarded `choices[0]`.
+    """
+    model = str(kwargs.get("model") or "")
+    if kwargs.get("stream"):
+        return None
+    if provider == "google-antigravity" or (provider is None and is_gemini_model(model)):
+        return None
+    if provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
+        return await _codex_responses_turn(model, kwargs)
+    return None
 
 
 async def dispatch(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
@@ -1041,6 +1155,63 @@ async def _wrapped_router_acompletion(
     return await original(self, model=model, messages=messages, stream=stream, **delegated)
 
 
+def bind_responses_route(router: Any) -> bool:
+    """Routes ``/v1/responses`` through the plugin for `router`. ``True`` if it bound.
+
+    `Router.aresponses` is **not** a class method. `Router.__init__` builds it per instance
+    with ``self.aresponses = self.factory_function(litellm.aresponses, ...)``, capturing
+    `litellm.aresponses` by value at construction. Two consequences, both measured:
+
+    - patching the class does nothing — there is no class attribute to override;
+    - patching `litellm.aresponses` after the Router exists does nothing either, because
+      the factory already holds the old reference.
+
+    And the Router **does** already exist by the time this package loads: the proxy builds
+    it before constructing the `CustomLogger` that brings us in (see `bootstrap`). So the
+    only thing that works is replacing the bound attribute on the live instance, which is
+    what this does.
+
+    Idempotent per router: rebinding twice would save our own wrapper as the original and
+    leave `unbind_responses_route` unable to restore anything.
+    """
+    if router is None:
+        return False
+    key = id(router)
+    if key in _state.rebound_routers:
+        return False
+    original = getattr(router, "aresponses", None)
+    if original is None:
+        return False
+
+    async def _wrapped_router_aresponses(**kwargs: Any) -> Any:
+        model = str(kwargs.get("model") or "")
+        declared = provider_of_deployment(router, model)
+        # On the Router the mark is authoritative and the name heuristic is not consulted:
+        # `codex.is_codex_model` matches any name containing "gpt-", so an operator's own
+        # `gpt-4o` deployment would be answered from our subscription — measured, and the
+        # reason this guard exists rather than deferring to `dispatch_responses` alone.
+        if declared is None:
+            return await original(**kwargs)
+        served = await dispatch_responses(provider=declared, **kwargs)
+        if served is not None:
+            return served
+        return await original(**kwargs)
+
+    _state.rebound_routers[key] = (router, original)
+    router.aresponses = _wrapped_router_aresponses
+    return True
+
+
+def unbind_responses_route() -> None:
+    """Restores every `aresponses` this module replaced."""
+    for router, original in _state.rebound_routers.values():
+        try:
+            router.aresponses = original
+        except Exception:  # teardown is best-effort; a dead router is fine
+            continue
+    _state.rebound_routers.clear()
+
+
 def install() -> None:
     """Applies the patch. Idempotent.
 
@@ -1073,6 +1244,7 @@ def uninstall() -> None:
     if _state.original_router_acompletion is not None:
         _router_class().acompletion = _state.original_router_acompletion
         _state.original_router_acompletion = None
+    unbind_responses_route()
     _state.original_acompletion = None
     _state.original_completion = None
 
@@ -1081,9 +1253,12 @@ __all__ = [
     "ANTIGRAVITY_USER_AGENT",
     "CODEX_URL",
     "StreamError",
+    "bind_responses_route",
     "configure",
     "dispatch",
+    "dispatch_responses",
     "install",
     "is_gemini_model",
+    "unbind_responses_route",
     "uninstall",
 ]

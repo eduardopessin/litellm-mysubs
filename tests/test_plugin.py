@@ -1035,3 +1035,189 @@ class TestThePrivateKwargNeverReachesTheProvider:
 
         assert out == "delegated"
         assert plugin._WIRE_MODEL_KEY not in seen
+
+
+def codex_responses_events(
+    *,
+    text: str = "hello",
+    status: str = "completed",
+    usage: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Terminal event carrying a full Responses payload, as the real endpoint sends it."""
+    return [
+        {"type": "response.output_text.delta", "delta": text},
+        {
+            "type": "response.completed" if status == "completed" else "response.incomplete",
+            "response": {
+                "id": "resp_upstream_1",
+                "created_at": 1700000000,
+                "object": "response",
+                "status": status,
+                "model": "gpt-5.5",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": text, "annotations": []}],
+                    }
+                ],
+                "usage": usage or {},
+            },
+        },
+    ]
+
+
+class TestTheResponsesRouteIsServed:
+    """`/v1/responses` reaches `Router.aresponses`, which `install()` cannot patch.
+
+    The regression these guard: the plugin patched `Router.acompletion` only, so a Codex
+    request on the Responses route bypassed dispatch entirely, reached LiteLLM's native
+    OpenAI path with no `api_key` — the credential is OAuth and lives in the store — and
+    came back `Incorrect API key provided: None`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_codex_is_served_from_its_own_responses_payload(self) -> None:
+        """Codex speaks Responses natively: the upstream object is returned, not rebuilt."""
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+
+        out = await plugin.dispatch_responses(
+            provider="openai-codex", model="mysubs/codex/gpt-5.5", input="hi"
+        )
+
+        assert out is not None
+        # The upstream's own output items survive rather than being flattened to text.
+        assert out.output[0].content[0].text == "served"
+        # The public name wins over the wire name the upstream echoes: it is what the
+        # caller asked for and what the spend log records.
+        assert out.model == "mysubs/codex/gpt-5.5"
+        assert out.id == "resp_upstream_1"
+
+    @pytest.mark.asyncio
+    async def test_a_string_input_becomes_a_user_turn(self) -> None:
+        """`/v1/responses` carries `input`, not `messages`."""
+        transport = install_transport(FakeTransport(codex_responses_events()))
+
+        await plugin.dispatch_responses(
+            provider="openai-codex", model="mysubs/codex/gpt-5.5", input="what is 2+2"
+        )
+
+        body = transport.specs[0].body
+        assert json.dumps(body["input"]).find("what is 2+2") != -1
+
+    @pytest.mark.asyncio
+    async def test_streaming_is_left_to_the_original(self) -> None:
+        """The Responses SSE protocol is its own event sequence, not chat chunks."""
+        install_transport(FakeTransport(codex_responses_events()))
+
+        out = await plugin.dispatch_responses(
+            provider="openai-codex", model="mysubs/codex/gpt-5.5", input="hi", stream=True
+        )
+
+        assert out is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("provider", "model"),
+        [
+            ("anthropic", "mysubs/claudecode/claude-opus-5"),
+            ("google-antigravity", "mysubs/antigravity/gemini-3-flash"),
+            (None, "some-other-model"),
+        ],
+    )
+    async def test_everything_else_is_not_ours(self, provider: Any, model: str) -> None:
+        """Anthropic is served by the native path; Antigravity is Gemini-shaped."""
+        install_transport(FakeTransport(codex_responses_events()))
+
+        assert await plugin.dispatch_responses(provider=provider, model=model, input="hi") is None
+
+
+class TestTheResponsesRouteIsBoundPerRouter:
+    """`Router.aresponses` is built per instance, so there is no class attribute to patch.
+
+    `Router.__init__` does `self.aresponses = self.factory_function(litellm.aresponses, ...)`,
+    capturing the module function by value. Measured: patching the class is a no-op, and
+    patching `litellm.aresponses` after the Router exists is too late — which is always,
+    because the proxy builds the Router before loading this package.
+    """
+
+    @staticmethod
+    def _router() -> Any:
+        calls: list[dict[str, Any]] = []
+
+        async def original(**kwargs: Any) -> str:
+            calls.append(kwargs)
+            return "original"
+
+        router = SimpleNamespace(
+            aresponses=original,
+            model_list=[
+                {
+                    "model_name": "mysubs/codex/gpt-5.5",
+                    "litellm_params": {"model": "openai/gpt-5.5"},
+                    "model_info": {"mysubs_provider": "openai-codex"},
+                }
+            ],
+        )
+        return router, original, calls
+
+    @pytest.mark.asyncio
+    async def test_ours_is_served_and_the_original_is_not_called(self) -> None:
+        install_transport(FakeTransport(codex_responses_events(text="bound")))
+        router, _original, calls = self._router()
+
+        assert plugin.bind_responses_route(router) is True
+        out = await router.aresponses(model="mysubs/codex/gpt-5.5", input="hi")
+
+        assert out.output[0].content[0].text == "bound"
+        assert calls == [], "the original must not be reached for one of our models"
+
+        plugin.unbind_responses_route()
+
+    @pytest.mark.asyncio
+    async def test_someone_elses_model_reaches_the_original(self) -> None:
+        install_transport(FakeTransport(codex_responses_events()))
+        router, _original, calls = self._router()
+        plugin.bind_responses_route(router)
+
+        out = await router.aresponses(model="gpt-4o", input="hi")
+
+        assert out == "original"
+        assert calls and calls[0]["model"] == "gpt-4o"
+
+        plugin.unbind_responses_route()
+
+    def test_binding_twice_does_not_chain_wrappers(self) -> None:
+        """The second bind would save our own wrapper as the original to restore."""
+        router, original, _calls = self._router()
+
+        assert plugin.bind_responses_route(router) is True
+        assert plugin.bind_responses_route(router) is False
+
+        plugin.unbind_responses_route()
+        assert router.aresponses is original
+
+    def test_unbind_restores_the_attribute(self) -> None:
+        router, original, _calls = self._router()
+        plugin.bind_responses_route(router)
+        assert router.aresponses is not original
+
+        plugin.unbind_responses_route()
+
+        assert router.aresponses is original
+
+    def test_uninstall_unbinds(self) -> None:
+        """`uninstall` has to leave no loose ends, the Responses route included."""
+        router, original, _calls = self._router()
+        plugin.install()
+        plugin.bind_responses_route(router)
+
+        plugin.uninstall()
+
+        assert router.aresponses is original
+
+    def test_a_router_without_the_attribute_is_skipped(self) -> None:
+        assert plugin.bind_responses_route(SimpleNamespace()) is False
+        assert plugin.bind_responses_route(None) is False
