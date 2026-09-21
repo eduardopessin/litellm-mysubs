@@ -40,6 +40,35 @@ class Selection:
     deployments: list[dict[str, Any]]
 
 
+def _upgraded(entry: dict[str, Any]) -> dict[str, Any]:
+    """A stored deployment brought up to what `to_deployment` builds today.
+
+    What is persisted is the **built deployment**, not the model name — see the note in
+    `service.reapply`. So a field added to `to_deployment` reaches new selections only,
+    and an installation that applied its models before the change keeps the old shape
+    across every restart, forever. Measured on a live gateway: after deploying the release
+    that declares `custom_llm_provider`, all 55 stored deployments still came back without
+    it, because `reapply` reinjects what is on disk verbatim.
+
+    Upgrading on read rather than rewriting the file keeps this recoverable: the file is
+    only rewritten when the user applies a selection, so a downgrade still finds what it
+    wrote.
+
+    `custom_llm_provider` is derived from the wire prefix already in the entry, which is
+    the one with a price table behind it — the same rule `to_deployment` follows, so an
+    upgraded entry and a freshly built one agree.
+    """
+    params = entry.get("litellm_params")
+    if not isinstance(params, dict) or params.get("custom_llm_provider"):
+        return entry
+    wire = params.get("model")
+    if not isinstance(wire, str) or "/" not in wire:
+        return entry
+    upgraded = dict(entry)
+    upgraded["litellm_params"] = {**params, "custom_llm_provider": wire.split("/", 1)[0]}
+    return upgraded
+
+
 class SelectionStore:
     """``models.json`` file next to ``credentials.json``.
 
@@ -79,9 +108,13 @@ class SelectionStore:
             # A deployment without `model_name` is skipped: injecting it into the Router
             # blows up later, somewhere that no longer points at the file that caused it.
             out[provider] = [
-                entry for entry in entries if isinstance(entry, dict) and entry.get("model_name")
+                _upgraded(entry)
+                for entry in entries
+                if isinstance(entry, dict) and entry.get("model_name")
             ]
         return out
+
+
 
     def all(self) -> list[Selection]:
         """Stored selections, in ``PROVIDER_IDS`` order so the result is deterministic."""

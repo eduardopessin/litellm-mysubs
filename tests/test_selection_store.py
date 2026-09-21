@@ -32,12 +32,82 @@ def dep(name: str, model: str = "openai/gpt-5.5") -> dict[str, object]:
 
 class TestRoundTrip:
     def test_deployments_survive_intact(self, store_path: Path) -> None:
+        """What was stored comes back, with `custom_llm_provider` filled in on read.
+
+        The field is derived, not stored data: see `_upgraded`. Everything the caller put
+        in the entry is preserved.
+        """
         saved = [dep("mysubs/codex/gpt-5.5"), dep("mysubs/codex/gpt-5.5-mini")]
         SelectionStore(store_path).save("openai-codex", saved)
 
         got = SelectionStore(store_path).all()
         assert [s.provider for s in got] == ["openai-codex"]
-        assert got[0].deployments == saved
+        assert [d["model_name"] for d in got[0].deployments] == [
+            d["model_name"] for d in saved
+        ]
+        for original, loaded in zip(saved, got[0].deployments, strict=True):
+            assert loaded["model_info"] == original["model_info"]
+            assert loaded["litellm_params"]["model"] == original["litellm_params"]["model"]
+            assert loaded["litellm_params"]["api_base"] == original["litellm_params"]["api_base"]
+
+    def test_a_deployment_stored_before_the_field_gains_it_on_read(
+        self, store_path: Path
+    ) -> None:
+        """What is persisted is the built deployment, not the model name.
+
+        So a field added to `to_deployment` would otherwise reach new selections only, and
+        an installation that applied its models earlier would keep the old shape across
+        every restart. Measured on a live gateway: after deploying the release that
+        declares `custom_llm_provider`, all 55 stored deployments still came back without
+        it, and the UI still had no icon for any of them.
+        """
+        legacy = {
+            "model_name": "mysubs/claudecode/claude-opus-5",
+            "litellm_params": {"model": "anthropic/claude-opus-5"},
+            "model_info": {"managed_by": "mysubs"},
+        }
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_text(
+            json.dumps({"version": 1, "providers": {"anthropic": [legacy]}}), "utf-8"
+        )
+
+        got = SelectionStore(store_path).all()
+
+        assert got[0].deployments[0]["litellm_params"]["custom_llm_provider"] == "anthropic"
+
+    def test_the_derived_provider_is_the_wire_prefix(self, store_path: Path) -> None:
+        """Icon and price must not disagree: the prefix is the one that has a rate."""
+        entries = [
+            {"model_name": "a", "litellm_params": {"model": "gemini/gemini-3-flash"}},
+            {"model_name": "b", "litellm_params": {"model": "openai/gpt-5.5"}},
+        ]
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_text(
+            json.dumps({"version": 1, "providers": {"google-antigravity": entries}}), "utf-8"
+        )
+
+        loaded = SelectionStore(store_path).all()[0].deployments
+
+        assert [d["litellm_params"]["custom_llm_provider"] for d in loaded] == [
+            "gemini",
+            "openai",
+        ]
+
+    def test_an_entry_that_already_declares_one_is_left_alone(
+        self, store_path: Path
+    ) -> None:
+        entry = {
+            "model_name": "a",
+            "litellm_params": {"model": "gemini/g", "custom_llm_provider": "vertex_ai"},
+        }
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_text(
+            json.dumps({"version": 1, "providers": {"google-antigravity": [entry]}}), "utf-8"
+        )
+
+        loaded = SelectionStore(store_path).all()[0].deployments
+
+        assert loaded[0]["litellm_params"]["custom_llm_provider"] == "vertex_ai"
 
     def test_two_providers_both_kept(self, store_path: Path) -> None:
         store = SelectionStore(store_path)
