@@ -179,27 +179,37 @@ exactly one priced spend row whichever cell serves it, carry the wire identity s
 tab can price it and draw an icon, and — when the client asked to stream — deliver output
 incrementally rather than in one block at the end. That last one is the invariant that is
 easiest to lose without noticing: a route that awaits the whole turn and replays it still
-answers correctly, still bills correctly, and is not a stream. Measured on `/v1/responses`
-before and after it was fixed, same prompt:
+answers correctly, still bills correctly, and is not a stream.
+
+Both routes that replayed have been made incremental. Measured on the live gateway, same
+prompt and the same 2000-token ceiling, `events / text deltas / time to first event`:
+
+| | `/v1/chat/completions` | `/v1/responses` | `/v1/messages` |
+|---|---|---|---|
+| **Claude Max** | 128 / 126 / 1552 ms | 155 / 146 / 874 ms | 276 / 132 / 2329 ms |
+| **ChatGPT Codex** | 1823 / 1820 / 1544 ms | 2175 / 2164 / 29 ms | 1692 / 1687 / 63 ms |
+| **Google Antigravity** | 53 / 50 / 6059 ms | 75 / 64 / 24 ms | 63 / 58 / 38 ms |
+
+What those numbers replaced:
 
 ```
-before   gemini events=   2 deltas=   0 ttft=20911ms
-after    gemini events=  59 deltas=  51 ttft=   51ms
-reference codex events=7117 deltas=7107 ttft=   30ms
+/v1/responses  antigravity     2 events,    0 deltas, 20911 ms
+/v1/messages   codex           9 events,              30714 ms
+/v1/messages   antigravity     6 events,               6916 ms
 ```
 
-Counts and latencies are one run each and vary between them — a later run of the fixed
-path gave 61 events at 29 ms. What does not vary is the shape: zero deltas and a
-twenty-second wait is a different contract, not a slower one.
+Counts and latencies are one run each and vary between them. What does not vary is the
+shape: zero deltas and a twenty-second wait is a different contract, not a slower one.
 
 The suite asserts this per cell against the number of chunks the upstream sent, rather than
 against an event count, so the incremental property is pinned without pinning a total that
 legitimately varies.
 
-**Known gap:** `/v1/messages` still replays the finished turn for the two served
-subscriptions, which is the defect described above, not yet fixed on that route. Measured:
-Codex 9 events at 30.7 s to first byte, Antigravity 6 events at 6.9 s, against Claude's 66
-events at 0.78 s on the same route. Correct answers, correct rows, and not a stream.
+**Open question:** Antigravity on chat-completions takes 6 s to its first event while the
+same subscription answers in 24 ms on `/v1/responses` with the same reader and the same
+upstream. Delta counts are comparable (50 against 64), so this is latency to the first one,
+not aggregation. That route is the only one of the three that goes through LiteLLM's
+`CustomStreamWrapper`. Not yet measured, so not yet claimed.
 
 ## Known incompatibility: `store_model_in_db: true`
 

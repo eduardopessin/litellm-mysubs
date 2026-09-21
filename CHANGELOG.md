@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-21
+
 ### Added
 
 - **`/v1/messages` serves every subscription.** Anthropic-native clients speak Messages,
@@ -187,6 +189,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   why a diagnostic build looked like code that never ran. Three `contextlib.suppress`
   blocks that hid real failures (route binding, model reapply, the stream's own emit) now
   report, and the gateway sets `LITELLM_LOG=INFO`.
+
+- **`/v1/messages` replayed the finished turn instead of streaming it.** The same defect
+  as on `/v1/responses`, on the last route that still had it, and defended by the same
+  argument: that a translated stream would have to invent block indices mid-flight. The
+  indices are ours either way — neither upstream sends them — so numbering blocks as they
+  open is no more invented than numbering them at the end, and it is what lets text leave
+  as it arrives.
+
+  Measured on the live gateway, same prompt and ceiling, `events / deltas / time to first
+  event`, before and after:
+
+  | | before | after |
+  |---|---|---|
+  | Codex | 9 / — / 30714 ms | 1692 / 1687 / 63 ms |
+  | Antigravity | 6 / — / 6916 ms | 63 / 58 / 38 ms |
+
+  `message_start` is emitted immediately rather than on the first token: it carries no
+  content, and holding it back made the route look slower than it was. Reasoning and tool
+  calls are still emitted as whole blocks once the turn closes, which is the division the
+  Responses route makes and for the same reason — neither upstream streams them in a form
+  that can be replayed without a second interpretation of the same events.
+
+  The spend row comes with it. This route never reaches `CustomStreamWrapper`, because it
+  emits Anthropic events rather than chat chunks, so it had the accounting hole
+  `/v1/responses` had: `_logged_messages` dispatches from the usage on `message_delta`,
+  in a `finally`, so a consumer that stops reading early still bills the turn its
+  subscription has been charged for. `UpstreamError` is translated here too, which this
+  route also lacked — a quota refusal reached the client as 500 rather than 429.
 
 ### Changed
 
