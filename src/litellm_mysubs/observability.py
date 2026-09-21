@@ -178,31 +178,50 @@ async def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> 
     The terminal event carries the turn: `response.completed` holds the usage the row needs,
     so it is kept as the result rather than reassembled. Best effort by contract — a
     logging failure must not truncate a stream the subscription has already paid for.
+
+    The row is dispatched **when the terminal event is seen**, not after the loop drains.
+    A consumer that stops reading at `response.completed` — which is what the proxy does —
+    closes this generator, and `aclose()` raises `GeneratorExit` at the `yield`, so anything
+    after the `async for` never runs. Measured on the live gateway: three streamed
+    `/v1/responses` calls left no row at all, while the non-streamed one on the same model
+    logged normally. The `finally` still covers a stream that ends without a terminal event.
     """
     started = datetime.datetime.now()
     first_token_at: datetime.datetime | None = None
     terminal: Any = None
-    async for event in events:
-        # The first event out is the time-to-first-token the Logs tab shows. Nothing else
-        # can measure it: by the time the stream ends the moment has passed, and the
-        # upstream does not report it.
-        if first_token_at is None:
-            first_token_at = datetime.datetime.now()
-        if getattr(event, "type", None) in ("response.completed", "response.incomplete"):
-            terminal = getattr(event, "response", None) or event
-        yield event
+    emitted = False
 
-    logging_obj = kwargs.get("litellm_logging_obj")
-    handler = getattr(logging_obj, "async_success_handler", None)
-    if handler is None:
-        return
-    if terminal is not None:
-        _stamp_cost(logging_obj, terminal, kwargs)
-    _stamp_first_token(logging_obj, first_token_at)
-    with contextlib.suppress(Exception):
-        await handler(
-            result=terminal, start_time=started, end_time=datetime.datetime.now()
-        )
+    async def _emit() -> None:
+        nonlocal emitted
+        if emitted:
+            return
+        emitted = True
+        logging_obj = kwargs.get("litellm_logging_obj")
+        handler = getattr(logging_obj, "async_success_handler", None)
+        if handler is None:
+            return
+        if terminal is not None:
+            _stamp_cost(logging_obj, terminal, kwargs)
+        _stamp_first_token(logging_obj, first_token_at)
+        with contextlib.suppress(Exception):
+            await handler(
+                result=terminal, start_time=started, end_time=datetime.datetime.now()
+            )
+
+    try:
+        async for event in events:
+            # The first event out is the time-to-first-token the Logs tab shows. Nothing
+            # else can measure it: by the time the stream ends the moment has passed, and
+            # the upstream does not report it.
+            if first_token_at is None:
+                first_token_at = datetime.datetime.now()
+            if getattr(event, "type", None) in ("response.completed", "response.incomplete"):
+                terminal = getattr(event, "response", None) or event
+                await _emit()
+            yield event
+    finally:
+        with contextlib.suppress(Exception):
+            await _emit()
 
 
 def _stamp_first_token(logging_obj: Any, moment: datetime.datetime | None) -> None:

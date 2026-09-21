@@ -1596,6 +1596,37 @@ class TestTheResponsesRouteIsLogged:
         assert call["start"] <= call["first_token"] <= call["end"]
         assert call["end"] > call["start"], "a streamed turn takes time"
 
+    @pytest.mark.asyncio
+    async def test_a_consumer_that_stops_at_the_terminal_event_still_gets_a_row(
+        self,
+    ) -> None:
+        """The proxy stops reading at `response.completed`; it does not drain the stream.
+
+        Logging used to live after the `async for`, so closing the generator raised
+        `GeneratorExit` at the `yield` and that code never ran. Every other test in this
+        class drains to exhaustion, which is why the suite stayed green while three
+        streamed `/v1/responses` calls on the live gateway left no spend row at all and the
+        non-streamed one on the same model logged normally.
+        """
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+        log = self.Recorder("mysubs/codex/gpt-5.5")
+
+        stream = await plugin.dispatch_responses(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            input="hi",
+            stream=True,
+            litellm_logging_obj=log,
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+        async for event in stream:
+            if getattr(event, "type", None) == "response.completed":
+                break
+        await stream.aclose()
+
+        assert len(log.calls) == 1, "a turn the subscription paid for has to leave a row"
+        assert log.calls[0]["usage"] is not None, "a row without usage cannot be priced"
+
 
 class TestTheResponsesRouteIsBoundPerRouter:
     """`Router.aresponses` is built per instance, so there is no class attribute to patch.
