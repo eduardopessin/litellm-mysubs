@@ -271,10 +271,12 @@ class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
         except StopAsyncIteration:
             await self._emit()
             raise
-        # The first event out is the time-to-first-token the Logs tab shows. Nothing else
-        # can measure it: by the time the stream ends the moment has passed, and the
-        # upstream does not report it.
-        if self._first_token_at is None:
+        # The first event that carries **output** is the time-to-first-token, not the
+        # first event of any kind: `response.created` is an envelope this plugin emits
+        # the moment the stream opens, before the upstream has answered anything.
+        # Measured on the live gateway while any-event was the rule: Codex logged
+        # ttft=1ms against a 114s turn, which is the envelope's latency, not the model's.
+        if self._first_token_at is None and _carries_output(event):
             self._first_token_at = datetime.datetime.now()
         if getattr(event, "type", None) in ("response.completed", "response.incomplete"):
             # Two consumers, two shapes, and they are not the same object.
@@ -348,6 +350,21 @@ def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> _Logge
     return _LoggedResponsesStream(events, kwargs)
 
 
+
+#: Events that mean the model has produced something a client can show. The envelope
+#: events (`response.created`, `response.in_progress`) and the structural ones
+#: (`output_item.added`, `content_part.added`) are emitted before any output exists.
+_OUTPUT_EVENT_MARKERS: Final = (".delta", ".done")
+
+
+def _carries_output(event: Any) -> bool:
+    """Whether this event is the model answering rather than the stream opening."""
+    kind = getattr(event, "type", None)
+    if not isinstance(kind, str):
+        return False
+    if kind in ("response.completed", "response.incomplete"):
+        return True
+    return any(kind.endswith(marker) for marker in _OUTPUT_EVENT_MARKERS)
 
 
 def _stamp_first_token(logging_obj: Any, moment: datetime.datetime | None) -> None:

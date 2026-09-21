@@ -6,6 +6,7 @@ what the real `Transport` delivers (`AsyncIterator[dict]`).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator, Iterable
@@ -59,9 +60,13 @@ class FakeTransport:
         events: Iterable[dict[str, Any]] = (),
         *,
         error: Exception | None = None,
+        delay: float = 0.0,
     ) -> None:
         self.events = list(events)
         self.error = error
+        #: Seconds before the first event. Without it a test cannot tell the moment the
+        #: stream opened from the moment the model answered, which is the whole of TTFT.
+        self.delay = delay
         self.specs: list[RequestSpec] = []
 
     async def request(self, spec: RequestSpec) -> Response:  # pragma: no cover - unused
@@ -72,6 +77,8 @@ class FakeTransport:
         self.specs.append(spec)
         if self.error is not None:
             raise self.error
+        if self.delay:
+            await asyncio.sleep(self.delay)
         for event in self.events:
             yield event
 
@@ -1746,8 +1753,13 @@ class TestTheResponsesRouteIsLogged:
 
         By the time it ends the moment has passed, and the upstream does not report it —
         so a row without it shows no TTFT at all, which is what the Logs tab displayed.
+
+        It must also measure the **model**, not the envelope. `response.created` is
+        emitted the instant the stream opens, before the upstream has said anything;
+        timing it produced `ttft=1ms` on a 114-second Codex turn on the live gateway,
+        next to a Gemini turn reporting an honest 736ms on the same route.
         """
-        install_transport(FakeTransport(codex_responses_events(text="served")))
+        install_transport(FakeTransport(codex_responses_events(text="served"), delay=0.05))
         log = self.Recorder("mysubs/codex/gpt-5.5")
 
         stream = await plugin.dispatch_responses(
@@ -1765,6 +1777,9 @@ class TestTheResponsesRouteIsLogged:
         assert call["first_token"] is not None, "the row has to know when output began"
         assert call["start"] <= call["first_token"] <= call["end"]
         assert call["end"] > call["start"], "a streamed turn takes time"
+        assert (call["first_token"] - call["start"]).total_seconds() >= 0.05, (
+            "TTFT has to time the model, not the envelope event we emit ourselves"
+        )
 
     @pytest.mark.asyncio
     async def test_a_consumer_that_stops_at_the_terminal_event_still_gets_a_row(
