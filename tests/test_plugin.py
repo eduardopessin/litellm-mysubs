@@ -16,7 +16,7 @@ import litellm
 import litellm.main
 import pytest
 
-from litellm_mysubs import plugin
+from litellm_mysubs import observability, plugin, routes, specs
 from litellm_mysubs.credentials.store import Credential, CredentialStore, ProviderId
 from litellm_mysubs.transport.client import (
     RedeemRequired,
@@ -640,7 +640,7 @@ class TestRefresh:
         store = FakeStore({"openai-codex": Credential(provider="openai-codex", access_token="new")})
         plugin.configure(store=store)
 
-        token = await plugin._refresh("codex")
+        token = await specs._refresh("codex")
 
         assert token == "new"
         assert store.reloads == 1
@@ -848,14 +848,14 @@ class TestDispatchHonoursTheDeclaredProvider:
             called.append("antigravity")
             return "answer"
 
-        original = plugin._antigravity_turn
-        plugin._antigravity_turn = fake_antigravity  # type: ignore[assignment]
+        original = routes._antigravity_turn
+        routes._antigravity_turn = fake_antigravity  # type: ignore[assignment]
         try:
             out = await plugin.dispatch(
                 provider="google-antigravity", model="claude-sonnet-4-6", messages=[]
             )
         finally:
-            plugin._antigravity_turn = original  # type: ignore[assignment]
+            routes._antigravity_turn = original  # type: ignore[assignment]
         assert out == "answer"
         assert called == ["antigravity"], "the name beat the declared provider"
 
@@ -874,15 +874,15 @@ class TestDispatchHonoursTheDeclaredProvider:
             called.append("codex")
             return "ok"
 
-        a, c = plugin._antigravity_turn, plugin._codex_turn
-        plugin._antigravity_turn = fake_antigravity  # type: ignore[assignment]
-        plugin._codex_turn = fake_codex  # type: ignore[assignment]
+        a, c = routes._antigravity_turn, routes._codex_turn
+        routes._antigravity_turn = fake_antigravity  # type: ignore[assignment]
+        routes._codex_turn = fake_codex  # type: ignore[assignment]
         try:
             await plugin.dispatch(
                 provider="google-antigravity", model="gpt-oss-120b-medium", messages=[]
             )
         finally:
-            plugin._antigravity_turn, plugin._codex_turn = a, c  # type: ignore[assignment]
+            routes._antigravity_turn, routes._codex_turn = a, c  # type: ignore[assignment]
         assert called == ["antigravity"], f"it went to the wrong place: {called}"
 
     async def test_without_a_declared_provider_the_name_still_decides(self) -> None:
@@ -896,12 +896,12 @@ class TestDispatchHonoursTheDeclaredProvider:
             called.append("antigravity")
             return "ok"
 
-        original = plugin._antigravity_turn
-        plugin._antigravity_turn = fake_antigravity  # type: ignore[assignment]
+        original = routes._antigravity_turn
+        routes._antigravity_turn = fake_antigravity  # type: ignore[assignment]
         try:
             await plugin.dispatch(model="gemini-3-flash", messages=[])
         finally:
-            plugin._antigravity_turn = original  # type: ignore[assignment]
+            routes._antigravity_turn = original  # type: ignore[assignment]
         assert called == ["antigravity"]
 
     async def test_a_foreign_model_is_still_not_ours(self) -> None:
@@ -966,7 +966,8 @@ class TestStreamedCallsCarryACostableIdentity:
     def test_the_wire_pair_is_what_reaches_the_cost_calculation(
         self, public: str, wire: str, expected: tuple[str, str]
     ) -> None:
-        assert plugin._cost_identity(public, {plugin._WIRE_MODEL_KEY: wire}) == expected
+        identity = observability._cost_identity(public, {observability._WIRE_MODEL_KEY: wire})
+        assert identity == expected
 
     def test_without_a_deployment_the_name_is_not_guessed(self) -> None:
         """A direct `litellm.acompletion` call has no Router to ask.
@@ -974,7 +975,7 @@ class TestStreamedCallsCarryACostableIdentity:
         Guessing a family from the name would price the call against another model's
         rate, which is worse than not pricing it.
         """
-        assert plugin._cost_identity("gpt-5.5", {}) == ("gpt-5.5", "custom_openai")
+        assert observability._cost_identity("gpt-5.5", {}) == ("gpt-5.5", "custom_openai")
 
     def test_the_wrapper_is_built_with_the_wire_identity(self) -> None:
         """What the wrapper is given is what the cost calculation sees."""
@@ -983,10 +984,10 @@ class TestStreamedCallsCarryACostableIdentity:
             if False:  # pragma: no cover - an empty stream is enough here
                 yield None
 
-        wrapper = plugin._wrap_stream(
+        wrapper = observability._wrap_stream(
             chunks(),
             "mysubs/codex/gpt-5.5",
-            {plugin._WIRE_MODEL_KEY: "openai/gpt-5.5", "messages": []},
+            {observability._WIRE_MODEL_KEY: "openai/gpt-5.5", "messages": []},
         )
         # The wrapper keeps the prefix; what matters is that the pair is the priceable
         # one, not the public name with `custom_openai`.
@@ -1045,11 +1046,11 @@ class TestThePrivateKwargNeverReachesTheProvider:
         out = await plugin._wrapped_acompletion(
             model="some-other-model",
             messages=[{"role": "user", "content": "hi"}],
-            **{plugin._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
         )
 
         assert out == "delegated"
-        assert plugin._WIRE_MODEL_KEY not in seen
+        assert observability._WIRE_MODEL_KEY not in seen
 
 
 def codex_responses_events(
@@ -1313,11 +1314,11 @@ class TestTheSpendLogRecordsAPriceableIdentity:
         public = "mysubs/antigravity/gemini-3-flash"
         log = self._logging_obj(public)
 
-        plugin._stamp_logging_identity(
+        observability._stamp_logging_identity(
             public,
             {
                 "litellm_logging_obj": log,
-                plugin._WIRE_MODEL_KEY: "gemini/gemini-3-flash",
+                observability._WIRE_MODEL_KEY: "gemini/gemini-3-flash",
             },
         )
 
@@ -1329,9 +1330,9 @@ class TestTheSpendLogRecordsAPriceableIdentity:
         public = "mysubs/codex/gpt-5.5"
         log = self._logging_obj(public)
 
-        plugin._stamp_logging_identity(
+        observability._stamp_logging_identity(
             public,
-            {"litellm_logging_obj": log, plugin._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+            {"litellm_logging_obj": log, observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
         )
 
         assert log.model_call_details["model_group"] == public
@@ -1344,13 +1345,13 @@ class TestTheSpendLogRecordsAPriceableIdentity:
         public = "mysubs/codex/gpt-5.5"
         log = self._logging_obj(public)
 
-        plugin._stamp_logging_identity(public, {"litellm_logging_obj": log})
+        observability._stamp_logging_identity(public, {"litellm_logging_obj": log})
 
         assert log.model_call_details["model"] == public
         assert log.model_call_details["custom_llm_provider"] is None
 
     def test_a_caller_without_a_logging_object_is_not_a_failure(self) -> None:
-        plugin._stamp_logging_identity("m", {plugin._WIRE_MODEL_KEY: "openai/m"})
+        observability._stamp_logging_identity("m", {observability._WIRE_MODEL_KEY: "openai/m"})
 
 
 class TestTheNonStreamingPathIsLogged:
@@ -1394,7 +1395,7 @@ class TestTheNonStreamingPathIsLogged:
             model="mysubs/codex/gpt-5.5",
             messages=[{"role": "user", "content": "hi"}],
             litellm_logging_obj=log,
-            **{plugin._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
         )
 
         assert len(log.calls) == 1, "exactly one success event per turn"
@@ -1416,7 +1417,7 @@ class TestTheNonStreamingPathIsLogged:
             model="mysubs/codex/gpt-5.5",
             messages=[{"role": "user", "content": "hi"}],
             litellm_logging_obj=Broken("mysubs/codex/gpt-5.5"),
-            **{plugin._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
         )
 
         assert out.choices[0].message.content == "served"
@@ -1459,7 +1460,7 @@ class TestTheResponsesRouteIsLogged:
             model="mysubs/codex/gpt-5.5",
             input="hi",
             litellm_logging_obj=log,
-            **{plugin._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
         )
 
         assert len(log.calls) == 1, "exactly one success event per turn"
@@ -1481,7 +1482,7 @@ class TestTheResponsesRouteIsLogged:
             input="hi",
             stream=True,
             litellm_logging_obj=log,
-            **{plugin._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
         )
         events = [e async for e in stream]
 
@@ -1597,3 +1598,97 @@ class TestTheResponsesRouteIsBoundPerRouter:
     def test_a_router_without_the_attribute_is_skipped(self) -> None:
         assert plugin.bind_responses_route(SimpleNamespace()) is False
         assert plugin.bind_responses_route(None) is False
+
+
+class TestTheMessagesRouteIsBoundPerRouter:
+    """`/v1/messages` is the third dialect, and a client should not have to adapt.
+
+    Anthropic-native clients speak Messages, and a proxy that only answers
+    chat-completions and Responses forces each of them to change. Measured on the live
+    gateway before this existed::
+
+        /v1/messages  mysubs/claudecode/*  401 Missing Anthropic API Key
+        /v1/messages  mysubs/codex/*       401 AuthenticationError
+
+    The 401 is the same failure mode the Responses route had before 0.1.3: without
+    interception the request reaches LiteLLM's native client with no key, because the
+    credential is OAuth and lives in the store, not in `config.yaml`.
+
+    `Router.aanthropic_messages` is built per instance exactly like `aresponses`
+    (`self.aanthropic_messages = self.factory_function(litellm.anthropic_messages, ...)`),
+    so the same binding strategy applies.
+    """
+
+    @staticmethod
+    def _router() -> Any:
+        calls: list[dict[str, Any]] = []
+
+        async def original(**kwargs: Any) -> str:
+            calls.append(kwargs)
+            return "original"
+
+        router = SimpleNamespace(
+            aanthropic_messages=original,
+            anthropic_messages=original,
+            model_list=[
+                {
+                    "model_name": "mysubs/claudecode/claude-opus-5",
+                    "litellm_params": {"model": "anthropic/claude-opus-5"},
+                    "model_info": {"mysubs_provider": "anthropic"},
+                },
+                {
+                    "model_name": "mysubs/codex/gpt-5.5",
+                    "litellm_params": {"model": "openai/gpt-5.5"},
+                    "model_info": {"mysubs_provider": "openai-codex"},
+                },
+            ],
+        )
+        return router, original, calls
+
+    def test_binding_replaces_both_spellings(self) -> None:
+        """The Router exposes the call under two names, and the proxy may use either."""
+        router, original, _calls = self._router()
+
+        assert plugin.bind_messages_route(router) is True
+        assert router.aanthropic_messages is not original
+        assert router.anthropic_messages is not original
+
+        plugin.unbind_messages_route()
+        assert router.aanthropic_messages is original
+        assert router.anthropic_messages is original
+
+    @pytest.mark.asyncio
+    async def test_someone_elses_model_reaches_the_original(self) -> None:
+        router, _original, calls = self._router()
+        plugin.bind_messages_route(router)
+
+        out = await router.aanthropic_messages(
+            model="claude-3-5-sonnet", messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert out == "original"
+        assert calls and calls[0]["model"] == "claude-3-5-sonnet"
+
+        plugin.unbind_messages_route()
+
+    def test_binding_twice_does_not_chain_wrappers(self) -> None:
+        router, original, _calls = self._router()
+
+        assert plugin.bind_messages_route(router) is True
+        assert plugin.bind_messages_route(router) is False
+
+        plugin.unbind_messages_route()
+        assert router.aanthropic_messages is original
+
+    def test_uninstall_unbinds(self) -> None:
+        router, original, _calls = self._router()
+        plugin.install()
+        plugin.bind_messages_route(router)
+
+        plugin.uninstall()
+
+        assert router.aanthropic_messages is original
+
+    def test_a_router_without_the_attribute_is_skipped(self) -> None:
+        assert plugin.bind_messages_route(SimpleNamespace()) is False
+        assert plugin.bind_messages_route(None) is False

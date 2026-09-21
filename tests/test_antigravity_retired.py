@@ -24,7 +24,7 @@ from typing import Any, Final
 
 import pytest
 
-from litellm_mysubs import plugin
+from litellm_mysubs import plugin, turns
 from litellm_mysubs.credentials.store import Credential, CredentialStore, ProviderId
 from litellm_mysubs.transport.client import RequestSpec, Response
 from litellm_mysubs.wire import antigravity, antigravity_models
@@ -303,10 +303,10 @@ class TestSplitNotice:
                 calls.append(wire_model)
                 raise
 
-        plugin.antigravity.raise_if_retired = counting  # type: ignore[assignment]
+        turns.antigravity.raise_if_retired = counting  # type: ignore[assignment]
         try:
             with pytest.raises(ModelRetiredError, match=r"Gemini 3\.7"):
                 await stream()
         finally:
-            plugin.antigravity.raise_if_retired = original  # type: ignore[assignment]
+            turns.antigravity.raise_if_retired = original  # type: ignore[assignment]
         assert calls == ["gemini-3.5-flash-low"]

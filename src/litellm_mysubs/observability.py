@@ -1,0 +1,254 @@
+"""Spend logging, cost identity and error translation for the three routes.
+
+Extracted from `plugin.py`. None of it touches process state: every function takes the
+caller's `kwargs` and works from what is in them, which is why it moved out cleanly.
+
+The three jobs here are what makes a served request indistinguishable from a native one
+from the outside:
+
+- **identity** — the wire `(model, provider)` pair, so the spend log can price the call
+  and the UI can draw a provider icon;
+- **logging** — firing the success handler on paths that never reach LiteLLM's own
+  `@client` wrapper, which is every path this plugin serves;
+- **errors** — mapping an upstream refusal onto the exception LiteLLM has a class for, so
+  a 429 stays a 429 instead of collapsing into `internal_server_error`.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime
+import uuid
+from collections.abc import AsyncIterator, Coroutine
+from typing import Any, Final
+
+import litellm
+from litellm.litellm_core_utils.litellm_logging import Logging
+from litellm.types.utils import ModelResponseStream
+
+from .transport.client import RedeemRequired, RemapRequired, UpstreamError
+
+#: Carries the deployment's wire model name across the dispatch boundary.
+_WIRE_MODEL_KEY: Final = "mysubs_wire_model"
+
+
+async def _translate_errors(
+    chunks: AsyncIterator[ModelResponseStream], model: str, kwargs: dict[str, Any]
+) -> AsyncIterator[ModelResponseStream]:
+    """Same translation as `dispatch`, for the streaming path.
+
+    The generator is built before `dispatch` returns but only starts running when the
+    wrapper pulls the first chunk, so the `try` around the call site never sees the
+    upstream refusal — `_open` runs inside the first `__anext__`. Wrapping the iterator is
+    what puts the translation where the error actually surfaces.
+    """
+    try:
+        async for chunk in chunks:
+            yield chunk
+    except UpstreamError as error:
+        raise _as_litellm_error(error, model, kwargs) from error
+
+
+def _as_litellm_error(error: UpstreamError, model: str, kwargs: dict[str, Any]) -> Exception:
+    """Translates an upstream refusal into the exception LiteLLM understands.
+
+    `UpstreamError` already carries the real status, but the proxy has no class for it: an
+    unrecognised exception is reported as `internal_server_error` with HTTP 500, and the
+    upstream status survives only as text inside the message. Measured on the live
+    gateway, a quota refusal reached the client as::
+
+        HTTP 500  {"error": {"type": "internal_server_error", "code": "500",
+                             "message": "HTTP 429: ... RESOURCE_EXHAUSTED ..."}}
+
+    A client cannot back off on a 500. It can on a 429, and backing off is the one correct
+    response to a quota refusal — so the status is mapped, never invented: anything that is
+    not a status LiteLLM has a class for propagates unchanged.
+
+    `RemapRequired` and `RedeemRequired` are excluded even though the latter is also a 429:
+    they are signals to `plugin.py`, not answers to the client, and the module docstring's
+    rule that they propagate as themselves is what lets a caller act on them.
+    """
+    if isinstance(error, RemapRequired | RedeemRequired):
+        return error
+    _, family = _cost_identity(model, kwargs)
+    if error.status == 429:
+        return litellm.exceptions.RateLimitError(
+            message=str(error), llm_provider=family, model=model
+        )
+    return error
+
+
+async def _logged(turn: Coroutine[Any, Any, Any], kwargs: dict[str, Any]) -> Any:
+    """Awaits a non-streaming turn and dispatches success logging for it.
+
+    Chat streaming already logs: `_wrap_stream` hands the response to
+    `CustomStreamWrapper`, which dispatches the success handler at end of stream. A
+    non-streaming turn returns bare straight out of `dispatch` — a `ModelResponse` on the
+    chat route, a `ResponsesAPIResponse` on ``/v1/responses`` — so it never reaches the
+    `@client` wrapper in ``litellm.utils`` that would normally call
+    ``logging_obj.async_success_handler``, and a request that never logs produces **no**
+    spend row at all. Both routes are served here; the streamed Responses counterpart is
+    `_logged_stream`.
+
+    Measured on a live gateway, two calls to the same model two seconds apart:
+
+    ===============  ======================================================
+    ``stream: true``  ``openai/gpt-5.5`` priced at ``0.00121``
+    ``stream: false`` no row of any kind
+    ===============  ======================================================
+
+    The consequence is not a pricing bug but an accounting hole: ``x-litellm-key-spend``
+    undercounts, and per-key budgets and rate limits never see these calls.
+
+    Best effort by contract: a logging failure must not lose a response the upstream
+    already produced and the user has already been charged for by the subscription.
+    """
+    response = await turn
+    logging_obj = kwargs.get("litellm_logging_obj")
+    handler = getattr(logging_obj, "async_success_handler", None)
+    if handler is None:
+        return response
+    with contextlib.suppress(Exception):
+        now = datetime.datetime.now()
+        await handler(result=response, start_time=now, end_time=now)
+    return response
+
+
+async def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> AsyncIterator[Any]:
+    """Relays a Responses stream and dispatches success logging once it ends.
+
+    The chat route gets this for free: `_wrap_stream` hands the turn to
+    `CustomStreamWrapper`, which fires the handler itself at end of stream. The Responses
+    route emits its own event sequence and never touches that wrapper, so it produced **no**
+    spend row at all — the same accounting hole `_logged` closes for the non-streaming
+    path, on the path that matters most in practice: a client that discovers models
+    through LiteLLM routes every OpenAI-backed model here.
+
+    Measured on the live gateway: an omp run exercising all five Codex models end to end
+    left no Codex row, while Anthropic and Gemini — which go through chat — logged 33 and
+    50 rows over the same minutes.
+
+    The terminal event carries the turn: `response.completed` holds the usage the row needs,
+    so it is kept as the result rather than reassembled. Best effort by contract — a
+    logging failure must not truncate a stream the subscription has already paid for.
+    """
+    terminal: Any = None
+    async for event in events:
+        if getattr(event, "type", None) in ("response.completed", "response.incomplete"):
+            terminal = getattr(event, "response", None) or event
+        yield event
+
+    logging_obj = kwargs.get("litellm_logging_obj")
+    handler = getattr(logging_obj, "async_success_handler", None)
+    if handler is None:
+        return
+    with contextlib.suppress(Exception):
+        now = datetime.datetime.now()
+        await handler(result=terminal, start_time=now, end_time=now)
+
+
+def _cost_identity(model: str, kwargs: dict[str, Any]) -> tuple[str, str]:
+    """The ``(model, provider)`` pair the cost calculation needs.
+
+    ``model`` arrives here as the **public** name (``mysubs/codex/gpt-5.5``) — what the
+    client asked for and what the Router resolved. No rate exists under that name, and
+    ``custom_openai`` has no price table either, so every streamed call was logged at
+    ``0.0``. Measured on ``litellm[proxy]`` 1.101.0, identical usage:
+
+    ===================================== ============
+    ``(model, custom_llm_provider)``       cost
+    ===================================== ============
+    ``("mysubs/codex/gpt-5.5", "custom_openai")``  ``0.0``
+    ``("openai/gpt-5.5", "openai")``               ``0.0202325``
+    ===================================== ============
+
+    The wire name is already on the deployment, in ``litellm_params.model``, carrying the
+    family prefix ``to_deployment`` picked from ``modelProvider``. It is the same pair the
+    non-streaming path gets from the Router — which is why only streaming lost the cost,
+    and why 83% of real calls were logged as free.
+
+    Without a deployment there is nothing to look up: a direct ``litellm.acompletion``
+    call has no Router. The old pair is kept for that case rather than guessing a family
+    from the name, because a wrong guess prices the call against another model's rate.
+    """
+    wire = str(kwargs.get(_WIRE_MODEL_KEY) or "")
+    if not wire:
+        return model, "custom_openai"
+    family = wire.split("/", 1)[0] if "/" in wire else "openai"
+    return wire, family
+
+
+def _stamp_logging_identity(model: str, kwargs: dict[str, Any]) -> None:
+    """Record the **wire** ``(model, provider)`` pair on the caller's logging object.
+
+    The spend log reads `custom_llm_provider` and `model` from
+    `logging_obj.model_call_details`, not from the deployment. A request this plugin serves
+    never reaches the provider client that would normally fill them in, so without this the
+    row lands with the public name and **no provider at all** — measured on a live gateway:
+    rows served natively read `anthropic/claude-opus-5` + `anthropic`, while rows served
+    here read `mysubs/antigravity/...` with an empty provider.
+
+    That empty provider is what leaves the Logs tab without an icon: the UI maps a provider
+    id to a logo, and there is nothing to map. Declaring `custom_llm_provider` on the
+    deployment fixes the Models tab only, because that one is built from the Router while
+    this one is built per request.
+
+    `model_group` keeps the public name, so the client still sees what it asked for.
+    """
+    logging_obj = kwargs.get("litellm_logging_obj")
+    details = getattr(logging_obj, "model_call_details", None)
+    if not isinstance(details, dict):
+        return
+    wire_model, provider = _cost_identity(model, kwargs)
+    if not wire_model or wire_model == model:
+        # No deployment to read the wire name from: leave what the proxy already set
+        # rather than stamping a guessed family, which would bill against another rate.
+        return
+    details["model"] = wire_model
+    details["custom_llm_provider"] = provider
+    details.setdefault("model_group", model)
+    with contextlib.suppress(Exception):
+        logging_obj.model = wire_model  # type: ignore[union-attr]
+        logging_obj.custom_llm_provider = provider  # type: ignore[union-attr]
+
+
+def _wrap_stream(
+    chunks: AsyncIterator[ModelResponseStream], model: str, kwargs: dict[str, Any]
+) -> litellm.CustomStreamWrapper:
+    """Wraps it in LiteLLM's iterator: that is what the proxy knows how to consume.
+
+    Returning the raw generator gave the client objects without the protocol the
+    ``/v1/chat/completions`` route expects — and no spend log callback would fire.
+
+    The model and provider handed to the wrapper are the **wire** ones, not the public
+    name: see ``_cost_identity``. The client still sees the name it asked for, because the
+    spend log records ``model_group`` for that, but the cost calculation now gets a pair
+    it can price.
+    """
+    cost_model, cost_provider = _cost_identity(model, kwargs)
+    return litellm.CustomStreamWrapper(
+        completion_stream=chunks,
+        model=cost_model,
+        custom_llm_provider=cost_provider,
+        logging_obj=kwargs.get("litellm_logging_obj") or _logging_obj(cost_model, kwargs),
+    )
+
+
+def _logging_obj(model: str, kwargs: dict[str, Any]) -> Logging:
+    """Logging object for when the caller does not bring its own.
+
+    `CustomStreamWrapper` dereferences it in the constructor — passing ``None`` blows up
+    before the first chunk. The proxy always injects its own; a direct library call does
+    not.
+    """
+    return Logging(
+        model=model,
+        messages=kwargs.get("messages") or [],
+        stream=True,
+        call_type="acompletion",
+        start_time=datetime.datetime.now(),
+        litellm_call_id=str(kwargs.get("litellm_call_id") or uuid.uuid4()),
+        function_id=str(kwargs.get("id") or uuid.uuid4()),
+    )
+
+
