@@ -391,6 +391,33 @@ class TestToolCalls:
         assert response["response"] == {"output": "capture"}
         assert "inlineData" in response["parts"][0]
 
+    def test_claude_models_keep_the_call_id(self) -> None:
+        """Antigravity serves Anthropic too, and Vertex requires `tool_use.id`.
+
+        `supports_function_ids` gated the id on the name starting with `gemini-3`, so a
+        Claude served by this account sent `functionCall` with no id. The first turn passes
+        — the call is made — and the second one, carrying the result back, is refused::
+
+            HTTP 400 messages.1.content.0.tool_use.id: Field required
+
+        Measured on the live gateway: 97 failures on `claude-sonnet-4-6` and 88 on
+        `claude-opus-4-6-thinking`, every one of them on the second turn, while the same
+        models served natively by Anthropic were fine.
+        """
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "c1", "function": {"name": "read", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "r"},
+        ]
+        catalog = ModelCatalog(ids=("claude-sonnet-4-6",), info={}, fetched_at=1.0)
+        body = payload(messages, model="claude-sonnet-4-6", catalog=catalog)
+        call = body["request"]["contents"][0]["parts"][0]["functionCall"]
+        result = body["request"]["contents"][1]["parts"][0]["functionResponse"]
+        assert call["id"] == "c1", "Vertex refuses a tool_use without an id"
+        assert result["id"] == "c1", "the result has to name the call it answers"
+
     def test_sentinel_is_per_turn_not_per_request(self) -> None:
         """The CCA requires the sentinel on the first call of **every** assistant turn.
 

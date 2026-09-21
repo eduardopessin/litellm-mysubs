@@ -132,7 +132,21 @@ def base_family(model: str) -> str:
 
 
 def supports_function_ids(model: str) -> bool:
-    return str(model).split("/")[-1].lower().startswith("gemini-3")
+    """Whether `functionCall`/`functionResponse` carry an ``id`` for this model.
+
+    Two backends sit behind Antigravity and they disagree. Gemini accepts the id from
+    `gemini-3` onwards and 400s on the older variants, which is what the name test covers.
+    The Claude models this account serves run on Vertex, where `tool_use.id` is **required**
+    — a request without it is refused on the turn that carries the result back::
+
+        HTTP 400 messages.1.content.0.tool_use.id: Field required
+
+    Gating on the name alone meant every Claude served here lost its ids. Measured on the
+    live gateway: 97 failures on `claude-sonnet-4-6` and 88 on `claude-opus-4-6-thinking`,
+    all on the second turn, while the first one — which carries no result — went through.
+    """
+    name = str(model).split("/")[-1].lower()
+    return name.startswith(("gemini-3", "claude-"))
 
 
 def _from_catalog(raw: str, effort: str, available: tuple[str, ...]) -> str | None:
