@@ -350,6 +350,70 @@ def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> _Logge
     return _LoggedResponsesStream(events, kwargs)
 
 
+async def _logged_messages(
+    events: AsyncIterator[dict[str, Any]], model: str, kwargs: dict[str, Any]
+) -> AsyncIterator[dict[str, Any]]:
+    """Relays a Messages event stream and dispatches its spend row at the end.
+
+    The Responses route needed a class, because the Router gates on the iterator's type
+    and the proxy reads the finished turn off the object. Nothing reads this one: the
+    Messages route hands its events straight to the SSE writer, so a generator is the
+    whole requirement and a class would be ceremony.
+
+    The row is dispatched from `message_stop`, which is the event that carries the turn's
+    usage — and in a `finally`, so a consumer that stops reading early still bills the
+    turn its subscription has already been charged for.
+    """
+    started = datetime.datetime.now()
+    first_token_at: datetime.datetime | None = None
+    final: dict[str, Any] | None = None
+    emitted = False
+
+    async def _emit() -> None:
+        nonlocal emitted
+        if emitted:
+            return
+        emitted = True
+        logging_obj = kwargs.get("litellm_logging_obj")
+        handler = getattr(logging_obj, "async_success_handler", None)
+        if handler is None:
+            return
+        response = _messages_response(model, final or {}, kwargs)
+        try:
+            _stamp_cost(logging_obj, response, kwargs)
+            _stamp_first_token(logging_obj, first_token_at)
+            await handler(
+                result=response, start_time=started, end_time=datetime.datetime.now()
+            )
+        except Exception:
+            _LOG.exception("mysubs: the messages stream turn produced no spend row")
+
+    try:
+        async for event in events:
+            kind = event.get("type")
+            if first_token_at is None and kind == "content_block_delta":
+                first_token_at = datetime.datetime.now()
+            if kind == "message_delta":
+                final = event
+            yield event
+    finally:
+        await _emit()
+
+
+def _messages_response(model: str, final: dict[str, Any], kwargs: dict[str, Any]) -> Any:
+    """The turn as a priceable object: usage under the wire name, nothing invented."""
+    usage = final.get("usage") or {}
+    return litellm.ModelResponse(
+        model=_cost_identity(model, kwargs)[0],
+        usage=litellm.Usage(
+            prompt_tokens=int(usage.get("input_tokens") or 0),
+            completion_tokens=int(usage.get("output_tokens") or 0),
+            total_tokens=int(usage.get("input_tokens") or 0)
+            + int(usage.get("output_tokens") or 0),
+        ),
+    )
+
+
 
 #: Events that mean the model has produced something a client can show. The envelope
 #: events (`response.created`, `response.in_progress`) and the structural ones

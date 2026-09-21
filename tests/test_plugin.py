@@ -84,10 +84,17 @@ class FakeTransport:
 
 
 def codex_events(
-    *, text: str = "hello", status: str = "completed", usage: dict[str, Any] | None = None
+    *,
+    text: str = "hello",
+    status: str = "completed",
+    usage: dict[str, Any] | None = None,
+    chunks: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     return [
-        {"type": "response.output_text.delta", "delta": text},
+        *(
+            {"type": "response.output_text.delta", "delta": part}
+            for part in (chunks if chunks is not None else [text])
+        ),
         {
             "type": "response.completed" if status == "completed" else "response.incomplete",
             "response": {"status": status, "usage": usage or {}},
@@ -2191,6 +2198,73 @@ class TestEveryDialectReachesEverySubscription:
         )
 
         assert out["content"][0]["text"] == "served"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("provider", "model", "events"),
+        [
+            ("openai-codex", "mysubs/codex/gpt-5.5", codex_events(chunks=["a", "b", "c", "d"])),
+            (
+                "google-antigravity",
+                "mysubs/antigravity/gemini-3-pro",
+                gemini_events(chunks=["a", "b", "c", "d"]),
+            ),
+        ],
+    )
+    async def test_a_streamed_messages_cell_emits_a_delta_per_upstream_chunk(
+        self, provider: Any, model: str, events: list[dict[str, Any]]
+    ) -> None:
+        """Both served subscriptions stream at the same granularity on this route.
+
+        This route replayed the finished turn until the indices were made incremental.
+        Measured on the live gateway before that: Codex answered with 9 events and 30.7 s
+        to first byte, Antigravity with 6 events and 6.9 s, against the 66 events and
+        0.78 s a natively-served Claude turn delivered on the same route. Correct answers,
+        correct rows, and not a stream.
+        """
+        install_transport(FakeTransport(events))
+
+        stream = await plugin.dispatch_messages(
+            provider=provider,
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+        )
+        kinds = [e["type"] async for e in stream]
+
+        deltas = [k for k in kinds if k == "content_block_delta"]
+        assert len(deltas) == 4, f"one delta per upstream chunk, got {len(deltas)}"
+        assert kinds[0] == "message_start"
+        assert kinds[-1] == "message_stop"
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_messages_turn_leaves_exactly_one_priced_row(self) -> None:
+        """The chat route gets its row from `CustomStreamWrapper`; this route never
+        reaches that wrapper, because it emits Anthropic events rather than chat chunks.
+        """
+        install_transport(
+            FakeTransport(
+                codex_events(
+                    chunks=["a", "b"],
+                    usage={"input_tokens": 1000, "output_tokens": 500},
+                )
+            )
+        )
+        log = TestTheNonStreamingPathIsLogged.Recorder("mysubs/codex/gpt-5.5")
+
+        stream = await plugin.dispatch_messages(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            litellm_logging_obj=log,
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+        async for _ in stream:
+            pass
+
+        assert len(log.calls) == 1, "billed once per turn, never twice"
+        assert log.calls[0]["cost"], "a streamed row still has to carry its cost"
 
     @pytest.mark.asyncio
     async def test_claude_max_is_left_to_the_native_path(self) -> None:

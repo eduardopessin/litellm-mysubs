@@ -206,6 +206,140 @@ def sse(event: str, data: dict[str, Any]) -> dict[str, Any]:
     return {"type": event, **data}
 
 
+def envelope(model: str) -> dict[str, Any]:
+    """The `message_start` envelope for a turn that has not produced content yet.
+
+    Same shape `from_model_response` builds, minus what only the finished turn knows.
+    Streaming needs it before any of that exists, and a client reads the id and the model
+    from the opening event.
+    """
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [],
+        "stop_reason": None,
+        "stop_sequence": None,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }
+
+
+def stop_reason(finish: Any) -> str:
+    """The Anthropic stop reason for a canonical finish reason."""
+    return _STOP_REASON.get(str(finish or ""), "end_turn")
+
+
+class MessagesStreamState:
+    """Block indices for one Messages stream, assigned as the text arrives.
+
+    `stream_events` numbers the blocks of a turn that has already finished, which is easy
+    and is not streaming. The objection that made the replay look necessary — that a
+    translated stream would have to invent block indices mid-flight — is answered the same
+    way the Responses route answers it: the indices are **ours** either way. The upstream
+    never sends them, so assigning them as blocks open is no more invented than assigning
+    them at the end, and it is what lets the text leave as it arrives.
+
+    A turn that produces text opens exactly one text block; reasoning and tool calls are
+    known only once the turn closes and are emitted as whole blocks after it, which is the
+    same division `_codex_responses_stream` makes and for the same reason.
+    """
+
+    __slots__ = ("index", "text_open", "text_started")
+
+    def __init__(self) -> None:
+        self.index = 0
+        self.text_open = False
+        self.text_started = False
+
+    def start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Opens the turn. Carries the envelope with no content, as Anthropic does."""
+        return sse(
+            "message_start",
+            {"message": {**{k: v for k, v in payload.items() if k != "content"}, "content": []}},
+        )
+
+    def open_text(self) -> list[dict[str, Any]]:
+        """Opens the text block, once, on the first visible token."""
+        if self.text_open:
+            return []
+        self.text_open = True
+        self.text_started = True
+        return [
+            sse(
+                "content_block_start",
+                {"index": self.index, "content_block": {"type": "text", "text": ""}},
+            )
+        ]
+
+    def delta(self, text: str) -> dict[str, Any]:
+        return sse(
+            "content_block_delta",
+            {"index": self.index, "delta": {"type": "text_delta", "text_delta": text}},
+        )
+
+    def close_text(self) -> list[dict[str, Any]]:
+        if not self.text_open:
+            return []
+        self.text_open = False
+        out = [sse("content_block_stop", {"index": self.index})]
+        self.index += 1
+        return out
+
+    def whole_block(self, block: dict[str, Any]) -> list[dict[str, Any]]:
+        """A block known only at the end: reasoning, or a tool call."""
+        index = self.index
+        self.index += 1
+        if block.get("type") == "tool_use":
+            return [
+                sse(
+                    "content_block_start",
+                    {"index": index, "content_block": {**block, "input": {}}},
+                ),
+                sse(
+                    "content_block_delta",
+                    {
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps(block.get("input") or {}),
+                        },
+                    },
+                ),
+                sse("content_block_stop", {"index": index}),
+            ]
+        field = "thinking" if block.get("type") == "thinking" else "text"
+        return [
+            sse(
+                "content_block_start",
+                {"index": index, "content_block": {"type": block.get("type"), field: ""}},
+            ),
+            sse(
+                "content_block_delta",
+                {
+                    "index": index,
+                    "delta": {f"{field}_delta": block.get(field, ""), "type": f"{field}_delta"},
+                },
+            ),
+            sse("content_block_stop", {"index": index}),
+        ]
+
+    def finish(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            sse(
+                "message_delta",
+                {
+                    "delta": {
+                        "stop_reason": payload.get("stop_reason"),
+                        "stop_sequence": payload.get("stop_sequence"),
+                    },
+                    "usage": payload.get("usage") or {},
+                },
+            ),
+            sse("message_stop", {}),
+        ]
+
+
 def stream_events(payload: dict[str, Any], model: str) -> list[dict[str, Any]]:
     """A finished Messages payload as the event sequence a streaming client expects.
 

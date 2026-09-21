@@ -29,6 +29,7 @@ from .credentials.store import ProviderId
 from .observability import (
     _as_litellm_error,
     _logged,
+    _logged_messages,
     _logged_stream,
     _stamp_logging_identity,
     _translate_errors,
@@ -654,10 +655,14 @@ async def dispatch_messages(*, provider: ProviderId | None = None, **kwargs: Any
     answers it correctly once `_delegate_kwargs` has injected the OAuth token. Returning
     `None` routes it there, exactly as `dispatch` does for chat.
 
-    Streaming is served by replaying the finished turn as the Anthropic event sequence.
-    The upstreams here do not speak that sequence, so a translated stream would have to
-    invent block indices mid-flight; producing the turn and then replaying it keeps the
-    indices contiguous, which is what a client tracking them needs.
+    Streaming is incremental, as on the other two routes. The replay this used to do —
+    produce the turn whole, then emit it as events — was defended on the grounds that a
+    translated stream would have to invent block indices mid-flight. The indices are ours
+    either way: the upstreams do not send them, so numbering blocks as they open is no
+    more invented than numbering them at the end, and it is what lets text leave as it
+    arrives. Measured on the live gateway before this changed: Codex answered with 9
+    events and 30.7 s to first byte, Antigravity with 6 events and 6.9 s, against the 66
+    events and 0.78 s a natively-served Claude turn delivered on the same route.
     """
     model = str(kwargs.get("model") or "")
     if provider == "anthropic" or (provider is None and anthropic.is_anthropic_model(model)):
@@ -676,24 +681,112 @@ async def dispatch_messages(*, provider: ProviderId | None = None, **kwargs: Any
     converted.pop("system", None)
     converted.pop("stream", None)
 
-    if provider == "google-antigravity" or (provider is None and is_gemini_model(model)):
-        turn = _antigravity_turn(model, converted["messages"], converted)
-    elif provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
-        turn = _codex_turn(model, converted["messages"], converted)
-    else:
+    is_gemini = provider == "google-antigravity" or (provider is None and is_gemini_model(model))
+    is_codex = provider == "openai-codex" or (provider is None and codex.is_codex_model(model))
+    if not is_gemini and not is_codex:
         return None
 
-    response = await _logged(turn, kwargs)
-    answer = messages.from_model_response(response, model)
-    if not kwargs.get("stream"):
-        return answer
-    return _replay_messages_stream(answer, model)
+    try:
+        if kwargs.get("stream"):
+            chunks = (
+                _antigravity_stream(model, converted["messages"], converted)
+                if is_gemini
+                else _codex_stream(model, converted["messages"], converted)
+            )
+            return _wrap_messages_stream(chunks, model, kwargs)
+        turn = (
+            _antigravity_turn(model, converted["messages"], converted)
+            if is_gemini
+            else _codex_turn(model, converted["messages"], converted)
+        )
+        response = await _logged(turn, kwargs)
+    except UpstreamError as error:
+        raise _as_litellm_error(error, model, kwargs) from error
+    return messages.from_model_response(response, model)
 
 
-async def _replay_messages_stream(payload: dict[str, Any], model: str) -> AsyncIterator[Any]:
-    """The finished Messages turn, replayed as the Anthropic event sequence."""
-    for event in messages.stream_events(payload, model):
-        yield event
+async def _messages_events(
+    chunks: AsyncIterator[ModelResponseStream], model: str, kwargs: dict[str, Any]
+) -> AsyncIterator[dict[str, Any]]:
+    """Relays canonical chunks as the Anthropic event sequence, text first.
+
+    Both subscriptions reach this through their own reader, so the sequence a client sees
+    does not depend on which one answered. Reasoning and tool calls are known only once
+    the turn closes and are emitted as whole blocks after the text — the same division the
+    Responses route makes, because neither upstream streams them in a form that can be
+    replayed without a second interpretation of the same events.
+
+    The chunks carry the finished turn's own finish reason and usage on their tail, which
+    `_finish_chunk` and `_usage_chunk` appended; they are read here rather than rebuilt,
+    so a streamed turn and a non-streamed one cannot disagree about either.
+    """
+    state = messages.MessagesStreamState()
+    envelope = messages.envelope(model)
+    text_parts: list[str] = []
+    tail: dict[str, Any] = {}
+    started = False
+
+    async for chunk in chunks:
+        _absorb_tail(tail, chunk)
+        text = _chunk_text(chunk)
+        if not text:
+            continue
+        if not started:
+            started = True
+            yield state.start(envelope)
+        for out in state.open_text():
+            yield out
+        text_parts.append(text)
+        yield state.delta(text)
+
+    if not started:
+        yield state.start(envelope)
+    for out in state.close_text():
+        yield out
+
+    payload = {
+        **envelope,
+        "content": [{"type": "text", "text": "".join(text_parts)}],
+        "stop_reason": messages.stop_reason(tail.get("finish_reason")),
+        "usage": tail.get("usage") or {},
+    }
+    for out in state.finish(payload):
+        yield out
+
+
+def _absorb_tail(tail: dict[str, Any], chunk: ModelResponseStream) -> None:
+    """Keeps the finish reason and usage the trailing chunks carry.
+
+    `_finish_chunk` and `_usage_chunk` close every stream this plugin produces, so the
+    turn's own numbers are already on the wire — reading them here is what keeps a
+    streamed Messages turn agreeing with the non-streamed one about `stop_reason` and
+    token counts.
+    """
+    usage = getattr(chunk, "usage", None)
+    if usage is not None:
+        tail["usage"] = {
+            "input_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+            "output_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+        }
+    choices = getattr(chunk, "choices", None) or []
+    if choices and getattr(choices[0], "finish_reason", None):
+        tail["finish_reason"] = choices[0].finish_reason
+
+
+def _wrap_messages_stream(
+    chunks: AsyncIterator[ModelResponseStream], model: str, kwargs: dict[str, Any]
+) -> AsyncIterator[dict[str, Any]]:
+    """The Messages event stream, with the turn's spend row dispatched at its end.
+
+    The chat route gets its row from `CustomStreamWrapper`; this route never reaches that
+    wrapper, because it emits Anthropic events rather than chat chunks. `_logged_messages`
+    closes the same accounting hole `_logged_stream` closes on the Responses route.
+    """
+    return _logged_messages(
+        _messages_events(_translate_errors(chunks, model, kwargs), model, kwargs),
+        model,
+        kwargs,
+    )
 
 
 async def dispatch(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
