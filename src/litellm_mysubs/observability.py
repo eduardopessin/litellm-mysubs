@@ -322,6 +322,22 @@ def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> _Logge
     return _LoggedResponsesStream(events, kwargs)
 
 
+def _responses_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> _LoggedResponsesStream:
+    """Same wrapper, with the row already written by whoever produced the turn.
+
+    The Antigravity route serves its turn through `_logged` and then replays it as events,
+    so the spend row exists before the stream starts. What the replay still needs is the
+    **type**: `Router._aresponses_with_streaming_fallbacks` gates on
+    `isinstance(response, BaseResponsesAPIStreamingIterator)` and hands anything else back
+    raw, and the proxy reads `completed_response` off the object. Both come from this
+    class; only the logging is suppressed, because logging twice would bill the turn
+    twice.
+    """
+    stream = _LoggedResponsesStream(events, kwargs)
+    stream._emitted = True
+    return stream
+
+
 def _stamp_first_token(logging_obj: Any, moment: datetime.datetime | None) -> None:
     """Records when the first chunk left, which is what the row's TTFT is read from.
 

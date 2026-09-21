@@ -21,7 +21,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from litellm.types.utils import ModelResponse, ModelResponseStream
 
@@ -30,6 +30,7 @@ from .observability import (
     _as_litellm_error,
     _logged,
     _logged_stream,
+    _responses_stream,
     _stamp_logging_identity,
     _translate_errors,
 )
@@ -501,36 +502,102 @@ async def _antigravity_stream(
     yield _usage_chunk(google_usage(turn.usage_meta))
 
 
+async def _antigravity_responses(model: str, kwargs: dict[str, Any]) -> Any:
+    """Serves ``/v1/responses`` for Antigravity by translating its chat turn.
+
+    Codex is natively a Responses endpoint, so `_codex_responses_turn` keeps the
+    upstream's own object. Gemini is not: Cloud Code answers in `candidates`/`parts`, and
+    there is no Responses payload to pass through. Rather than hand-build items — which is
+    what made delegating look preferable — the turn is produced by the existing chat path
+    and handed to `LiteLLMCompletionResponsesConfig`, the same transform the proxy applies
+    to every other chat-backed model on this route.
+
+    Going through `_logged` is the point: it is what prices the turn under the wire
+    identity. The delegated version could not, because the native path costs from the
+    response object, which carries the public name and no rate.
+
+    Streaming replays the finished turn, as `/v1/messages` does for the same reason: the
+    event sequence is reconstructed from a complete answer rather than interleaved with a
+    second reading of the upstream stream.
+    """
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    turn_input = _responses_input(kwargs)
+    extra = dict(kwargs)
+    extra.pop("stream", None)
+    response = await _logged(_antigravity_turn(model, turn_input, extra), kwargs)
+    transform = (
+        LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response
+    )
+    answer = transform(
+        request_input=kwargs.get("input") or "",
+        responses_api_request=cast("Any", kwargs),
+        chat_completion_response=response,
+    )
+    if not kwargs.get("stream"):
+        return answer
+    # `_logged` above already wrote the row, so the replay must not log a second one —
+    # but it still has to be the type `Router._aresponses_with_streaming_fallbacks` gates
+    # on, or the proxy hands it back raw. `_responses_stream` wraps without logging.
+    return _responses_stream(_replay_responses_stream(answer), kwargs)
+
+
+async def _replay_responses_stream(answer: Any) -> AsyncIterator[Any]:
+    """Emits a finished Responses turn as the event pair the proxy keys on.
+
+    `response.created` opens the turn and `response.completed` closes it and carries the
+    result — `_extract_completed_responses_response` reads the terminal event, and the
+    plugin's own `_LoggedResponsesStream` looks for the same type. Replaying a complete
+    answer, rather than interleaving a second reading of the upstream stream, is what
+    `/v1/messages` already does for this provider and for the same reason.
+    """
+    from litellm.types.llms.openai import (
+        ResponseCompletedEvent,
+        ResponseCreatedEvent,
+        ResponsesAPIStreamEvents,
+    )
+
+    yield ResponseCreatedEvent(
+        type=ResponsesAPIStreamEvents.RESPONSE_CREATED, response=answer
+    )
+    yield ResponseCompletedEvent(
+        type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED, response=answer
+    )
+
+
 async def dispatch_responses(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
     """``/v1/responses`` counterpart of `dispatch`; ``None`` means "not mine".
 
-    Only Codex is served here. Anthropic has no branch for the same reason it has none in
-    `dispatch` — LiteLLM's native path serves it with the token `_delegate_kwargs` injects,
-    and that path already answers this route correctly. Antigravity is Gemini-shaped, so
-    returning it through a Responses object would mean inventing item structure the
-    upstream never sent; it stays on the route it works on.
+    Anthropic has no branch for the same reason it has none in `dispatch` — LiteLLM's
+    native path serves it with the token `_delegate_kwargs` injects, and that path already
+    answers this route correctly.
 
-    Delegating is not the same as walking away. A turn this function hands back still
-    spends the subscription, and the native path prices it under the name the client
-    asked for — which for Antigravity carries the effort and has no rate. Measured on the
-    live gateway, same model and usage across the six routes::
+    Antigravity used to be delegated too, on the grounds that returning Gemini through a
+    Responses object would mean inventing item structure the upstream never sent. The
+    objection was right; the conclusion was wrong, because delegating does not stop the
+    turn from spending the subscription. Measured on the live gateway, same model and the
+    same 122+116 tokens across all six routes::
 
         acompletion         gemini/gemini-3.6-flash       prov=gemini   0.0005265
         anthropic_messages  gemini/gemini-3.6-flash       prov=gemini   0.0005265
         aresponses          gemini/gemini-3.6-flash-low   prov=         0.0
 
-    The two routes this plugin serves stamped the identity; the delegated one kept the
-    suffix and lost the provider. So the stamp happens before the hand-off, which is the
-    only thing the native path needs to price the turn correctly.
+    Stamping the identity before handing off was not enough: the provider stuck, the
+    model name did not. The native path prices from the **response**, which carries the
+    public name the client asked for and ``cost: None`` — the same mechanism as
+    BerriAI/litellm#42161, on this route.
 
-    Streaming returns an async iterator of Responses API events, not chat chunks: see
-    `_codex_responses_stream`, whose event order was captured from this proxy's own native
-    path rather than assumed.
+    So the turn is served here and translated with LiteLLM's own
+    `LiteLLMCompletionResponsesConfig`, which is what the proxy uses for every other
+    chat-backed model on this route. Nothing is invented: the item structure comes from
+    the same transform the native bridge would have applied.
     """
     model = str(kwargs.get("model") or "")
     if provider == "google-antigravity" or (provider is None and is_gemini_model(model)):
         _stamp_logging_identity(model, kwargs)
-        return None
+        return await _antigravity_responses(model, kwargs)
     if provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
         _stamp_logging_identity(model, kwargs)
         if kwargs.get("stream"):

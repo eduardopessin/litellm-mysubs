@@ -1309,12 +1309,16 @@ class TestTheResponsesRouteIsServed:
         ("provider", "model"),
         [
             ("anthropic", "mysubs/claudecode/claude-opus-5"),
-            ("google-antigravity", "mysubs/antigravity/gemini-3-flash"),
             (None, "some-other-model"),
         ],
     )
     async def test_everything_else_is_not_ours(self, provider: Any, model: str) -> None:
-        """Anthropic is served by the native path; Antigravity is Gemini-shaped."""
+        """Anthropic is served by LiteLLM's native path with the token we inject.
+
+        Antigravity is **not** in this list any more: delegating it left the turn priced
+        by the native path, which costs from the response object — public name, no rate.
+        It is served here now, translated with LiteLLM's own bridge.
+        """
         install_transport(FakeTransport(codex_responses_events()))
 
         assert await plugin.dispatch_responses(provider=provider, model=model, input="hi") is None
@@ -1542,19 +1546,22 @@ class TestTheResponsesRouteIsLogged:
     Recorder = TestTheNonStreamingPathIsLogged.Recorder
 
     @pytest.mark.asyncio
-    async def test_a_delegated_gemini_turn_is_stamped_before_the_hand_off(self) -> None:
-        """Returning `None` routes the turn to LiteLLM's native path, which still bills.
+    async def test_a_gemini_turn_is_served_and_priced_on_this_route(self) -> None:
+        """Delegating Gemini here left the turn unpriced, so it is served instead.
 
-        That path prices under whatever identity is on the logging object, and for
-        Antigravity the client's name carries the effort, which has no rate. Measured on
-        the live gateway, same model and usage across six routes: the two this plugin
-        serves logged `gemini/gemini-3.6-flash` + `gemini` at 0.0005265, while the
-        delegated `aresponses` row kept `gemini/gemini-3.6-flash-low`, had an empty
-        provider, and was costed at zero.
+        The native path costs from the response object, which carries the public name and
+        `cost: None`. Stamping the identity first was not enough: measured on the live
+        gateway the provider stuck and the model name did not, and the row stayed at zero
+        while the same model on chat and messages logged 0.0005265 for identical usage.
+
+        Serving it through `_logged` is what prices it, and the Responses shape comes
+        from LiteLLM's own `LiteLLMCompletionResponsesConfig` rather than hand-built
+        items.
         """
+        install_transport(FakeTransport(gemini_events(text="served")))
         log = self.Recorder("mysubs/antigravity/gemini-3.6-flash-low")
 
-        served = await plugin.dispatch_responses(
+        answer = await plugin.dispatch_responses(
             provider="google-antigravity",
             model="mysubs/antigravity/gemini-3.6-flash-low",
             input="hi",
@@ -1562,7 +1569,8 @@ class TestTheResponsesRouteIsLogged:
             **{observability._WIRE_MODEL_KEY: "gemini/gemini-3.6-flash-low"},
         )
 
-        assert served is None, "Gemini stays on the route it works on"
+        assert answer is not None, "the turn is served here now, not delegated"
+        assert len(log.calls) == 1, "a turn the subscription paid for has to leave a row"
         assert log.model_call_details["model"] == "gemini/gemini-3.6-flash"
         assert log.model_call_details["custom_llm_provider"] == "gemini"
 
