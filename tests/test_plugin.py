@@ -1627,6 +1627,42 @@ class TestTheResponsesRouteIsLogged:
         assert len(log.calls) == 1, "a turn the subscription paid for has to leave a row"
         assert log.calls[0]["usage"] is not None, "a row without usage cannot be priced"
 
+    @pytest.mark.asyncio
+    async def test_the_stream_carries_the_finished_turn_on_itself(self) -> None:
+        """The proxy reads the turn off the object, not off anything the stream yields.
+
+        `_extract_completed_responses_response` does `attribute_of(stream_response,
+        "completed_response")`, so a bare `async_generator` — which streams perfectly well
+        — hands it nothing. Measured on the live gateway with the generator this replaces:
+
+            Container ownership recording skipped on streaming /v1/responses:
+            no completed_response on stream iterator async_generator
+
+        Same minute, same model, same key: the streamed chat turn logged dur=3958
+        ttft=3794 and the streamed Responses turn left no row at all.
+        """
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+        log = self.Recorder("mysubs/codex/gpt-5.5")
+
+        stream = await plugin.dispatch_responses(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            input="hi",
+            stream=True,
+            litellm_logging_obj=log,
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+        assert stream.completed_response is None, "nothing has finished before iteration"
+
+        async for event in stream:
+            if getattr(event, "type", None) == "response.completed":
+                break
+
+        assert stream.completed_response is not None, (
+            "the proxy reads the finished turn off this attribute"
+        )
+        assert getattr(stream.completed_response, "usage", None) is not None
+
 
 class TestTheResponsesRouteIsBoundPerRouter:
     """`Router.aresponses` is built per instance, so there is no class attribute to patch.

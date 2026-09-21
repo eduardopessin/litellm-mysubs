@@ -161,67 +161,100 @@ def _stamp_cost(logging_obj: Any, response: Any, kwargs: dict[str, Any]) -> None
             response._hidden_params["response_cost"] = cost
 
 
-async def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> AsyncIterator[Any]:
-    """Relays a Responses stream and dispatches success logging once it ends.
+class _LoggedResponsesStream:
+    """Relays a Responses stream, dispatches its spend row, and carries the turn.
+
+    A bare ``async_generator`` is not enough on this route, even though it streams
+    correctly. The proxy reads the finished turn off the **object** it was handed —
+    ``_extract_completed_responses_response`` does ``attribute_of(stream_response,
+    "completed_response")`` — rather than from anything the iteration yields. Measured on
+    the live gateway against the generator this class replaces::
+
+        15:18:35 WARNING common_request_processing.py:2814 - Container ownership
+        recording skipped on streaming /v1/responses: no completed_response on
+        stream iterator async_generator
+
+    ``async_generator`` in that line is ours. Same minute, same model, same key: the
+    streamed chat turn logged ``dur=3958 ttft=3794`` and the streamed Responses turn left
+    no row at all. So the attribute is the contract, and this class holds it while
+    remaining an async iterator — which is all `_is_streaming_response` requires.
+
+    The row is dispatched **when the terminal event is seen**, not after iteration ends. A
+    consumer that stops reading at ``response.completed`` closes the underlying generator,
+    and ``aclose()`` raises `GeneratorExit` at the ``yield``, so anything after the loop
+    never runs. `aclose` covers a stream that ends without a terminal event.
+
+    Best effort by contract: a logging failure must not truncate a stream the subscription
+    has already been charged for.
+    """
+
+    def __init__(self, events: AsyncIterator[Any], kwargs: dict[str, Any]) -> None:
+        self._events = events
+        self._kwargs = kwargs
+        self._started = datetime.datetime.now()
+        self._first_token_at: datetime.datetime | None = None
+        self._emitted = False
+        #: The terminal event's response, where the proxy looks for the finished turn.
+        self.completed_response: Any = None
+
+    def __aiter__(self) -> _LoggedResponsesStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            event = await self._events.__anext__()
+        except StopAsyncIteration:
+            await self._emit()
+            raise
+        # The first event out is the time-to-first-token the Logs tab shows. Nothing else
+        # can measure it: by the time the stream ends the moment has passed, and the
+        # upstream does not report it.
+        if self._first_token_at is None:
+            self._first_token_at = datetime.datetime.now()
+        if getattr(event, "type", None) in ("response.completed", "response.incomplete"):
+            self.completed_response = getattr(event, "response", None) or event
+            await self._emit()
+        return event
+
+    async def aclose(self) -> None:
+        await self._emit()
+        aclose = getattr(self._events, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+    async def _emit(self) -> None:
+        if self._emitted:
+            return
+        self._emitted = True
+        logging_obj = self._kwargs.get("litellm_logging_obj")
+        handler = getattr(logging_obj, "async_success_handler", None)
+        if handler is None:
+            return
+        terminal = self.completed_response
+        if terminal is not None:
+            _stamp_cost(logging_obj, terminal, self._kwargs)
+        _stamp_first_token(logging_obj, self._first_token_at)
+        with contextlib.suppress(Exception):
+            await handler(
+                result=terminal, start_time=self._started, end_time=datetime.datetime.now()
+            )
+
+
+def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> _LoggedResponsesStream:
+    """Wraps a Responses event stream so it logs its spend row and carries the turn.
 
     The chat route gets this for free: `_wrap_stream` hands the turn to
     `CustomStreamWrapper`, which fires the handler itself at end of stream. The Responses
-    route emits its own event sequence and never touches that wrapper, so it produced **no**
-    spend row at all — the same accounting hole `_logged` closes for the non-streaming
-    path, on the path that matters most in practice: a client that discovers models
-    through LiteLLM routes every OpenAI-backed model here.
+    route emits its own event sequence and never touches that wrapper, so it produced
+    **no** spend row at all — the same accounting hole `_logged` closes for the
+    non-streaming path, on the path that matters most in practice: a client that discovers
+    models through LiteLLM routes every OpenAI-backed model here.
 
     Measured on the live gateway: an omp run exercising all five Codex models end to end
     left no Codex row, while Anthropic and Gemini — which go through chat — logged 33 and
     50 rows over the same minutes.
-
-    The terminal event carries the turn: `response.completed` holds the usage the row needs,
-    so it is kept as the result rather than reassembled. Best effort by contract — a
-    logging failure must not truncate a stream the subscription has already paid for.
-
-    The row is dispatched **when the terminal event is seen**, not after the loop drains.
-    A consumer that stops reading at `response.completed` — which is what the proxy does —
-    closes this generator, and `aclose()` raises `GeneratorExit` at the `yield`, so anything
-    after the `async for` never runs. Measured on the live gateway: three streamed
-    `/v1/responses` calls left no row at all, while the non-streamed one on the same model
-    logged normally. The `finally` still covers a stream that ends without a terminal event.
     """
-    started = datetime.datetime.now()
-    first_token_at: datetime.datetime | None = None
-    terminal: Any = None
-    emitted = False
-
-    async def _emit() -> None:
-        nonlocal emitted
-        if emitted:
-            return
-        emitted = True
-        logging_obj = kwargs.get("litellm_logging_obj")
-        handler = getattr(logging_obj, "async_success_handler", None)
-        if handler is None:
-            return
-        if terminal is not None:
-            _stamp_cost(logging_obj, terminal, kwargs)
-        _stamp_first_token(logging_obj, first_token_at)
-        with contextlib.suppress(Exception):
-            await handler(
-                result=terminal, start_time=started, end_time=datetime.datetime.now()
-            )
-
-    try:
-        async for event in events:
-            # The first event out is the time-to-first-token the Logs tab shows. Nothing
-            # else can measure it: by the time the stream ends the moment has passed, and
-            # the upstream does not report it.
-            if first_token_at is None:
-                first_token_at = datetime.datetime.now()
-            if getattr(event, "type", None) in ("response.completed", "response.incomplete"):
-                terminal = getattr(event, "response", None) or event
-                await _emit()
-            yield event
-    finally:
-        with contextlib.suppress(Exception):
-            await _emit()
+    return _LoggedResponsesStream(events, kwargs)
 
 
 def _stamp_first_token(logging_obj: Any, moment: datetime.datetime | None) -> None:
