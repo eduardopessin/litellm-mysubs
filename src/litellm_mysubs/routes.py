@@ -510,12 +510,26 @@ async def dispatch_responses(*, provider: ProviderId | None = None, **kwargs: An
     returning it through a Responses object would mean inventing item structure the
     upstream never sent; it stays on the route it works on.
 
+    Delegating is not the same as walking away. A turn this function hands back still
+    spends the subscription, and the native path prices it under the name the client
+    asked for — which for Antigravity carries the effort and has no rate. Measured on the
+    live gateway, same model and usage across the six routes::
+
+        acompletion         gemini/gemini-3.6-flash       prov=gemini   0.0005265
+        anthropic_messages  gemini/gemini-3.6-flash       prov=gemini   0.0005265
+        aresponses          gemini/gemini-3.6-flash-low   prov=         0.0
+
+    The two routes this plugin serves stamped the identity; the delegated one kept the
+    suffix and lost the provider. So the stamp happens before the hand-off, which is the
+    only thing the native path needs to price the turn correctly.
+
     Streaming returns an async iterator of Responses API events, not chat chunks: see
     `_codex_responses_stream`, whose event order was captured from this proxy's own native
     path rather than assumed.
     """
     model = str(kwargs.get("model") or "")
     if provider == "google-antigravity" or (provider is None and is_gemini_model(model)):
+        _stamp_logging_identity(model, kwargs)
         return None
     if provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
         _stamp_logging_identity(model, kwargs)

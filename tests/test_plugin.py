@@ -1542,6 +1542,31 @@ class TestTheResponsesRouteIsLogged:
     Recorder = TestTheNonStreamingPathIsLogged.Recorder
 
     @pytest.mark.asyncio
+    async def test_a_delegated_gemini_turn_is_stamped_before_the_hand_off(self) -> None:
+        """Returning `None` routes the turn to LiteLLM's native path, which still bills.
+
+        That path prices under whatever identity is on the logging object, and for
+        Antigravity the client's name carries the effort, which has no rate. Measured on
+        the live gateway, same model and usage across six routes: the two this plugin
+        serves logged `gemini/gemini-3.6-flash` + `gemini` at 0.0005265, while the
+        delegated `aresponses` row kept `gemini/gemini-3.6-flash-low`, had an empty
+        provider, and was costed at zero.
+        """
+        log = self.Recorder("mysubs/antigravity/gemini-3.6-flash-low")
+
+        served = await plugin.dispatch_responses(
+            provider="google-antigravity",
+            model="mysubs/antigravity/gemini-3.6-flash-low",
+            input="hi",
+            litellm_logging_obj=log,
+            **{observability._WIRE_MODEL_KEY: "gemini/gemini-3.6-flash-low"},
+        )
+
+        assert served is None, "Gemini stays on the route it works on"
+        assert log.model_call_details["model"] == "gemini/gemini-3.6-flash"
+        assert log.model_call_details["custom_llm_provider"] == "gemini"
+
+    @pytest.mark.asyncio
     async def test_a_non_streamed_responses_turn_is_logged(self) -> None:
         install_transport(FakeTransport(codex_responses_events(text="served")))
         log = self.Recorder("mysubs/codex/gpt-5.5")
