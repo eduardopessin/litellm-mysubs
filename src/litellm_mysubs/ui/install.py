@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from litellm._logging import verbose_proxy_logger
+
 from ..credentials.file_store import FileCredentialStore
 from ..credentials.secret_store import SecretManagerCredentialStore, is_available
 from ..credentials.store import CredentialStore
@@ -111,12 +113,28 @@ def _start_refresher_with(app: Any, service: MySubsService) -> None:
         from ..plugin import bind_messages_route, bind_responses_route
 
         router = service.router_source()
-        with contextlib.suppress(Exception):
-            bind_responses_route(router)
-        with contextlib.suppress(Exception):
-            bind_messages_route(router)
-        with contextlib.suppress(Exception):
+        # Reported, not suppressed. A bind that fails here costs the route its spend
+        # logging and says nothing: the turn still answers, from LiteLLM's native path,
+        # so the only visible symptom is a row that never appears. That symptom took
+        # several deploys to attribute.
+        for name, bind in (
+            ("aresponses", bind_responses_route),
+            ("aanthropic_messages", bind_messages_route),
+        ):
+            try:
+                bound = bind(router)
+            except Exception:
+                verbose_proxy_logger.exception(
+                    "mysubs: binding %s failed; that route will not log", name
+                )
+            else:
+                verbose_proxy_logger.info(
+                    "mysubs: %s bound=%s router=%s", name, bound, router is not None
+                )
+        try:
             service.reapply()
+        except Exception:
+            verbose_proxy_logger.exception("mysubs: reapply failed; stored models may be missing")
         service.start_refresher()
 
     async def _boot_when_ready() -> None:
