@@ -269,7 +269,7 @@ class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
         if self._emitted:
             return
         self._emitted = True
-        _LOG.info(
+        _LOG.warning(
             "mysubs: responses stream finished, model=%s terminal=%s",
             self._kwargs.get("model"),
             self.completed_response is not None,
