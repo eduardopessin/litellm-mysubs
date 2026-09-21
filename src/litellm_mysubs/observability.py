@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import logging
 import uuid
 from collections.abc import AsyncIterator, Coroutine
 from typing import Any, Final
@@ -27,6 +28,9 @@ from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.types.utils import ModelResponseStream
 
 from .transport.client import RedeemRequired, RemapRequired, UpstreamError
+
+#: Operator-facing log. A spend row that never appears has to say so somewhere.
+_LOG: Final = logging.getLogger("litellm_mysubs.observability")
 
 #: Carries the deployment's wire model name across the dispatch boundary.
 _WIRE_MODEL_KEY: Final = "mysubs_wire_model"
@@ -229,15 +233,23 @@ class _LoggedResponsesStream:
         logging_obj = self._kwargs.get("litellm_logging_obj")
         handler = getattr(logging_obj, "async_success_handler", None)
         if handler is None:
+            _LOG.warning("mysubs: no async_success_handler on the responses stream turn")
             return
         terminal = self.completed_response
         if terminal is not None:
             _stamp_cost(logging_obj, terminal, self._kwargs)
         _stamp_first_token(logging_obj, self._first_token_at)
-        with contextlib.suppress(Exception):
+        try:
             await handler(
                 result=terminal, start_time=self._started, end_time=datetime.datetime.now()
             )
+        except Exception:
+            # Still swallowed — the subscription has been charged and the answer must not
+            # be truncated over a logging failure. But a silent `suppress` is what made
+            # this defect cost two deploys to find: the row was missing with nothing
+            # anywhere saying why. An operator gets the traceback; the client gets the
+            # stream.
+            _LOG.exception("mysubs: the responses stream turn produced no spend row")
 
 
 def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> _LoggedResponsesStream:
