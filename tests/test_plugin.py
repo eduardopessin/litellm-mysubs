@@ -1784,6 +1784,14 @@ class TestEveryDialectReachesEverySubscription:
 
         assert out == "native", "the native path still answers it"
         assert seen and seen[0].get("api_key"), "without a key the upstream returns 401"
+        # `/v1/messages` has its own top-level `system`, and the upstream rejects the
+        # identity as `messages[0]` outright:
+        #   400 messages.0: use the top-level 'system' parameter for the initial system
+        #       prompt
+        assert seen[0].get("system"), "the identity has to ride in the native field"
+        assert all(
+            message.get("role") != "system" for message in seen[0].get("messages") or []
+        ), "no system message may survive in the turn list"
 
     @pytest.mark.asyncio
     async def test_the_system_prompt_is_not_lost(self) -> None:

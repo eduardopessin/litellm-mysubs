@@ -767,11 +767,27 @@ def _wants_thinking(kwargs: dict[str, Any]) -> bool:
     return bool(thinking or effort in EFFORT_BUDGET)
 
 
-def build_request(kwargs: dict[str, Any], model: str, access_token: str = "") -> dict[str, Any]:
+def build_request(
+    kwargs: dict[str, Any],
+    model: str,
+    access_token: str = "",
+    *,
+    native_system: bool = False,
+) -> dict[str, Any]:
     """Prepare the kwargs of a Claude request. Mutates and returns ``kwargs``.
 
     The token comes in as an argument: keeping credential reading out of this module is
     what makes it testable without global state.
+
+    ``native_system`` selects where the identity goes. On chat-completions it has to ride
+    as ``messages[0]``, because LiteLLM pops system messages and joins them at the front.
+    On ``/v1/messages`` the payload already has a top-level ``system`` and the upstream
+    rejects the other form outright::
+
+        400 messages.0: use the top-level 'system' parameter for the initial system prompt
+
+    Measured on the live gateway, which is why the placement is a parameter rather than a
+    guess from the shape of the kwargs.
     """
     if not is_anthropic_model(model):
         return kwargs
@@ -797,6 +813,23 @@ def build_request(kwargs: dict[str, Any], model: str, access_token: str = "") ->
     # (llms/anthropic/chat/transformation.py:1686), so the
     # mid-conversation-system-2026-04-07 beta we send cannot be honoured from here.
     client_prompt, rest = split_system_messages(messages)
+    if native_system:
+        # `/v1/messages` carries its own top-level `system`, and the client's own prompt
+        # is already there. Prepending ours keeps the identity the subscription validates
+        # without displacing what the caller wrote.
+        existing = kwargs.get("system")
+        blocks = build_system_blocks(client_prompt)
+        if isinstance(existing, list):
+            blocks = [*blocks, *existing]
+        elif isinstance(existing, str) and existing.strip():
+            blocks = [*blocks, {"type": "text", "text": existing}]
+        kwargs["system"] = blocks
+        tools = kwargs.get("tools")
+        head = apply_head_cache(blocks, tools if isinstance(tools, list) else None)
+        apply_conversation_cache(rest, head)
+        kwargs["messages"] = rest
+        return kwargs
+
     system_blocks = build_system_blocks(client_prompt)
     identity = {"role": "system", "content": system_blocks}
 

@@ -216,7 +216,10 @@ def _router_class() -> Any:
 
 
 async def _delegate_kwargs(
-    kwargs: dict[str, Any], *, provider: ProviderId | None = None
+    kwargs: dict[str, Any],
+    *,
+    provider: ProviderId | None = None,
+    native_system: bool = False,
 ) -> dict[str, Any]:
     """Kwargs for the original, with the Claude prompt applied when it is a Claude model.
 
@@ -228,11 +231,16 @@ async def _delegate_kwargs(
     Antigravity catalog serves `claude-sonnet-4-6` and `claude-opus-4-6-thinking`: without
     this guard, those requests carried the Anthropic subscription token to a Google
     endpoint — one account's credential sent to another.
+
+    ``native_system`` is passed through for ``/v1/messages``, where the identity belongs in
+    the top-level ``system`` rather than in ``messages[0]``.
     """
     model = str(kwargs.get("model") or "")
     if provider is not None and provider != "anthropic":
         return kwargs
-    return anthropic.build_request(kwargs, model, await _access_token("anthropic"))
+    return anthropic.build_request(
+        kwargs, model, await _access_token("anthropic"), native_system=native_system
+    )
 
 
 async def _wrapped_router_acompletion(
@@ -384,7 +392,10 @@ def bind_messages_route(router: Any) -> bool:
             # declining is not the same as needing no credential. The token still has to
             # be injected, exactly as the chat route does before delegating, or the native
             # client answers `Missing Anthropic API Key`.
-            return await original(**await _delegate_kwargs(kwargs, provider=declared))
+            delegated = await _delegate_kwargs(
+                kwargs, provider=declared, native_system=True
+            )
+            return await original(**delegated)
 
         return _wrapped
 
