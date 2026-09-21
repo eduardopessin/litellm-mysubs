@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from litellm.types.utils import ModelResponse, ModelResponseStream
@@ -30,7 +30,6 @@ from .observability import (
     _as_litellm_error,
     _logged,
     _logged_stream,
-    _responses_stream,
     _stamp_logging_identity,
     _translate_errors,
 )
@@ -248,8 +247,61 @@ async def _codex_responses_stream(
     """
     spec = await _codex_spec(model, _responses_input(kwargs), kwargs)
     turn = _Turn()
-    reader = _CodexReader(turn)
+    async for out in _responses_events(
+        model, spec, turn, _CodexReader(turn), codex_usage, turn.response_payload
+    ):
+        yield out
 
+
+async def _antigravity_responses_stream(
+    model: str, kwargs: dict[str, Any]
+) -> AsyncIterator[Any]:
+    """``/v1/responses`` with ``stream: true`` for Antigravity, incrementally.
+
+    The first version served this cell by awaiting the whole chat turn and replaying it as
+    two events. It answered correctly and priced correctly, and it was not a stream.
+    Measured on the live gateway against Codex on the same route and prompt::
+
+        codex   events=7117  deltas=7107  ttft=    30ms
+        gemini  events=   2  deltas=   0  ttft= 20911ms
+
+    A client reading `stream.text_deltas` got nothing until the turn had finished. Same
+    route, same client, two different contracts — which is the one thing this plugin
+    exists to prevent.
+
+    Nothing about the incremental form is Codex-specific: `_ResponsesStreamState` owns
+    every id and index, and `_chunk_text` reads the canonical chunk both readers emit. So
+    this is the same driver with the other provider's spec and reader, not a second
+    implementation.
+    """
+    messages = _responses_input(kwargs)
+    spec = await _antigravity_spec(model, messages, kwargs)
+    turn = _Turn()
+    reader = _AntigravityReader(turn, wire_model=str(spec.body.get("model") or model))
+    async for out in _responses_events(model, spec, turn, reader, google_usage, {}):
+        yield out
+
+
+async def _responses_events(
+    model: str,
+    spec: Any,
+    turn: _Turn,
+    reader: Any,
+    usage_of: Callable[[dict[str, Any]], Any],
+    base_payload: dict[str, Any],
+) -> AsyncIterator[Any]:
+    """Drives one upstream stream and emits the Responses event sequence for it.
+
+    Provider-specific parts are the three arguments: the request spec, the reader that
+    turns wire events into canonical chunks, and the usage mapper. Everything else — the
+    event order, the item ids, the indices and the strictly increasing sequence numbers —
+    belongs to `_ResponsesStreamState` and is identical for both subscriptions, which is
+    what keeps the two cells of this route telling a client the same story.
+
+    `base_payload` is the upstream's own response object where one exists (Codex answers
+    in Responses shape) and empty where it does not (Cloud Code answers in
+    `candidates`/`parts`); the envelope is completed from the stream state either way.
+    """
     state = _ResponsesStreamState(model=model)
     for out in state.created():
         yield out
@@ -275,14 +327,14 @@ async def _codex_responses_stream(
         for out in state.whole_item(item):
             yield out
 
-    payload = dict(turn.response_payload)
+    payload = dict(base_payload)
     payload["model"] = model
     payload["id"] = state.response_id
     payload.setdefault("created_at", state.created_at)
     payload.setdefault("object", "response")
     payload["status"] = payload.get("status") or "completed"
     payload["output"] = state.items
-    payload["usage"] = _responses_usage(codex_usage(turn.usage_meta)).model_dump()
+    payload["usage"] = _responses_usage(usage_of(turn.usage_meta)).model_dump()
     yield state.completed(payload)
 
 
@@ -536,35 +588,7 @@ async def _antigravity_responses(model: str, kwargs: dict[str, Any]) -> Any:
         responses_api_request=cast("Any", kwargs),
         chat_completion_response=response,
     )
-    if not kwargs.get("stream"):
-        return answer
-    # `_logged` above already wrote the row, so the replay must not log a second one —
-    # but it still has to be the type `Router._aresponses_with_streaming_fallbacks` gates
-    # on, or the proxy hands it back raw. `_responses_stream` wraps without logging.
-    return _responses_stream(_replay_responses_stream(answer), kwargs)
-
-
-async def _replay_responses_stream(answer: Any) -> AsyncIterator[Any]:
-    """Emits a finished Responses turn as the event pair the proxy keys on.
-
-    `response.created` opens the turn and `response.completed` closes it and carries the
-    result — `_extract_completed_responses_response` reads the terminal event, and the
-    plugin's own `_LoggedResponsesStream` looks for the same type. Replaying a complete
-    answer, rather than interleaving a second reading of the upstream stream, is what
-    `/v1/messages` already does for this provider and for the same reason.
-    """
-    from litellm.types.llms.openai import (
-        ResponseCompletedEvent,
-        ResponseCreatedEvent,
-        ResponsesAPIStreamEvents,
-    )
-
-    yield ResponseCreatedEvent(
-        type=ResponsesAPIStreamEvents.RESPONSE_CREATED, response=answer
-    )
-    yield ResponseCompletedEvent(
-        type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED, response=answer
-    )
+    return answer
 
 
 async def dispatch_responses(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
@@ -589,20 +613,31 @@ async def dispatch_responses(*, provider: ProviderId | None = None, **kwargs: An
     public name the client asked for and ``cost: None`` — the same mechanism as
     BerriAI/litellm#42161, on this route.
 
-    So the turn is served here and translated with LiteLLM's own
-    `LiteLLMCompletionResponsesConfig`, which is what the proxy uses for every other
-    chat-backed model on this route. Nothing is invented: the item structure comes from
-    the same transform the native bridge would have applied.
+    So the turn is served here. Non-streaming is shaped with LiteLLM's own
+    `LiteLLMCompletionResponsesConfig`, the transform the proxy applies to every other
+    chat-backed model on this route; streaming goes through `_antigravity_responses_stream`
+    and emits the same event sequence Codex does, because a client on this route must not
+    be able to tell which subscription answered.
+
+    The `try` is not decoration: `dispatch` has had it since the chat route existed, and
+    without it a quota refusal from the same transport reaches the client as HTTP 500
+    instead of 429 — a client cannot back off on a 500. Delegating used to hide that,
+    because LiteLLM's native path normalised the error on the way out.
     """
     model = str(kwargs.get("model") or "")
-    if provider == "google-antigravity" or (provider is None and is_gemini_model(model)):
-        _stamp_logging_identity(model, kwargs)
-        return await _antigravity_responses(model, kwargs)
-    if provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
-        _stamp_logging_identity(model, kwargs)
-        if kwargs.get("stream"):
-            return _logged_stream(_codex_responses_stream(model, kwargs), kwargs)
-        return await _logged(_codex_responses_turn(model, kwargs), kwargs)
+    try:
+        if provider == "google-antigravity" or (provider is None and is_gemini_model(model)):
+            _stamp_logging_identity(model, kwargs)
+            if kwargs.get("stream"):
+                return _logged_stream(_antigravity_responses_stream(model, kwargs), kwargs)
+            return await _antigravity_responses(model, kwargs)
+        if provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
+            _stamp_logging_identity(model, kwargs)
+            if kwargs.get("stream"):
+                return _logged_stream(_codex_responses_stream(model, kwargs), kwargs)
+            return await _logged(_codex_responses_turn(model, kwargs), kwargs)
+    except UpstreamError as error:
+        raise _as_litellm_error(error, model, kwargs) from error
     return None
 
 

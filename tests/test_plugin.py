@@ -89,15 +89,32 @@ def codex_events(
 
 
 def gemini_events(
-    *, text: str = "hello", finish: str = "STOP", usage: dict[str, Any] | None = None
+    *,
+    text: str = "hello",
+    finish: str = "STOP",
+    usage: dict[str, Any] | None = None,
+    chunks: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """Cloud Code events. `chunks` splits the answer across several upstream events.
+
+    A single-event fixture cannot tell an incremental stream from one that blocks and
+    replays the finished turn, which is how a two-event non-stream reached production on
+    the Responses route.
+    """
+    parts = chunks if chunks is not None else [text]
     return [
         {
             "response": {
-                "candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": finish}],
-                "usageMetadata": usage or {},
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": part}]},
+                        **({"finishReason": finish} if last else {}),
+                    }
+                ],
+                "usageMetadata": (usage or {}) if last else {},
             }
         }
+        for part, last in ((p, i == len(parts) - 1) for i, p in enumerate(parts))
     ]
 
 
@@ -1088,6 +1105,7 @@ def codex_responses_events(
     status: str = "completed",
     usage: dict[str, Any] | None = None,
     carry_output: bool = False,
+    chunks: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Events as the real endpoint sends them.
 
@@ -1117,7 +1135,10 @@ def codex_responses_events(
             }
         ]
     return [
-        {"type": "response.output_text.delta", "delta": text},
+        *(
+            {"type": "response.output_text.delta", "delta": part}
+            for part in (chunks if chunks is not None else [text])
+        ),
         {
             "type": "response.completed" if status == "completed" else "response.incomplete",
             "response": response,
@@ -1303,6 +1324,50 @@ class TestTheResponsesRouteIsServed:
 
         assert streamed == "served"
         assert text == streamed
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("provider", "model", "events"),
+        [
+            (
+                "openai-codex",
+                "mysubs/codex/gpt-5.5",
+                codex_responses_events(chunks=["a", "b", "c", "d"]),
+            ),
+            (
+                "google-antigravity",
+                "mysubs/antigravity/gemini-3.6-flash-low",
+                gemini_events(chunks=["a", "b", "c", "d"]),
+            ),
+        ],
+    )
+    async def test_a_streamed_cell_emits_a_delta_per_upstream_chunk(
+        self, provider: Any, model: str, events: list[dict[str, Any]]
+    ) -> None:
+        """Both subscriptions must stream at the same granularity on this route.
+
+        Membership assertions — "a delta appeared somewhere" — pass with one delta and
+        with a thousand, which is how a version that awaited the whole turn and emitted
+        two events shipped as a stream. Measured on the live gateway before this was
+        fixed, same route and prompt: Codex `events=7117 deltas=7107 ttft=30ms`,
+        Antigravity `events=2 deltas=0 ttft=20911ms`. A client reading `text_deltas` got
+        nothing from one of them until the turn had finished.
+
+        The count is asserted against the upstream chunk count rather than a literal, so
+        it pins the incremental property without pinning an event total that legitimately
+        varies.
+        """
+        install_transport(FakeTransport(events))
+
+        stream = await plugin.dispatch_responses(
+            provider=provider, model=model, input="hi", stream=True
+        )
+        kinds = [e.type async for e in stream]
+
+        deltas = [k for k in kinds if k == "response.output_text.delta"]
+        assert len(deltas) == 4, f"one delta per upstream chunk, got {len(deltas)}"
+        assert kinds[0] == "response.created"
+        assert kinds[-1] == "response.completed"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1558,7 +1623,14 @@ class TestTheResponsesRouteIsLogged:
         from LiteLLM's own `LiteLLMCompletionResponsesConfig` rather than hand-built
         items.
         """
-        install_transport(FakeTransport(gemini_events(text="served")))
+        install_transport(
+            FakeTransport(
+                gemini_events(
+                    text="served",
+                    usage={"promptTokenCount": 1000, "candidatesTokenCount": 500},
+                )
+            )
+        )
         log = self.Recorder("mysubs/antigravity/gemini-3.6-flash-low")
 
         answer = await plugin.dispatch_responses(
@@ -1573,6 +1645,40 @@ class TestTheResponsesRouteIsLogged:
         assert len(log.calls) == 1, "a turn the subscription paid for has to leave a row"
         assert log.model_call_details["model"] == "gemini/gemini-3.6-flash"
         assert log.model_call_details["custom_llm_provider"] == "gemini"
+        assert log.calls[0]["cost"], "the name in the row is only useful if it prices"
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_gemini_turn_leaves_exactly_one_row(self) -> None:
+        """One turn, one row — the cell that had no test at all.
+
+        The first version of this path served the turn through `_logged` and then replayed
+        it through a second logging wrapper. Swapping the non-logging wrapper for the
+        logging one billed the subscription twice and the whole suite stayed green, which
+        is the most expensive defect reachable here.
+        """
+        install_transport(
+            FakeTransport(
+                gemini_events(
+                    chunks=["a", "b", "c"],
+                    usage={"promptTokenCount": 1000, "candidatesTokenCount": 500},
+                )
+            )
+        )
+        log = self.Recorder("mysubs/antigravity/gemini-3.6-flash-low")
+
+        stream = await plugin.dispatch_responses(
+            provider="google-antigravity",
+            model="mysubs/antigravity/gemini-3.6-flash-low",
+            input="hi",
+            stream=True,
+            litellm_logging_obj=log,
+            **{observability._WIRE_MODEL_KEY: "gemini/gemini-3.6-flash-low"},
+        )
+        async for _ in stream:
+            pass
+
+        assert len(log.calls) == 1, "billed once per turn, never twice"
+        assert log.calls[0]["cost"], "a streamed row still has to carry its cost"
 
     @pytest.mark.asyncio
     async def test_a_non_streamed_responses_turn_is_logged(self) -> None:
@@ -1723,21 +1829,38 @@ class TestTheResponsesRouteIsLogged:
 
     @pytest.mark.asyncio
     async def test_the_stream_mirrors_every_attribute_the_base_sets(self) -> None:
-        """Subclassing for the `isinstance` gate means inheriting fourteen methods.
+        """Subclassing for the `isinstance` gate means inheriting the base's methods.
 
         `super().__init__` cannot run — it wants an `httpx.Response` this object does not
         have — so every attribute it would set is mirrored by hand. Miss one and the
-        inherited reader raises mid-stream instead of logging: `_check_max_streaming_
-        duration` reads `start_time`, `_handle_failure` reads `_failure_handled`,
-        `_log_completed_response` reads `_completed_response_logged`.
+        inherited reader raises mid-stream: `_check_max_streaming_duration` reads
+        `_stream_created_time` on every `__anext__`, and the proxy's
+        `get_hidden_params_dict` reads `_hidden_params` to build the response headers.
+
+        The expected names come from the base constructor's **AST**, not from a regex over
+        its source. `self.x = ...` and `self.x: T = ...` are different nodes and the
+        obvious pattern only matches the first, so a regex silently under-reported by
+        seven names — including both readers above — and the assertion passed while the
+        object had holes.
         """
+        import ast
         import inspect
-        import re
+        import textwrap
 
         from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
 
-        base_init = inspect.getsource(BaseResponsesAPIStreamingIterator.__init__)
-        expected = set(re.findall(r"self\.(\w+)\s*=", base_init))
+        tree = ast.parse(
+            textwrap.dedent(inspect.getsource(BaseResponsesAPIStreamingIterator.__init__))
+        )
+        expected = {
+            target.attr
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            if isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "self"
+        }
 
         install_transport(FakeTransport(codex_responses_events(text="served")))
         stream = await plugin.dispatch_responses(
@@ -1751,6 +1874,8 @@ class TestTheResponsesRouteIsLogged:
 
         missing = sorted(name for name in expected if not hasattr(stream, name))
         assert not missing, f"inherited methods read these: {missing}"
+        # Not just present — usable. This is the reader that runs on every `__anext__`.
+        stream._check_max_streaming_duration()
 
 
     @pytest.mark.asyncio

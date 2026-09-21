@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import time
 import uuid
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator, Coroutine, Mapping
+from types import MappingProxyType
 from typing import Any, Final
 
 import litellm
@@ -241,6 +243,24 @@ class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
         self._completed_response_logged = False
         self._completed_response_cache_hit: bool | None = None
         self._persist_completed_response_before_logging = True
+        # Annotated assignments in the base constructor, which an earlier version missed
+        # because the test derived its list by regexing `self.<name> =` out of the base
+        # source and that pattern cannot match `self.<name>: T = ...`. Two of them bite
+        # today rather than hypothetically: `_stream_created_time` is read by
+        # `_check_max_streaming_duration` on every `__anext__` (latent only because
+        # `LITELLM_MAX_STREAMING_DURATION_SECONDS` defaults to None), and `_hidden_params`
+        # is read by the proxy's `get_hidden_params_dict` to build the response headers —
+        # empty here meant plugin-served streaming turns answered without
+        # `x-litellm-model-id`, `x-litellm-api-base` and `x-litellm-response-cost` while
+        # natively-served ones carried them.
+        self._stream_created_time = time.time()
+        self.request_data: dict[str, Any] = {}
+        self.call_type: str | None = None
+        self._hidden_params: dict[str, Any] = {
+            "custom_llm_provider": self.custom_llm_provider,
+            "additional_headers": {},
+        }
+        self._raw_response_headers: Mapping[str, Any] = MappingProxyType({})
 
     def __aiter__(self) -> _LoggedResponsesStream:
         return self
@@ -285,10 +305,16 @@ class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
         if handler is None:
             _LOG.warning("mysubs: no async_success_handler on the responses stream turn")
             return
-        if self.completed_response is not None:
-            _stamp_cost(logging_obj, self.completed_response, self._kwargs)
-        _stamp_first_token(logging_obj, self._first_token_at)
         try:
+            # Inside the `try`, not before it. Both stamps start by reading
+            # `logging_obj.model_call_details`, and that read is not itself protected: a
+            # logging object whose attribute raises truncated the stream with zero events
+            # delivered, on a turn the subscription had already paid for — while
+            # `_emitted` was already set, so `aclose()` would not retry and the `except`
+            # below never ran. Measured against a raising logging object: 0 of 3 events.
+            if self.completed_response is not None:
+                _stamp_cost(logging_obj, self.completed_response, self._kwargs)
+            _stamp_first_token(logging_obj, self._first_token_at)
             # The **event**, not the response: the handler's streaming branch keys off
             # `isinstance(result, ResponseCompletedEvent)` and drops anything else.
             await handler(
@@ -322,20 +348,6 @@ def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> _Logge
     return _LoggedResponsesStream(events, kwargs)
 
 
-def _responses_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> _LoggedResponsesStream:
-    """Same wrapper, with the row already written by whoever produced the turn.
-
-    The Antigravity route serves its turn through `_logged` and then replays it as events,
-    so the spend row exists before the stream starts. What the replay still needs is the
-    **type**: `Router._aresponses_with_streaming_fallbacks` gates on
-    `isinstance(response, BaseResponsesAPIStreamingIterator)` and hands anything else back
-    raw, and the proxy reads `completed_response` off the object. Both come from this
-    class; only the logging is suppressed, because logging twice would bill the turn
-    twice.
-    """
-    stream = _LoggedResponsesStream(events, kwargs)
-    stream._emitted = True
-    return stream
 
 
 def _stamp_first_token(logging_obj: Any, moment: datetime.datetime | None) -> None:
@@ -343,9 +355,21 @@ def _stamp_first_token(logging_obj: Any, moment: datetime.datetime | None) -> No
 
     A stream that produced nothing has no first token, and leaving the field unset says
     exactly that — a fabricated instant would read as a fast answer that never came.
+
+    Writing the dict entry alone is not enough, and looked like it was: LiteLLM's
+    `_success_handler_helper_fn` does ``if self.completion_start_time is None`` and then
+    overwrites both the attribute and the dict entry with `end_time`. The attribute is
+    what it tests, so a row stamped only through `model_call_details` came out with
+    TTFT equal to the whole duration. `_update_completion_start_time` sets both, and is
+    the method LiteLLM's own `_process_chunk` calls for this.
     """
     if moment is None:
         return
+    updater = getattr(logging_obj, "_update_completion_start_time", None)
+    if callable(updater):
+        with contextlib.suppress(Exception):
+            updater(completion_start_time=moment)
+            return
     details = getattr(logging_obj, "model_call_details", None)
     if isinstance(details, dict):
         details["completion_start_time"] = moment
