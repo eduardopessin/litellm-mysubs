@@ -18,19 +18,22 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import logging
 import uuid
 from collections.abc import AsyncIterator, Coroutine
 from typing import Any, Final
 
 import litellm
+from litellm._logging import verbose_proxy_logger
 from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.types.utils import ModelResponseStream
 
 from .transport.client import RedeemRequired, RemapRequired, UpstreamError
 
-#: Operator-facing log. A spend row that never appears has to say so somewhere.
-_LOG: Final = logging.getLogger("litellm_mysubs.observability")
+#: Operator-facing log. `litellm_mysubs.*` loggers are silent inside the proxy: the root
+#: logger has no handlers, so a plain `getLogger(__name__)` emits nowhere — measured, and
+#: the reason a diagnostic build looked like the code never ran. `verbose_proxy_logger`
+#: is the one with a handler, and it is where an operator already looks.
+_LOG: Final = verbose_proxy_logger
 
 #: Carries the deployment's wire model name across the dispatch boundary.
 _WIRE_MODEL_KEY: Final = "mysubs_wire_model"
