@@ -246,6 +246,11 @@ class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
         if self._emitted:
             return
         self._emitted = True
+        _LOG.info(
+            "mysubs: responses stream finished, model=%s terminal=%s",
+            self._kwargs.get("model"),
+            self.completed_response is not None,
+        )
         logging_obj = self._kwargs.get("litellm_logging_obj")
         handler = getattr(logging_obj, "async_success_handler", None)
         if handler is None:
