@@ -418,6 +418,35 @@ class TestToolCalls:
         assert call["id"] == "c1", "Vertex refuses a tool_use without an id"
         assert result["id"] == "c1", "the result has to name the call it answers"
 
+    def test_the_output_ceiling_leaves_room_for_the_thinking_budget(self) -> None:
+        """Vertex refuses a request whose `max_tokens` does not exceed the budget.
+
+            HTTP 400 `max_tokens` must be greater than `thinking.budget_tokens`
+
+        The two travel independently: `maxOutputTokens` is whatever the client asked for,
+        `thinkingBudget` comes from the catalog. A client with a modest ceiling and a
+        variant with a large budget produce a request the backend cannot accept —
+        reproduced on the live gateway with `max_tokens: 1024`, which failed on the very
+        first turn while the same call with no ceiling succeeded.
+
+        The budget is what gives way: it is the plugin's own choice, while the ceiling is
+        the caller's and silently raising it would bill for output nobody asked for.
+        """
+        catalog = ModelCatalog(
+            ids=("claude-sonnet-4-6",),
+            info={"claude-sonnet-4-6": {"thinkingBudget": 4000}},
+            fetched_at=1.0,
+        )
+        body = payload(
+            [{"role": "user", "content": "x"}],
+            model="claude-sonnet-4-6",
+            catalog=catalog,
+            extra={"max_tokens": 1024},
+        )
+        config = body["request"]["generationConfig"]
+        assert config["maxOutputTokens"] == 1024, "the caller's ceiling is not raised"
+        assert config["thinkingConfig"]["thinkingBudget"] < 1024
+
     def test_sentinel_is_per_turn_not_per_request(self) -> None:
         """The CCA requires the sentinel on the first call of **every** assistant turn.
 

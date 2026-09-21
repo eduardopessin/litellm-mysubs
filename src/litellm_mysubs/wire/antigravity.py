@@ -480,7 +480,9 @@ def tool_result_value(
 # -- envelope ------------------------------------------------------------------
 
 
-def _thinking_config(effort: str, info: Mapping[str, Any]) -> dict[str, Any]:
+def _thinking_config(
+    effort: str, info: Mapping[str, Any], max_output_tokens: int | None = None
+) -> dict[str, Any]:
     """Omitting ``thinkingConfig`` makes the CCA reapply the server defaults and bill
     thinking tokens without returning the text.
 
@@ -488,6 +490,17 @@ def _thinking_config(effort: str, info: Mapping[str, Any]) -> dict[str, Any]:
     catalog, the ``thinkingBudget`` advertised for the variant is used (-low 1000,
     -medium 4000, -high -1 = dynamic, pro-agent 10001) plus ``minThinkingBudget`` to turn it
     off. Without a catalog it falls back to ``thinkingLevel``, which is also accepted.
+
+    ``max_output_tokens`` caps the budget because the two are not independent on the
+    Anthropic backend::
+
+        HTTP 400 `max_tokens` must be greater than `thinking.budget_tokens`
+
+    Reproduced on the live gateway with ``max_tokens: 1024`` against a variant whose
+    catalog budget is larger: the request failed on the first turn, while the same call
+    with no ceiling succeeded. The budget is what gives way — it is this plugin's own
+    choice, while the ceiling belongs to the caller, and raising it would bill for output
+    nobody asked for. A dynamic budget (-1) is left alone: the backend picks it itself.
     """
     budget = info.get("thinkingBudget")
 
@@ -503,10 +516,23 @@ def _thinking_config(effort: str, info: Mapping[str, Any]) -> dict[str, Any]:
 
     config = {"includeThoughts": True}
     if isinstance(budget, int) and budget > 0:
-        config["thinkingBudget"] = budget
+        config["thinkingBudget"] = _fit_budget(budget, max_output_tokens)
     elif not isinstance(budget, int):
         config["thinkingLevel"] = THINKING_LEVEL.get(effort, "MEDIUM")
     return config
+
+
+def _fit_budget(budget: int, max_output_tokens: int | None) -> int:
+    """The budget, reduced to leave room under the caller's output ceiling.
+
+    Three quarters keeps the reasoning generous while guaranteeing the strict inequality
+    the backend demands; a ceiling too small for any useful reasoning still yields at least
+    one token, because zero would read as "thinking off" and change the answer rather than
+    the envelope.
+    """
+    if max_output_tokens is None or budget < max_output_tokens:
+        return budget
+    return max(1, max_output_tokens * 3 // 4)
 
 
 def build_payload(
@@ -642,7 +668,7 @@ def build_payload(
         "contents": contents,
         "generationConfig": {
             "maxOutputTokens": max_tokens,
-            "thinkingConfig": _thinking_config(effort, info),
+            "thinkingConfig": _thinking_config(effort, info, max_tokens),
         },
     }
 
