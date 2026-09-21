@@ -1231,7 +1231,7 @@ async def dispatch(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
         _stamp_logging_identity(model, kwargs)
         if streaming:
             return _wrap_stream(_antigravity_stream(model, messages, kwargs), model, kwargs)
-        return await _antigravity_turn(model, messages, kwargs)
+        return await _logged(_antigravity_turn(model, messages, kwargs), kwargs)
 
     # After Gemini: `codex.is_codex_model` matches any name containing "gpt-", and a
     # hypothetical "gemini-gpt" belongs to Google.
@@ -1239,12 +1239,46 @@ async def dispatch(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
         _stamp_logging_identity(model, kwargs)
         if streaming:
             return _wrap_stream(_codex_stream(model, messages, kwargs), model, kwargs)
-        return await _codex_turn(model, messages, kwargs)
+        return await _logged(_codex_turn(model, messages, kwargs), kwargs)
 
     # `anthropic` has no branch of its own: it is served by LiteLLM's native path with the
     # prompt and the token that `_delegate_kwargs` injects. Returning `None` is what routes
     # it there.
     return None
+
+
+async def _logged(turn: Coroutine[Any, Any, ModelResponse], kwargs: dict[str, Any]) -> Any:
+    """Awaits a non-streaming turn and dispatches success logging for it.
+
+    Streaming already logs: `_wrap_stream` hands the response to `CustomStreamWrapper`,
+    which dispatches the success handler at end of stream. The non-streaming path returns a
+    bare ``ModelResponse`` straight out of `dispatch`, so it never reaches the `@client`
+    wrapper in ``litellm.utils`` that would normally call
+    ``logging_obj.async_success_handler`` — and a request that never logs produces **no**
+    spend row at all.
+
+    Measured on a live gateway, two calls to the same model two seconds apart:
+
+    ===============  ======================================================
+    ``stream: true``  ``openai/gpt-5.5`` priced at ``0.00121``
+    ``stream: false`` no row of any kind
+    ===============  ======================================================
+
+    The consequence is not a pricing bug but an accounting hole: ``x-litellm-key-spend``
+    undercounts, and per-key budgets and rate limits never see these calls.
+
+    Best effort by contract: a logging failure must not lose a response the upstream
+    already produced and the user has already been charged for by the subscription.
+    """
+    response = await turn
+    logging_obj = kwargs.get("litellm_logging_obj")
+    handler = getattr(logging_obj, "async_success_handler", None)
+    if handler is None:
+        return response
+    with contextlib.suppress(Exception):
+        now = datetime.datetime.now()
+        await handler(result=response, start_time=now, end_time=now)
+    return response
 
 
 def _cost_identity(model: str, kwargs: dict[str, Any]) -> tuple[str, str]:

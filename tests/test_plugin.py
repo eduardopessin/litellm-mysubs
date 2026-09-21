@@ -1338,6 +1338,87 @@ class TestTheSpendLogRecordsAPriceableIdentity:
         plugin._stamp_logging_identity("m", {plugin._WIRE_MODEL_KEY: "openai/m"})
 
 
+class TestTheNonStreamingPathIsLogged:
+    """A non-streaming turn returns straight out of `dispatch`.
+
+    So it never reaches the `@client` wrapper in `litellm.utils` that calls
+    `async_success_handler`, and a request that never logs produces **no** spend row at
+    all. Measured on a live gateway, same model two seconds apart: the streamed call was
+    priced at `0.00121`, the non-streamed one left no row of any kind.
+
+    The consequence is an accounting hole rather than a pricing bug — `x-litellm-key-spend`
+    undercounts, and per-key budgets never see these calls.
+    """
+
+    class Recorder:
+        def __init__(self, model: str) -> None:
+            self.model_call_details: dict[str, Any] = {
+                "model": model,
+                "custom_llm_provider": None,
+            }
+            self.calls: list[dict[str, Any]] = []
+
+        async def async_success_handler(
+            self, result: Any = None, start_time: Any = None, end_time: Any = None
+        ) -> None:
+            self.calls.append(
+                {
+                    "model": self.model_call_details.get("model"),
+                    "provider": self.model_call_details.get("custom_llm_provider"),
+                    "usage": getattr(result, "usage", None),
+                }
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_non_streamed_turn_dispatches_success_logging(self) -> None:
+        install_transport(FakeTransport(codex_events(text="served")))
+        log = self.Recorder("mysubs/codex/gpt-5.5")
+
+        await plugin.dispatch(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            messages=[{"role": "user", "content": "hi"}],
+            litellm_logging_obj=log,
+            **{plugin._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+
+        assert len(log.calls) == 1, "exactly one success event per turn"
+        assert log.calls[0]["model"] == "openai/gpt-5.5"
+        assert log.calls[0]["provider"] == "openai"
+        assert log.calls[0]["usage"] is not None, "a row without usage cannot be priced"
+
+    @pytest.mark.asyncio
+    async def test_a_logging_failure_does_not_lose_the_response(self) -> None:
+        """The subscription has already been charged; losing the answer is worse."""
+        install_transport(FakeTransport(codex_events(text="served")))
+
+        class Broken(self.Recorder):
+            async def async_success_handler(self, **_: Any) -> None:
+                raise RuntimeError("logging backend down")
+
+        out = await plugin.dispatch(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            messages=[{"role": "user", "content": "hi"}],
+            litellm_logging_obj=Broken("mysubs/codex/gpt-5.5"),
+            **{plugin._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+
+        assert out.choices[0].message.content == "served"
+
+    @pytest.mark.asyncio
+    async def test_a_caller_without_a_logging_object_still_gets_its_answer(self) -> None:
+        install_transport(FakeTransport(codex_events(text="served")))
+
+        out = await plugin.dispatch(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        assert out.choices[0].message.content == "served"
+
+
 class TestTheResponsesRouteIsBoundPerRouter:
     """`Router.aresponses` is built per instance, so there is no class attribute to patch.
 
