@@ -33,8 +33,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Router still has it, and travels to the streaming path under a private kwarg popped
   before any delegation upstream.
 
-  Still zero, and upstream data rather than dispatch: Antigravity models absent from
-  LiteLLM's price map (`gemini-3.x-flash-*` report `input=0`/`output=0`).
+  Two things this does not fix, both upstream rather than dispatch. Antigravity models
+  absent from LiteLLM's price map still cost zero (`gemini-3.x-flash-*` report
+  `input=0`/`output=0`), and Anthropic is not covered at all — see below.
+
+### Known issues
+
+- **Claude streaming spend is wrong, and the cause is upstream.** The fix above covers
+  Codex and Antigravity, which this plugin serves through its own streaming path.
+  Anthropic is served by LiteLLM's native path instead, so the wrapper built here is never
+  involved and there is nothing in this package to correct.
+
+  The proxy restamps each outgoing chunk with the public model name. Anthropic carries
+  usage on the first chunk (`message_start`) and on `message_delta`; usage-bearing chunks
+  are stored as pre-restamp copies while ordinary ones are stored by reference, so what
+  reaches `stream_chunk_builder` is `[wire, public, public, wire]` and the assembled model
+  is the public name. Measured on 1.101.0, driving a real `CustomStreamWrapper`:
+
+  | | logged model | cost |
+  |---|---|---|
+  | restamp off | `anthropic/claude-opus-4-20250514` | `0.609735` |
+  | restamp on | `mysubs/claudecode/claude-opus-5` | `BadRequestError` |
+
+  The failure mode differs from the one fixed above: the public name is absent from the
+  price map entirely, so `completion_cost` raises rather than quietly returning `0.0`.
+  Anthropic calls are therefore missing from spend tracking rather than present at zero,
+  which is why those rows look different from the Codex rows in `/ui/logs`.
+
+  Tracked upstream as [BerriAI/litellm#42161](https://github.com/BerriAI/litellm/issues/42161),
+  with [PR #42176](https://github.com/BerriAI/litellm/pull/42176) open against it. Not
+  worked around in-tree: the mutation happens in the proxy after these chunks have left,
+  and pricing from a name this plugin never put on the wire would bill against another
+  model's rate.
 
 ### Documented
 
