@@ -157,6 +157,50 @@ local store.
   snapshot labelled with its age. A model name the subscription does not serve returns the
   upstream error — it is never silently answered by a different model.
 
+## Any client, any protocol
+
+The point of the plugin is that a client reaches any subscription through whichever
+protocol it already speaks, without adapting. Three subscriptions, three protocols, each
+streaming and not:
+
+| | `/v1/chat/completions` | `/v1/responses` | `/v1/messages` |
+|---|---|---|---|
+| **Claude Max** | native | native | native |
+| **ChatGPT Codex** | served | served | served |
+| **Google Antigravity** | served | served | served |
+
+*served* means this plugin answers the turn on the subscription's own wire; *native* means
+LiteLLM's own path answers it once the OAuth token has been injected, which for Claude is
+correct on all three — Messages **is** its wire, and the other two are bridges LiteLLM
+already ships.
+
+Uniform is not the same as identical, and the difference is measurable. A turn must leave
+exactly one priced spend row whichever cell serves it, carry the wire identity so the Logs
+tab can price it and draw an icon, and — when the client asked to stream — deliver output
+incrementally rather than in one block at the end. That last one is the invariant that is
+easiest to lose without noticing: a route that awaits the whole turn and replays it still
+answers correctly, still bills correctly, and is not a stream. Measured on `/v1/responses`
+before and after it was fixed, same prompt:
+
+```
+before   gemini events=   2 deltas=   0 ttft=20911ms
+after    gemini events=  59 deltas=  51 ttft=   51ms
+reference codex events=7117 deltas=7107 ttft=   30ms
+```
+
+Counts and latencies are one run each and vary between them — a later run of the fixed
+path gave 61 events at 29 ms. What does not vary is the shape: zero deltas and a
+twenty-second wait is a different contract, not a slower one.
+
+The suite asserts this per cell against the number of chunks the upstream sent, rather than
+against an event count, so the incremental property is pinned without pinning a total that
+legitimately varies.
+
+**Known gap:** `/v1/messages` still replays the finished turn for the two served
+subscriptions, which is the defect described above, not yet fixed on that route. Measured:
+Codex 9 events at 30.7 s to first byte, Antigravity 6 events at 6.9 s, against Claude's 66
+events at 0.78 s on the same route. Correct answers, correct rows, and not a stream.
+
 ## Known incompatibility: `store_model_in_db: true`
 
 **The applied models appear and then vanish from the Router within 30 seconds.** If that is

@@ -95,6 +95,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and 50 over the same minutes. Same accounting hole 0.1.5 closed for chat:
   `x-litellm-key-spend` undercounts and per-key budgets never see these calls.
 
+- **Claude Max on `/v1/messages` answered 401, then 400.** Declining the translation
+  routes the turn to LiteLLM's native path, which does not excuse the two things the
+  plugin still owes it: the OAuth token has to be injected (`401 Missing Anthropic API
+  Key`), and the Claude Code identity belongs in the top-level `system` rather than in
+  `messages[0]` (`400 messages.0: use the top-level 'system' parameter`). Placement is a
+  parameter on `build_request` now, because both callers are legitimate and only the route
+  knows which is which.
+
+- **Spend rows named the model the client asked for, and no provider.** The row reads its
+  identity off the logging object, per request — and a request served by this plugin never
+  reaches the provider client that would fill those in. Measured on the live gateway: rows
+  served natively read `anthropic/claude-opus-5` + `anthropic`, rows served here read
+  `mysubs/antigravity/...` with an empty provider. An empty provider is also what leaves
+  the Logs tab without an icon, and a name with no rate is what left the cost at zero.
+
+- **Rows carried the right name and still billed nothing.** `completion_cost` was asked
+  under the public name, which has no entry in the price map. Measured on 1.101.0 with
+  identical usage: `("mysubs/codex/gpt-5.5", "custom_openai")` → `0.0`, and
+  `("openai/gpt-5.5", "openai")` → `0.0202325`. 49 of 50 rows were at zero, including
+  `claude-opus-5` turns of 123k tokens whose rate is in the map. A model with no rate now
+  leaves the field unset rather than asserting the turn was free.
+
+- **Every row read `duration = 0` and had no TTFT.** One instant was captured after the
+  await and passed as both `start_time` and `end_time`, so the duration was never measured
+  rather than merely small — natively-served rows alongside read 3.9 s to 14 s. TTFT needed
+  a second fix and then a third: writing `model_call_details["completion_start_time"]` is a
+  no-op, because `_success_handler_helper_fn` tests the **attribute** and overwrites it
+  with `end_time`; and timing the first event of any kind measures `response.created`,
+  which this plugin emits before the upstream has answered. Measured: `ttft=1ms` against a
+  114-second turn. It is taken at the first event carrying output now, through
+  `_update_completion_start_time`, which is what LiteLLM's own `_process_chunk` calls.
+
+- **A streamed `/v1/responses` turn left no row at all.** Four defects stacked, each
+  hiding the next, and the client got a correct answer every time:
+
+  | # | cause |
+  |---|---|
+  | 1 | logging sat after the `async for`; the proxy closes the generator at `response.completed`, so `GeneratorExit` discarded it |
+  | 2 | the object had no `completed_response`, which is where the proxy reads the finished turn |
+  | 3 | it was not a `BaseResponsesAPIStreamingIterator`, so the Router's `isinstance` gate handed it back raw |
+  | 4 | the success handler was given `result.response` instead of the terminal `ResponseCompletedEvent`, and `_get_assembled_streaming_response` returns `None` for anything else — silently |
+
+  Subclassing the base means inheriting its methods, so every attribute its constructor
+  sets is mirrored by hand; `_stream_created_time` is read on every `__anext__` and
+  `_hidden_params` is what the proxy reads to build `x-litellm-model-id` and friends.
+
+- **Gemini turns were costed zero because the effort is part of the model id.**
+  `gemini/gemini-3.6-flash-low` has no rate; `gemini/gemini-3.6-flash` does. Effort changes
+  the thinking budget, not the per-token rate, so the base name is what the turn is priced
+  against — and only when that name actually has a rate, which keeps `gemini-3-flash-agent`
+  from being repriced against a sibling it merely shares a prefix with. Recovers 21 of the
+  32 served models; the other 11 have no rate under any name and stay unpriced.
+
+- **Gemini on `/v1/responses` was delegated, and delegating does not stop the turn from
+  spending the subscription.** The native path prices from the response object, which
+  carries the public name and `cost: None` — the mechanism of
+  [BerriAI/litellm#42161](https://github.com/BerriAI/litellm/issues/42161), on this route.
+  Stamping the identity before the hand-off fixed the provider and not the name. The turn
+  is served here now.
+
+  The first version of that serving was a shortcut: it awaited the whole chat turn and
+  replayed it as two events. It answered and it priced, and it was not a stream. Measured
+  against Codex on the same route and prompt:
+
+  ```
+  codex   events=7117  deltas=7107  ttft=    30ms
+  gemini  events=   2  deltas=   0  ttft= 20911ms
+  ```
+
+  A client reading `text_deltas` got nothing for 21 seconds — same route, same client, two
+  contracts. Nothing about the incremental form was Codex-specific: `_ResponsesStreamState`
+  already owned every id, index and sequence number. The driver is parameterised by spec,
+  reader and usage mapper now, and both subscriptions emit the same sequence: 61 events and
+  29 ms on the wire, against Codex's 24 ms.
+
+- **A quota refusal on `/v1/responses` reached the client as HTTP 500.** `dispatch` has had
+  the `UpstreamError` translation since the chat route existed; `dispatch_responses` never
+  did. It went unnoticed while Gemini was delegated, because LiteLLM's native path
+  normalised the error on the way out. A client cannot back off on a 500.
+
+- **A logging failure could truncate a paid-for stream.** `_emit` set its guard before
+  unprotected work: both stamps begin by reading `logging_obj.model_call_details`, outside
+  the `try`. Measured against a logging object whose attribute raises: 0 of 3 events
+  delivered, with `_emitted` already set so `aclose()` would not retry and the `except`
+  never ran — the silent-failure mode the surrounding commits existed to remove.
+
+- **The plugin's own diagnostics went nowhere.** `verbose_proxy_logger` is the only logger
+  with a handler inside the proxy — the root has none — and it sits at WARNING by default.
+  A `getLogger(__name__)` wrote to nothing and an `.info()` was dropped by level, which is
+  why a diagnostic build looked like code that never ran. Three `contextlib.suppress`
+  blocks that hid real failures (route binding, model reapply, the stream's own emit) now
+  report, and the gateway sets `LITELLM_LOG=INFO`.
+
 ### Changed
 
 - **`plugin.py` split by responsibility.** It had grown to 1807 lines covering six
