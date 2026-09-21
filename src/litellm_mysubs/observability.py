@@ -208,14 +208,37 @@ class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
     """
 
     def __init__(self, events: AsyncIterator[Any], kwargs: dict[str, Any]) -> None:
-        # Deliberately not calling `super().__init__`: see the class docstring.
+        # `super().__init__` is deliberately not called — it wants an `httpx.Response`
+        # this object does not have, relaying events that are already parsed. But every
+        # attribute it would have set is mirrored here, because the inherited methods read
+        # them: `_check_max_streaming_duration` reads `start_time`, `_handle_failure`
+        # reads `_failure_handled`, `_log_completed_response` reads
+        # `_completed_response_logged`, and so on for fourteen names across fourteen
+        # methods. Subclassing for the `isinstance` gate while leaving them unset trades a
+        # missing row for an AttributeError mid-stream.
         self._events = events
         self._kwargs = kwargs
         self._started = datetime.datetime.now()
         self._first_token_at: datetime.datetime | None = None
         self._emitted = False
+
         #: The terminal event's response, where the proxy looks for the finished turn.
         self.completed_response: Any = None
+        self.response: Any = None
+        self.model = str(kwargs.get("model") or "")
+        self.logging_obj: Any = kwargs.get("litellm_logging_obj")
+        self.responses_api_provider_config = None
+        self.litellm_metadata = kwargs.get("litellm_metadata")
+        self.custom_llm_provider = kwargs.get("custom_llm_provider")
+        self.start_time = self._started
+        self.finished = False
+        self._failure_handled = False
+        self._yielded_first_chunk = False
+        self._generated_content = ""
+        self._completed_response_cached = False
+        self._completed_response_logged = False
+        self._completed_response_cache_hit: bool | None = None
+        self._persist_completed_response_before_logging = True
 
     def __aiter__(self) -> _LoggedResponsesStream:
         return self

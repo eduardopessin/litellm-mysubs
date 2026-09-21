@@ -1658,6 +1658,37 @@ class TestTheResponsesRouteIsLogged:
         )
 
     @pytest.mark.asyncio
+    async def test_the_stream_mirrors_every_attribute_the_base_sets(self) -> None:
+        """Subclassing for the `isinstance` gate means inheriting fourteen methods.
+
+        `super().__init__` cannot run — it wants an `httpx.Response` this object does not
+        have — so every attribute it would set is mirrored by hand. Miss one and the
+        inherited reader raises mid-stream instead of logging: `_check_max_streaming_
+        duration` reads `start_time`, `_handle_failure` reads `_failure_handled`,
+        `_log_completed_response` reads `_completed_response_logged`.
+        """
+        import inspect
+        import re
+
+        from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
+
+        base_init = inspect.getsource(BaseResponsesAPIStreamingIterator.__init__)
+        expected = set(re.findall(r"self\.(\w+)\s*=", base_init))
+
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+        stream = await plugin.dispatch_responses(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            input="hi",
+            stream=True,
+            litellm_logging_obj=self.Recorder("mysubs/codex/gpt-5.5"),
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+
+        missing = sorted(name for name in expected if not hasattr(stream, name))
+        assert not missing, f"inherited methods read these: {missing}"
+
+    @pytest.mark.asyncio
     async def test_the_stream_carries_the_finished_turn_on_itself(self) -> None:
         """The proxy reads the turn off the object, not off anything the stream yields.
 
