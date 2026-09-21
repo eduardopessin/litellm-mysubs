@@ -516,23 +516,45 @@ def _thinking_config(
 
     config = {"includeThoughts": True}
     if isinstance(budget, int) and budget > 0:
-        config["thinkingBudget"] = _fit_budget(budget, max_output_tokens)
+        fitted = _fit_budget(budget, max_output_tokens)
+        if fitted is None:
+            # No budget can satisfy both bounds: serve the turn without reasoning rather
+            # than fail it. The caller asked for a ceiling, not for thinking.
+            return {"includeThoughts": False, "thinkingBudget": 0}
+        config["thinkingBudget"] = fitted
     elif not isinstance(budget, int):
         config["thinkingLevel"] = THINKING_LEVEL.get(effort, "MEDIUM")
     return config
 
 
-def _fit_budget(budget: int, max_output_tokens: int | None) -> int:
-    """The budget, reduced to leave room under the caller's output ceiling.
+#: Anthropic refuses any positive budget below this — `thinking.enabled.budget_tokens:
+#: Input should be greater than or equal to 1024`. Measured on the live gateway.
+MIN_THINKING_BUDGET: Final = 1024
 
-    Three quarters keeps the reasoning generous while guaranteeing the strict inequality
-    the backend demands; a ceiling too small for any useful reasoning still yields at least
-    one token, because zero would read as "thinking off" and change the answer rather than
-    the envelope.
+
+def _fit_budget(budget: int, max_output_tokens: int | None) -> int | None:
+    """The budget that fits under the caller's ceiling, or ``None`` if none does.
+
+    Two bounds apply at once, and they close on each other::
+
+        max_tokens      > budget_tokens      (the ceiling has to leave room)
+        budget_tokens  >= 1024               (Anthropic's own minimum)
+
+    Together they mean a ceiling of 1024 or less admits **no** valid budget. The first
+    attempt here capped the budget at three quarters of the ceiling, which turned one
+    rejection into another: ``max_tokens: 1024`` produced 768 and the backend answered
+    `Input should be greater than or equal to 1024`. Both were measured on the live
+    gateway, in that order.
+
+    So a ceiling that cannot host reasoning returns ``None`` and the caller drops thinking
+    for that turn. The budget is what gives way — it is this plugin's own choice, while the
+    ceiling belongs to the caller and raising it would bill for output nobody asked for.
     """
     if max_output_tokens is None or budget < max_output_tokens:
         return budget
-    return max(1, max_output_tokens * 3 // 4)
+    if max_output_tokens <= MIN_THINKING_BUDGET:
+        return None
+    return max(MIN_THINKING_BUDGET, max_output_tokens - 1)
 
 
 def build_payload(

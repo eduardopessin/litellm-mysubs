@@ -418,20 +418,7 @@ class TestToolCalls:
         assert call["id"] == "c1", "Vertex refuses a tool_use without an id"
         assert result["id"] == "c1", "the result has to name the call it answers"
 
-    def test_the_output_ceiling_leaves_room_for_the_thinking_budget(self) -> None:
-        """Vertex refuses a request whose `max_tokens` does not exceed the budget.
-
-            HTTP 400 `max_tokens` must be greater than `thinking.budget_tokens`
-
-        The two travel independently: `maxOutputTokens` is whatever the client asked for,
-        `thinkingBudget` comes from the catalog. A client with a modest ceiling and a
-        variant with a large budget produce a request the backend cannot accept —
-        reproduced on the live gateway with `max_tokens: 1024`, which failed on the very
-        first turn while the same call with no ceiling succeeded.
-
-        The budget is what gives way: it is the plugin's own choice, while the ceiling is
-        the caller's and silently raising it would bill for output nobody asked for.
-        """
+    def _claude_config(self, ceiling: int | None) -> dict[str, Any]:
         catalog = ModelCatalog(
             ids=("claude-sonnet-4-6",),
             info={"claude-sonnet-4-6": {"thinkingBudget": 4000}},
@@ -441,11 +428,44 @@ class TestToolCalls:
             [{"role": "user", "content": "x"}],
             model="claude-sonnet-4-6",
             catalog=catalog,
-            extra={"max_tokens": 1024},
+            extra={} if ceiling is None else {"max_tokens": ceiling},
         )
-        config = body["request"]["generationConfig"]
-        assert config["maxOutputTokens"] == 1024, "the caller's ceiling is not raised"
-        assert config["thinkingConfig"]["thinkingBudget"] < 1024
+        return body["request"]["generationConfig"]
+
+    def test_a_roomy_ceiling_keeps_the_catalog_budget(self) -> None:
+        config = self._claude_config(64000)
+        assert config["maxOutputTokens"] == 64000
+        assert config["thinkingConfig"]["thinkingBudget"] == 4000
+
+    def test_a_tight_ceiling_shrinks_the_budget_under_it(self) -> None:
+        """`max_tokens` must be strictly greater than `budget_tokens`.
+
+        Measured on the live gateway: a ceiling at or below the catalog budget was refused
+        on the first turn, while the same call with no ceiling succeeded.
+        """
+        config = self._claude_config(2048)
+        assert config["maxOutputTokens"] == 2048, "the caller's ceiling is not raised"
+        assert config["thinkingConfig"]["thinkingBudget"] < 2048
+        assert config["thinkingConfig"]["thinkingBudget"] >= ag.MIN_THINKING_BUDGET
+
+    def test_a_ceiling_too_small_for_any_budget_drops_thinking(self) -> None:
+        """Two bounds close on each other and leave nothing valid.
+
+        `max_tokens > budget_tokens` and Anthropic's own `budget_tokens >= 1024` mean a
+        ceiling of 1024 admits no budget at all. Shrinking to three quarters — the first
+        attempt — merely swapped one rejection for the other::
+
+            HTTP 400 thinking.enabled.budget_tokens: Input should be greater than or
+                     equal to 1024
+
+        Serving the turn without reasoning is the honest answer: the caller asked for a
+        ceiling, not for thinking.
+        """
+        for ceiling in (512, 1024):
+            config = self._claude_config(ceiling)
+            thinking = config["thinkingConfig"]
+            assert thinking["includeThoughts"] is False, ceiling
+            assert thinking["thinkingBudget"] == 0, ceiling
 
     def test_sentinel_is_per_turn_not_per_request(self) -> None:
         """The CCA requires the sentinel on the first call of **every** assistant turn.
