@@ -1383,6 +1383,9 @@ class TestTheNonStreamingPathIsLogged:
                     "provider": self.model_call_details.get("custom_llm_provider"),
                     "usage": getattr(result, "usage", None),
                     "cost": self.model_call_details.get("response_cost"),
+                    "start": start_time,
+                    "end": end_time,
+                    "first_token": self.model_call_details.get("completion_start_time"),
                 }
             )
 
@@ -1403,6 +1406,29 @@ class TestTheNonStreamingPathIsLogged:
         assert log.calls[0]["model"] == "openai/gpt-5.5"
         assert log.calls[0]["provider"] == "openai"
         assert log.calls[0]["usage"] is not None, "a row without usage cannot be priced"
+
+    @pytest.mark.asyncio
+    async def test_the_row_measures_how_long_the_turn_took(self) -> None:
+        """A row whose two timestamps are the same instant reads as 0 ms.
+
+        The first version marked `now` once, after the await, and passed it as both
+        `start_time` and `end_time`. Measured on the live gateway's Logs tab, every row
+        this plugin served read 0 ms while the natively-served `anthropic/claude-opus-5`
+        ones read 3.9 s to 14 s — the duration was never measured, not merely small.
+        """
+        install_transport(FakeTransport(codex_events(text="served")))
+        log = self.Recorder("mysubs/codex/gpt-5.5")
+
+        await plugin.dispatch(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            messages=[{"role": "user", "content": "hi"}],
+            litellm_logging_obj=log,
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+
+        call = log.calls[0]
+        assert call["end"] > call["start"], "the turn took time; the row has to show it"
 
     @pytest.mark.asyncio
     async def test_the_row_carries_the_cost_of_the_turn(self) -> None:
@@ -1543,6 +1569,32 @@ class TestTheResponsesRouteIsLogged:
         events = [e async for e in stream]
 
         assert events[-1].type == "response.completed"
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_row_records_when_the_first_token_left(self) -> None:
+        """Time-to-first-token is only measurable while the stream runs.
+
+        By the time it ends the moment has passed, and the upstream does not report it —
+        so a row without it shows no TTFT at all, which is what the Logs tab displayed.
+        """
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+        log = self.Recorder("mysubs/codex/gpt-5.5")
+
+        stream = await plugin.dispatch_responses(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            input="hi",
+            stream=True,
+            litellm_logging_obj=log,
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+        async for _ in stream:
+            pass
+
+        call = log.calls[0]
+        assert call["first_token"] is not None, "the row has to know when output began"
+        assert call["start"] <= call["first_token"] <= call["end"]
+        assert call["end"] > call["start"], "a streamed turn takes time"
 
 
 class TestTheResponsesRouteIsBoundPerRouter:

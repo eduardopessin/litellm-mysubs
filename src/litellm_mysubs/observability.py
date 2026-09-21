@@ -103,6 +103,11 @@ async def _logged(turn: Coroutine[Any, Any, Any], kwargs: dict[str, Any]) -> Any
     Best effort by contract: a logging failure must not lose a response the upstream
     already produced and the user has already been charged for by the subscription.
     """
+    # Marked before the await, not after: the two timestamps are what the row's duration
+    # is computed from, and passing the same instant twice makes every call look
+    # instantaneous. Measured on the live gateway's Logs tab: our rows read 0 ms while the
+    # natively-served `anthropic/claude-opus-5` ones read 3.9 s to 14 s.
+    started = datetime.datetime.now()
     response = await turn
     logging_obj = kwargs.get("litellm_logging_obj")
     handler = getattr(logging_obj, "async_success_handler", None)
@@ -110,8 +115,9 @@ async def _logged(turn: Coroutine[Any, Any, Any], kwargs: dict[str, Any]) -> Any
         return response
     _stamp_cost(logging_obj, response, kwargs)
     with contextlib.suppress(Exception):
-        now = datetime.datetime.now()
-        await handler(result=response, start_time=now, end_time=now)
+        await handler(
+            result=response, start_time=started, end_time=datetime.datetime.now()
+        )
     return response
 
 
@@ -173,8 +179,15 @@ async def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> 
     so it is kept as the result rather than reassembled. Best effort by contract — a
     logging failure must not truncate a stream the subscription has already paid for.
     """
+    started = datetime.datetime.now()
+    first_token_at: datetime.datetime | None = None
     terminal: Any = None
     async for event in events:
+        # The first event out is the time-to-first-token the Logs tab shows. Nothing else
+        # can measure it: by the time the stream ends the moment has passed, and the
+        # upstream does not report it.
+        if first_token_at is None:
+            first_token_at = datetime.datetime.now()
         if getattr(event, "type", None) in ("response.completed", "response.incomplete"):
             terminal = getattr(event, "response", None) or event
         yield event
@@ -185,9 +198,24 @@ async def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> 
         return
     if terminal is not None:
         _stamp_cost(logging_obj, terminal, kwargs)
+    _stamp_first_token(logging_obj, first_token_at)
     with contextlib.suppress(Exception):
-        now = datetime.datetime.now()
-        await handler(result=terminal, start_time=now, end_time=now)
+        await handler(
+            result=terminal, start_time=started, end_time=datetime.datetime.now()
+        )
+
+
+def _stamp_first_token(logging_obj: Any, moment: datetime.datetime | None) -> None:
+    """Records when the first chunk left, which is what the row's TTFT is read from.
+
+    A stream that produced nothing has no first token, and leaving the field unset says
+    exactly that — a fabricated instant would read as a fast answer that never came.
+    """
+    if moment is None:
+        return
+    details = getattr(logging_obj, "model_call_details", None)
+    if isinstance(details, dict):
+        details["completion_start_time"] = moment
 
 
 def _cost_identity(model: str, kwargs: dict[str, Any]) -> tuple[str, str]:
