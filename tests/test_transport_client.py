@@ -235,6 +235,24 @@ class TestDecisionsAreNotReimplemented:
 
         assert not isinstance(raised.value, RedeemRequired)
 
+    async def test_antigravity_429_does_not_try_the_other_host(self) -> None:
+        """A 429 is the account's verdict, not the endpoint's.
+
+        Both hosts front the same account and the same quota, so asking the second one
+        repeats a refusal that is already known — it only doubles the latency of the
+        failure. Measured against the real backend: ~22 s through the rotation against
+        ~11 s when the error propagates at once.
+        """
+        rotation = HostRotation()
+        recorder = Recorder(httpx.Response(429, text="RESOURCE_EXHAUSTED"))
+
+        async with transport(recorder, rotation=rotation) as client:
+            with pytest.raises(UpstreamError) as raised:
+                await client.request(spec("antigravity", url=HOSTS[0] + STREAM_PATH))
+
+        assert recorder.urls == [HOSTS[0] + STREAM_PATH]
+        assert raised.value.status == 429
+
 
 class TestStreaming:
     async def test_events_arrive_in_order_and_stop_at_done(self) -> None:

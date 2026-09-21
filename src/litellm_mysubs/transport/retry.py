@@ -34,6 +34,9 @@ class Action(Enum):
     FAIL = "fail"
     """Nothing to do: propagate the upstream error."""
 
+    ABORT = "abort"
+    """Propagate at once: trying another endpoint cannot change the answer."""
+
 
 @dataclass(frozen=True, slots=True)
 class Decision:
@@ -92,9 +95,16 @@ def decide_antigravity(status: int) -> Decision:
     another model. A 404 is "this account does not serve this model" and a 503 is
     capacity; in either case the next host is tried and, once exhausted, the error
     propagates.
+
+    A 429 is the exception, and it is not an endpoint problem: both hosts front the same
+    account and the same quota, so asking the second one repeats a refusal that is already
+    known. Measured against the real backend, the rotation turned an ~11 s failure into
+    ~22 s and changed nothing else. `ABORT` propagates it at the first host.
     """
     if status == 200:
         return Decision(Action.RETURN)
     if status == 401:
         return Decision(Action.REFRESH_TOKEN, "credential rejected")
+    if status == 429:
+        return Decision(Action.ABORT, "quota exhausted: the other host serves the same account")
     return Decision(Action.FAIL, f"HTTP {status}")

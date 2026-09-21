@@ -50,7 +50,13 @@ from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, Strea
 
 from .credentials.store import CredentialStore, ProviderId
 from .transport import hosts
-from .transport.client import RequestSpec, Transport
+from .transport.client import (
+    RedeemRequired,
+    RemapRequired,
+    RequestSpec,
+    Transport,
+    UpstreamError,
+)
 from .wire import anthropic, antigravity, antigravity_models, codex, planning_leak, thinking_loop
 from .wire.usage import Usage, codex_finish_reason, codex_usage, google_finish_reason, google_usage
 
@@ -1225,26 +1231,83 @@ async def dispatch(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
     messages = kwargs.get("messages") or []
     streaming = bool(kwargs.get("stream"))
 
-    if provider == "google-antigravity" or (provider is None and is_gemini_model(model)):
-        # Stamped before serving, not after: the spend log reads the identity off the
-        # logging object, and the streaming path hands that object to the wrapper.
-        _stamp_logging_identity(model, kwargs)
-        if streaming:
-            return _wrap_stream(_antigravity_stream(model, messages, kwargs), model, kwargs)
-        return await _logged(_antigravity_turn(model, messages, kwargs), kwargs)
+    try:
+        if provider == "google-antigravity" or (provider is None and is_gemini_model(model)):
+            # Stamped before serving, not after: the spend log reads the identity off the
+            # logging object, and the streaming path hands that object to the wrapper.
+            _stamp_logging_identity(model, kwargs)
+            if streaming:
+                return _wrap_stream(
+                    _translate_errors(_antigravity_stream(model, messages, kwargs), model, kwargs),
+                    model,
+                    kwargs,
+                )
+            return await _logged(_antigravity_turn(model, messages, kwargs), kwargs)
 
-    # After Gemini: `codex.is_codex_model` matches any name containing "gpt-", and a
-    # hypothetical "gemini-gpt" belongs to Google.
-    if provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
-        _stamp_logging_identity(model, kwargs)
-        if streaming:
-            return _wrap_stream(_codex_stream(model, messages, kwargs), model, kwargs)
-        return await _logged(_codex_turn(model, messages, kwargs), kwargs)
+        # After Gemini: `codex.is_codex_model` matches any name containing "gpt-", and a
+        # hypothetical "gemini-gpt" belongs to Google.
+        if provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
+            _stamp_logging_identity(model, kwargs)
+            if streaming:
+                return _wrap_stream(
+                    _translate_errors(_codex_stream(model, messages, kwargs), model, kwargs),
+                    model,
+                    kwargs,
+                )
+            return await _logged(_codex_turn(model, messages, kwargs), kwargs)
+    except UpstreamError as error:
+        raise _as_litellm_error(error, model, kwargs) from error
 
     # `anthropic` has no branch of its own: it is served by LiteLLM's native path with the
     # prompt and the token that `_delegate_kwargs` injects. Returning `None` is what routes
     # it there.
     return None
+
+
+async def _translate_errors(
+    chunks: AsyncIterator[ModelResponseStream], model: str, kwargs: dict[str, Any]
+) -> AsyncIterator[ModelResponseStream]:
+    """Same translation as `dispatch`, for the streaming path.
+
+    The generator is built before `dispatch` returns but only starts running when the
+    wrapper pulls the first chunk, so the `try` around the call site never sees the
+    upstream refusal — `_open` runs inside the first `__anext__`. Wrapping the iterator is
+    what puts the translation where the error actually surfaces.
+    """
+    try:
+        async for chunk in chunks:
+            yield chunk
+    except UpstreamError as error:
+        raise _as_litellm_error(error, model, kwargs) from error
+
+
+def _as_litellm_error(error: UpstreamError, model: str, kwargs: dict[str, Any]) -> Exception:
+    """Translates an upstream refusal into the exception LiteLLM understands.
+
+    `UpstreamError` already carries the real status, but the proxy has no class for it: an
+    unrecognised exception is reported as `internal_server_error` with HTTP 500, and the
+    upstream status survives only as text inside the message. Measured on the live
+    gateway, a quota refusal reached the client as::
+
+        HTTP 500  {"error": {"type": "internal_server_error", "code": "500",
+                             "message": "HTTP 429: ... RESOURCE_EXHAUSTED ..."}}
+
+    A client cannot back off on a 500. It can on a 429, and backing off is the one correct
+    response to a quota refusal — so the status is mapped, never invented: anything that is
+    not a status LiteLLM has a class for propagates unchanged.
+
+    `RemapRequired` and `RedeemRequired` are excluded even though the latter is also a 429:
+    they are signals to `plugin.py`, not answers to the client, and the module docstring's
+    rule that they propagate as themselves is what lets a caller act on them.
+    """
+    if isinstance(error, RemapRequired | RedeemRequired):
+        return error
+    _, family = _cost_identity(model, kwargs)
+    if error.status == 429:
+        return litellm.exceptions.RateLimitError(
+            message=str(error), llm_provider=family, model=model
+        )
+    return error
 
 
 async def _logged(turn: Coroutine[Any, Any, ModelResponse], kwargs: dict[str, Any]) -> Any:

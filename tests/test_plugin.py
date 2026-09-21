@@ -316,6 +316,21 @@ class TestUpstreamErrors:
             await plugin.dispatch(model="gpt-5.5", messages=[{"role": "user", "content": "x"}])
         assert caught.value is error
 
+    async def test_a_429_reaches_the_client_as_a_rate_limit(self) -> None:
+        """A quota refusal has to keep its status across the LiteLLM boundary.
+
+        `UpstreamError` carries the real 429, but it means nothing to the proxy: an
+        exception it does not recognise is reported as `internal_server_error` with HTTP
+        500, and the 429 survives only as text inside the message. Measured on the live
+        gateway, that is exactly what the client saw — and a client cannot back off on a
+        500, which is the one thing it should do here.
+        """
+        install_transport(FakeTransport(error=UpstreamError(429, "RESOURCE_EXHAUSTED")))
+        with pytest.raises(litellm.exceptions.RateLimitError) as caught:
+            await plugin.dispatch(model="gpt-5.5", messages=[{"role": "user", "content": "x"}])
+        assert caught.value.status_code == 429
+        assert "RESOURCE_EXHAUSTED" in str(caught.value)
+
     async def test_in_band_codex_failure_is_not_a_response(self) -> None:
         """`response.failed` arrives with HTTP 200; swallowing it delivered an empty turn."""
         install_transport(

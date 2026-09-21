@@ -223,6 +223,8 @@ class Transport:
                     raise RemapRequired(status, body)
                 if decision.action is Action.REDEEM_CREDIT:
                     raise RedeemRequired(status, body)
+                if decision.action is Action.ABORT:
+                    raise UpstreamError(status, body)
                 if decision.action is Action.REFRESH_TOKEN and not refreshed:
                     token = await self._refresh(spec.provider) if self._refresh else None
                     if token:
