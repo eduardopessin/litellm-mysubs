@@ -585,24 +585,49 @@ YAML. Setting `store_model_in_db: false` in `config.yaml` while the container st
 
 Document the conflict in the README and do **not** patch the proxy from inside the plugin.
 
-The marker is already there — every injected deployment carries
-`model_info.managed_by = "mysubs"`, and `registry.py` uses it. The cleanup loop never reads
-it: `Router.delete_deployment()` deletes by id and has no notion of an external owner.
-Honouring the marker upstream is three lines and makes both mechanisms coexist, which is
-what a user who wants some models in the database and others from a plugin actually needs:
+The plugin marks every injected deployment with `model_info.managed_by = "mysubs"`, and
+`registry.py` uses it. Upstream has no such concept: `managed_by` does not appear anywhere
+in the LiteLLM source, and `Router.delete_deployment()` deletes by id with no notion of an
+external owner. So this is a field to *introduce* upstream, not one being ignored — the
+name is negotiable, the property that matters is that the reconcile can tell "nobody claims
+this" from "someone else owns this" instead of inferring ownership from absence.
+
+Honouring such a marker is a few lines and makes both mechanisms coexist, which is what a
+user who wants some models in the database and others from a plugin actually needs:
 
 ```python
 for model_id in router_model_ids:
     if model_id in combined_id_list:
         continue
     deployment = llm_router.get_deployment(model_id=model_id)
-    if (deployment.model_info or {}).get("managed_by"):
+    if deployment is not None and deployment.model_info.get("managed_by"):
         continue          # declared external owner — not an orphan
     llm_router.delete_deployment(id=model_id)
 ```
 
-(`ModelInfo` accepts extra fields and supports `.get()` — verified in the running pod, so
-the snippet works as written.)
+Two details, both measured on 1.101.0, because the obvious spelling of that guard is wrong.
+`ModelInfo` accepts extra fields and supports `.get()`, which returns `None` when the key is
+absent — but **attribute** access raises `AttributeError` rather than returning `None`, and
+the unmarked deployment is the common case, so `deployment.model_info.managed_by` would
+raise on nearly every iteration. `get_deployment()` also returns `None` for an id it does
+not know, and `get_model_ids()` is read before the loop mutates the list, hence the
+`is not None` check.
+
+Filed upstream as
+[BerriAI/litellm#42211](https://github.com/BerriAI/litellm/issues/42211), with a
+network-free reproduction that calls `_delete_deployment` directly.
+
+Adjacent but not sufficient: [#41505](https://github.com/BerriAI/litellm/pull/41505) adds a
+keep-set to this same loop for deployments whose `model_info.db_model` is `False`. Injected
+deployments do have `db_model == False`, but that keep-set is only built when the config read
+returns **no** `model_list` at all. A proxy running this plugin has its own models in
+`config.yaml`, so the guard is inert and the eviction still happens. Measured, same reconcile
+call, two config shapes:
+
+| config read | plugin deployment |
+|---|---|
+| no `model_list` (#41505 guard engages) | evicted anyway |
+| `model_list` present (realistic) | evicted |
 
 Why not do it here anyway: the workaround would mean monkey-patching a reconcile loop whose
 job is to delete what it does not recognise. Getting the predicate wrong evicts the
@@ -610,13 +635,15 @@ job is to delete what it does not recognise. Getting the predicate wrong evicts 
 That is a bad trade for a plugin to make on someone else's proxy.
 
 The scope is also wider than this package: **any** plugin injecting through
-`set_model_list` is silently undone while `store_model_in_db` is on. That makes it an
-upstream defect worth reporting on its own merits, without mentioning this package at all.
+`set_model_list` is silently undone while `store_model_in_db` is on. That is why #42211 is
+written generically, with a reproduction that names no plugin and does not mention this
+package at all.
 
 ### What would reopen this
 
 LiteLLM honouring `managed_by` (or any equivalent ownership marker) in the cleanup loop —
-then the README caveat is deleted and nothing else changes. Alternatively, an installation
+#42211 is the request; if it lands, the README caveat is deleted and nothing else changes.
+Alternatively, an installation
 that genuinely needs both the database catalog **and** the plugin: at that point the cost of
 the caveat stops being zero, and persisting through `POST /model/new` becomes worth
 revisiting. `registry.py` rejected that path because `supported_db_objects` without
