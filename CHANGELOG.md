@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-21
+
+### Fixed
+
+- **`/v1/responses` answered with an empty `output` for Codex models.** 0.1.3 routed the
+  request correctly but returned the terminal event's `response` object unchanged, on the
+  assumption that it carried the output items. It does not: the items arrive in the
+  `response.output_item.done` events during the stream, and `response.completed` closes the
+  turn without repeating them.
+
+  The result was a `status: completed` turn with billed output tokens and nothing in it.
+  Measured on a live gateway, same prompt, same model:
+
+  | route | answer | `output_tokens` |
+  |---|---|---|
+  | `/v1/chat/completions` | `4` | 17 |
+  | `/v1/responses` (0.1.3) | *(empty)* | 17 |
+
+  Worse than the 401 it replaced: a client cannot tell that from a model that chose to say
+  nothing.
+
+  The items are now rebuilt from what the stream reader accumulated — the same source the
+  chat path uses, so the two routes cannot disagree — as `reasoning`, `message` and
+  `function_call` items in that order, with the composite call id preserved so a follow-up
+  turn matches its output to the right call. An upstream that does send `output` keeps it;
+  rebuilding is the fallback, not the rule.
+
+  The 0.1.3 test suite missed this because its fixture invented an `output` the real
+  endpoint never sends. The fixture now matches the wire, and defaults to omitting it.
+
 ## [0.1.3] - 2026-09-21
 
 ### Fixed
@@ -197,7 +227,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.0...v0.1.1

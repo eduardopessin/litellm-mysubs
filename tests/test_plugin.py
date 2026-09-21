@@ -1042,29 +1042,40 @@ def codex_responses_events(
     text: str = "hello",
     status: str = "completed",
     usage: dict[str, Any] | None = None,
+    carry_output: bool = False,
 ) -> list[dict[str, Any]]:
-    """Terminal event carrying a full Responses payload, as the real endpoint sends it."""
+    """Events as the real endpoint sends them.
+
+    `response.completed` closes the turn **without** repeating `output`: the items arrived
+    in the `response.output_item.done` events during the stream. Measured against the live
+    endpoint after a passthrough shipped `output: []` with non-zero `output_tokens`.
+
+    `carry_output=True` covers the opposite case — an upstream that does include it, which
+    must then be preserved rather than rebuilt.
+    """
+    response: dict[str, Any] = {
+        "id": "resp_upstream_1",
+        "created_at": 1700000000,
+        "object": "response",
+        "status": status,
+        "model": "gpt-5.5",
+        "usage": usage or {},
+    }
+    if carry_output:
+        response["output"] = [
+            {
+                "type": "message",
+                "id": "msg_from_upstream",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+        ]
     return [
         {"type": "response.output_text.delta", "delta": text},
         {
             "type": "response.completed" if status == "completed" else "response.incomplete",
-            "response": {
-                "id": "resp_upstream_1",
-                "created_at": 1700000000,
-                "object": "response",
-                "status": status,
-                "model": "gpt-5.5",
-                "output": [
-                    {
-                        "type": "message",
-                        "id": "msg_1",
-                        "role": "assistant",
-                        "status": "completed",
-                        "content": [{"type": "output_text", "text": text, "annotations": []}],
-                    }
-                ],
-                "usage": usage or {},
-            },
+            "response": response,
         },
     ]
 
@@ -1079,21 +1090,99 @@ class TestTheResponsesRouteIsServed:
     """
 
     @pytest.mark.asyncio
-    async def test_codex_is_served_from_its_own_responses_payload(self) -> None:
-        """Codex speaks Responses natively: the upstream object is returned, not rebuilt."""
-        install_transport(FakeTransport(codex_responses_events(text="served")))
+    async def test_the_text_survives_when_the_terminal_event_omits_output(self) -> None:
+        """The regression: `output: []` with non-zero `output_tokens`.
+
+        `response.completed` does not repeat the items, so a straight passthrough returned
+        a completed turn whose text had vanished. Measured on the live gateway: the chat
+        route answered "4" while this one answered nothing.
+        """
+        install_transport(
+            FakeTransport(
+                codex_responses_events(
+                    text="served", usage={"input_tokens": 19, "output_tokens": 17}
+                )
+            )
+        )
 
         out = await plugin.dispatch_responses(
             provider="openai-codex", model="mysubs/codex/gpt-5.5", input="hi"
         )
 
         assert out is not None
-        # The upstream's own output items survive rather than being flattened to text.
+        assert out.output, "a turn that billed output tokens must carry output items"
         assert out.output[0].content[0].text == "served"
+        assert out.usage.output_tokens == 17
         # The public name wins over the wire name the upstream echoes: it is what the
         # caller asked for and what the spend log records.
         assert out.model == "mysubs/codex/gpt-5.5"
         assert out.id == "resp_upstream_1"
+
+    @pytest.mark.asyncio
+    async def test_an_upstream_that_sends_output_keeps_it(self) -> None:
+        """Rebuilding is the fallback, not the rule: the upstream's own items win."""
+        install_transport(FakeTransport(codex_responses_events(text="served", carry_output=True)))
+
+        out = await plugin.dispatch_responses(
+            provider="openai-codex", model="mysubs/codex/gpt-5.5", input="hi"
+        )
+
+        assert out is not None
+        assert out.output[0].id == "msg_from_upstream"
+
+    @pytest.mark.asyncio
+    async def test_tool_calls_become_function_call_items(self) -> None:
+        """A tool turn has to replay as `function_call` items, with the call id preserved."""
+        install_transport(
+            FakeTransport(
+                [
+                    {
+                        "type": "response.output_item.added",
+                        "item": {
+                            "type": "function_call",
+                            "id": "item_1",
+                            "call_id": "call_abc",
+                            "name": "get_weather",
+                        },
+                    },
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": "item_1",
+                        "delta": '{"city":"Lisbon"}',
+                    },
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "function_call",
+                            "id": "item_1",
+                            "call_id": "call_abc",
+                            "name": "get_weather",
+                            "arguments": '{"city":"Lisbon"}',
+                        },
+                    },
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_tools",
+                            "created_at": 1700000000,
+                            "status": "completed",
+                            "usage": {},
+                        },
+                    },
+                ]
+            )
+        )
+
+        out = await plugin.dispatch_responses(
+            provider="openai-codex", model="mysubs/codex/gpt-5.5", input="weather?"
+        )
+
+        assert out is not None
+        call = out.output[0]
+        assert call.type == "function_call"
+        assert call.name == "get_weather"
+        assert call.arguments == '{"city":"Lisbon"}'
+        assert "call_abc" in call.call_id
 
     @pytest.mark.asyncio
     async def test_a_string_input_becomes_a_user_turn(self) -> None:

@@ -803,15 +803,18 @@ async def _codex_responses_turn(
 ) -> ResponsesAPIResponse:
     """Serves ``/v1/responses`` from the subscription's own Responses payload.
 
-    Codex **is** a Responses API endpoint, so the terminal event already carries the object
-    this route has to return. It is handed back with the public model name restored,
-    instead of being flattened into a chat completion and rebuilt — which is what the chat
-    path does and what would lose `output` item structure, reasoning items and call ids.
+    Codex **is** a Responses API endpoint, so the terminal event's `response` object is the
+    shape this route has to return and is kept as the base — status, `previous_response_id`
+    and the rest are the upstream's.
 
-    Only the id, model and usage are normalised. Everything else is the upstream's.
+    What the terminal event does **not** carry is `output`. Measured against the real
+    endpoint: the items arrive in the `response.output_item.done` events during the stream,
+    and `response.completed` closes the turn without repeating them, so a straight
+    passthrough returned `output: []` with a non-zero `output_tokens` — a completed turn
+    whose text had vanished. They are rebuilt here from what the reader accumulated, which
+    is the same source the chat path uses, so the two routes cannot disagree.
 
-    Usage is rebuilt rather than passed through: the upstream sends it in the Responses
-    shape when it sends it at all, and an absent or partial `usage` fails
+    Usage is rebuilt for a second reason: an absent or partial `usage` fails
     `ResponseAPIUsage` validation, which requires all three counters. Going through
     `codex_usage` is also what makes this route's spend log match the chat route's.
     """
@@ -827,10 +830,54 @@ async def _codex_responses_turn(
     payload["model"] = model
     payload.setdefault("id", f"resp_{uuid.uuid4().hex[:24]}")
     payload.setdefault("created_at", int(time.time()))
-    payload.setdefault("output", [])
     payload.setdefault("object", "response")
+    if not payload.get("output"):
+        payload["output"] = _responses_output(turn)
     payload["usage"] = _responses_usage(codex_usage(turn.usage_meta))
     return ResponsesAPIResponse(**payload)
+
+
+def _responses_output(turn: _Turn) -> list[dict[str, Any]]:
+    """``output`` items for a turn the terminal event did not carry them for.
+
+    Reasoning comes first, then the message, then the tool calls — the order the Responses
+    API documents and the order a client replays them in. Tool calls carry the composite
+    id the chat path also emits, so a follow-up turn matches its output to the right call.
+    """
+    items: list[dict[str, Any]] = []
+    reasoning = "".join(turn.reasoning)
+    if reasoning:
+        items.append(
+            {
+                "type": "reasoning",
+                "id": f"rs_{uuid.uuid4().hex[:24]}",
+                "summary": [{"type": "summary_text", "text": reasoning}],
+            }
+        )
+    text = "".join(turn.text)
+    if text:
+        items.append(
+            {
+                "type": "message",
+                "id": f"msg_{uuid.uuid4().hex[:24]}",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+        )
+    for call in turn.tool_calls:
+        function = call.get("function") or {}
+        items.append(
+            {
+                "type": "function_call",
+                "id": f"fc_{uuid.uuid4().hex[:24]}",
+                "call_id": str(call.get("id") or ""),
+                "name": str(function.get("name") or ""),
+                "arguments": str(function.get("arguments") or ""),
+                "status": "completed",
+            }
+        )
+    return items
 
 
 def _responses_usage(usage: Usage) -> ResponseAPIUsage:

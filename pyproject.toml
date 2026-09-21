@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "litellm-mysubs"
-version = "0.1.3"
+version = "0.1.4"
 description = "Serve Claude Max, ChatGPT Plus/Codex and Google Antigravity subscriptions as OpenAI-compatible models through a LiteLLM proxy"
 readme = "README.md"
 license = "MIT"
