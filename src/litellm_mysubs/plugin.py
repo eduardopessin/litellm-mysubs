@@ -380,7 +380,11 @@ def bind_messages_route(router: Any) -> bool:
             served = await dispatch_messages(provider=declared, **kwargs)
             if served is not None:
                 return served
-            return await original(**kwargs)
+            # Claude Max declines translation because Messages is already its wire — but
+            # declining is not the same as needing no credential. The token still has to
+            # be injected, exactly as the chat route does before delegating, or the native
+            # client answers `Missing Anthropic API Key`.
+            return await original(**await _delegate_kwargs(kwargs, provider=declared))
 
         return _wrapped
 

@@ -1747,6 +1747,45 @@ class TestEveryDialectReachesEverySubscription:
         )
 
     @pytest.mark.asyncio
+    async def test_claude_max_still_gets_its_token(self) -> None:
+        """Declining to translate is not the same as needing no credential.
+
+        `dispatch_messages` returns `None` for Claude Max because Messages is already its
+        wire, and the first version stopped there — the native client then answered
+        `Missing Anthropic API Key`, measured on the live gateway. The token has to be
+        injected before delegating, exactly as the chat route does.
+        """
+        seen: list[dict[str, Any]] = []
+
+        async def original(**kwargs: Any) -> str:
+            seen.append(kwargs)
+            return "native"
+
+        install_transport(FakeTransport())
+        router = SimpleNamespace(
+            aanthropic_messages=original,
+            anthropic_messages=original,
+            model_list=[
+                {
+                    "model_name": "mysubs/claudecode/claude-opus-5",
+                    "litellm_params": {"model": "anthropic/claude-opus-5"},
+                    "model_info": {"mysubs_provider": "anthropic"},
+                }
+            ],
+        )
+        plugin.bind_messages_route(router)
+        try:
+            out = await router.aanthropic_messages(
+                model="mysubs/claudecode/claude-opus-5",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        finally:
+            plugin.unbind_messages_route()
+
+        assert out == "native", "the native path still answers it"
+        assert seen and seen[0].get("api_key"), "without a key the upstream returns 401"
+
+    @pytest.mark.asyncio
     async def test_the_system_prompt_is_not_lost(self) -> None:
         """Messages carries `system` at the top level, the canonical form as a message.
 
