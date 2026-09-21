@@ -1434,6 +1434,82 @@ class TestTheNonStreamingPathIsLogged:
         assert out.choices[0].message.content == "served"
 
 
+class TestTheResponsesRouteIsLogged:
+    """`/v1/responses` is a third path, and it had neither of the other two's logging.
+
+    `dispatch` covers chat both ways — `_wrap_stream` hands the streamed turn to
+    `CustomStreamWrapper`, which fires the handler at end of stream, and `_logged` covers
+    the non-streamed one. `dispatch_responses` returned its turn bare.
+
+    It is the path that matters most in practice: a client that discovers models through
+    LiteLLM routes every OpenAI-backed model here. Measured on the live gateway, an omp run
+    that exercised all five Codex models end to end left **no** Codex row at all, while
+    Anthropic and Gemini — which go through chat — logged 33 and 50.
+    """
+
+    Recorder = TestTheNonStreamingPathIsLogged.Recorder
+
+    @pytest.mark.asyncio
+    async def test_a_non_streamed_responses_turn_is_logged(self) -> None:
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+        log = self.Recorder("mysubs/codex/gpt-5.5")
+
+        await plugin.dispatch_responses(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            input="hi",
+            litellm_logging_obj=log,
+            **{plugin._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+
+        assert len(log.calls) == 1, "exactly one success event per turn"
+        assert log.calls[0]["model"] == "openai/gpt-5.5"
+        assert log.calls[0]["provider"] == "openai"
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_responses_turn_is_logged_once_at_the_end(self) -> None:
+        """The handler fires after the last event, not per event.
+
+        This is the shape omp actually sends: `stream: true` on the Responses route.
+        """
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+        log = self.Recorder("mysubs/codex/gpt-5.5")
+
+        stream = await plugin.dispatch_responses(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            input="hi",
+            stream=True,
+            litellm_logging_obj=log,
+            **{plugin._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+        events = [e async for e in stream]
+
+        assert events, "the stream still delivers its events"
+        assert len(log.calls) == 1, "one row per stream, fired at the end"
+        assert log.calls[0]["model"] == "openai/gpt-5.5"
+
+    @pytest.mark.asyncio
+    async def test_a_logging_failure_does_not_lose_the_stream(self) -> None:
+        """The subscription has already been charged; losing the answer is worse."""
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+
+        class Broken(self.Recorder):
+            async def async_success_handler(self, **_: Any) -> None:
+                raise RuntimeError("logging backend down")
+
+        stream = await plugin.dispatch_responses(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            input="hi",
+            stream=True,
+            litellm_logging_obj=Broken("mysubs/codex/gpt-5.5"),
+        )
+        events = [e async for e in stream]
+
+        assert events[-1].type == "response.completed"
+
+
 class TestTheResponsesRouteIsBoundPerRouter:
     """`Router.aresponses` is built per instance, so there is no class attribute to patch.
 

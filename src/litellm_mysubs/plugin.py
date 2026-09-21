@@ -1208,8 +1208,8 @@ async def dispatch_responses(*, provider: ProviderId | None = None, **kwargs: An
     if provider == "openai-codex" or (provider is None and codex.is_codex_model(model)):
         _stamp_logging_identity(model, kwargs)
         if kwargs.get("stream"):
-            return _codex_responses_stream(model, kwargs)
-        return await _codex_responses_turn(model, kwargs)
+            return _logged_stream(_codex_responses_stream(model, kwargs), kwargs)
+        return await _logged(_codex_responses_turn(model, kwargs), kwargs)
     return None
 
 
@@ -1310,15 +1310,17 @@ def _as_litellm_error(error: UpstreamError, model: str, kwargs: dict[str, Any]) 
     return error
 
 
-async def _logged(turn: Coroutine[Any, Any, ModelResponse], kwargs: dict[str, Any]) -> Any:
+async def _logged(turn: Coroutine[Any, Any, Any], kwargs: dict[str, Any]) -> Any:
     """Awaits a non-streaming turn and dispatches success logging for it.
 
-    Streaming already logs: `_wrap_stream` hands the response to `CustomStreamWrapper`,
-    which dispatches the success handler at end of stream. The non-streaming path returns a
-    bare ``ModelResponse`` straight out of `dispatch`, so it never reaches the `@client`
-    wrapper in ``litellm.utils`` that would normally call
-    ``logging_obj.async_success_handler`` — and a request that never logs produces **no**
-    spend row at all.
+    Chat streaming already logs: `_wrap_stream` hands the response to
+    `CustomStreamWrapper`, which dispatches the success handler at end of stream. A
+    non-streaming turn returns bare straight out of `dispatch` — a `ModelResponse` on the
+    chat route, a `ResponsesAPIResponse` on ``/v1/responses`` — so it never reaches the
+    `@client` wrapper in ``litellm.utils`` that would normally call
+    ``logging_obj.async_success_handler``, and a request that never logs produces **no**
+    spend row at all. Both routes are served here; the streamed Responses counterpart is
+    `_logged_stream`.
 
     Measured on a live gateway, two calls to the same model two seconds apart:
 
@@ -1342,6 +1344,39 @@ async def _logged(turn: Coroutine[Any, Any, ModelResponse], kwargs: dict[str, An
         now = datetime.datetime.now()
         await handler(result=response, start_time=now, end_time=now)
     return response
+
+
+async def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> AsyncIterator[Any]:
+    """Relays a Responses stream and dispatches success logging once it ends.
+
+    The chat route gets this for free: `_wrap_stream` hands the turn to
+    `CustomStreamWrapper`, which fires the handler itself at end of stream. The Responses
+    route emits its own event sequence and never touches that wrapper, so it produced **no**
+    spend row at all — the same accounting hole `_logged` closes for the non-streaming
+    path, on the path that matters most in practice: a client that discovers models
+    through LiteLLM routes every OpenAI-backed model here.
+
+    Measured on the live gateway: an omp run exercising all five Codex models end to end
+    left no Codex row, while Anthropic and Gemini — which go through chat — logged 33 and
+    50 rows over the same minutes.
+
+    The terminal event carries the turn: `response.completed` holds the usage the row needs,
+    so it is kept as the result rather than reassembled. Best effort by contract — a
+    logging failure must not truncate a stream the subscription has already paid for.
+    """
+    terminal: Any = None
+    async for event in events:
+        if getattr(event, "type", None) in ("response.completed", "response.incomplete"):
+            terminal = getattr(event, "response", None) or event
+        yield event
+
+    logging_obj = kwargs.get("litellm_logging_obj")
+    handler = getattr(logging_obj, "async_success_handler", None)
+    if handler is None:
+        return
+    with contextlib.suppress(Exception):
+        now = datetime.datetime.now()
+        await handler(result=terminal, start_time=now, end_time=now)
 
 
 def _cost_identity(model: str, kwargs: dict[str, Any]) -> tuple[str, str]:
