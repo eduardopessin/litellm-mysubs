@@ -724,23 +724,24 @@ async def _messages_events(
     envelope = messages.envelope(model)
     text_parts: list[str] = []
     tail: dict[str, Any] = {}
-    started = False
+
+    # Opened before the first chunk, not on it. `message_start` carries no content — it is
+    # the envelope, and a client reads the message id and the model from it. Holding it
+    # back until the model spoke made the route look slower than it is: measured against
+    # `/v1/responses`, which emits `response.created` immediately, 4003 ms to first event
+    # against 32 ms for the same prompt and ceiling.
+    yield state.start(envelope)
 
     async for chunk in chunks:
         _absorb_tail(tail, chunk)
         text = _chunk_text(chunk)
         if not text:
             continue
-        if not started:
-            started = True
-            yield state.start(envelope)
         for out in state.open_text():
             yield out
         text_parts.append(text)
         yield state.delta(text)
 
-    if not started:
-        yield state.start(envelope)
     for out in state.close_text():
         yield out
 
