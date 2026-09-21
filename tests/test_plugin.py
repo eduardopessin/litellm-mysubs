@@ -977,6 +977,35 @@ class TestStreamedCallsCarryACostableIdentity:
         """
         assert observability._cost_identity("gpt-5.5", {}) == ("gpt-5.5", "custom_openai")
 
+    @pytest.mark.parametrize(
+        ("wire", "expected"),
+        [
+            # Effort is part of the Antigravity model id and absent from the price map;
+            # the base name carries the rate. Measured on the live gateway: every Gemini
+            # row on all six routes read spend=0.0 while usage was recorded correctly.
+            ("gemini/gemini-3.6-flash-low", "gemini/gemini-3.6-flash"),
+            ("gemini/gemini-3.8-flash-high", "gemini/gemini-3.8-flash"),
+            ("gemini/gemini-3.6-flash-tiered", "gemini/gemini-3.6-flash"),
+            # Longest-first matching: `-low` must not eat the tail of `-extra-low`.
+            ("gemini/gemini-3.5-flash-extra-low", "gemini/gemini-3.5-flash"),
+            # A name the map already knows is never trimmed.
+            ("gemini/gemini-2.5-flash", "gemini/gemini-2.5-flash"),
+            # Trimming only applies when the base actually has a rate. `-agent` is a
+            # distinct deployment, not an effort of `gemini-3-flash`, and neither name is
+            # priced — repricing it against a sibling would invent a number.
+            ("gemini/gemini-3-flash-agent", "gemini/gemini-3-flash-agent"),
+            ("gemini/gemini-pro-agent", "gemini/gemini-pro-agent"),
+        ],
+    )
+    def test_an_effort_suffix_is_priced_against_the_base_model(
+        self, wire: str, expected: str
+    ) -> None:
+        """Effort changes the thinking budget, not the per-token rate."""
+        identity = observability._cost_identity(
+            "mysubs/antigravity/x", {observability._WIRE_MODEL_KEY: wire}
+        )
+        assert identity == (expected, "gemini")
+
     def test_the_wrapper_is_built_with_the_wire_identity(self) -> None:
         """What the wrapper is given is what the cost calculation sees."""
 

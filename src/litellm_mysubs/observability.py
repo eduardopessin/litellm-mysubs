@@ -358,12 +358,58 @@ def _cost_identity(model: str, kwargs: dict[str, Any]) -> tuple[str, str]:
     Without a deployment there is nothing to look up: a direct ``litellm.acompletion``
     call has no Router. The old pair is kept for that case rather than guessing a family
     from the name, because a wrong guess prices the call against another model's rate.
+
+    A third case is Antigravity, whose catalog names carry the **effort** as part of the
+    model id. Those names are not in the price map and the base name is::
+
+        gemini/gemini-3.6-flash-low   -> no rate
+        gemini/gemini-3.6-flash       -> in=7.5e-07 out=3.75e-06
+
+    Measured on the live gateway, every Gemini row across all six routes was logged at
+    ``0.0`` while usage was recorded correctly (62 prompt + 266 completion on one of
+    them). Effort changes the thinking budget, not the per-token rate, so the base name
+    is the right thing to price against. It recovers 21 of the 32 served models; the
+    other 11 (``chat_20706``, ``gemini-pro-agent``, ``gpt-oss-120b``, the ``tab_*``
+    previews, Claude-over-Antigravity) have no rate under any name and stay unpriced —
+    `_stamp_cost` leaves the field unset, which reads as "not priced" rather than free.
     """
     wire = str(kwargs.get(_WIRE_MODEL_KEY) or "")
     if not wire:
         return model, "custom_openai"
     family = wire.split("/", 1)[0] if "/" in wire else "openai"
-    return wire, family
+    return _priceable_name(wire), family
+
+
+#: Effort and routing suffixes Antigravity appends to a model id. Longest first: a plain
+#: ``-low`` must not eat the ``-extra-low`` that shares its ending.
+_EFFORT_SUFFIXES: Final = (
+    "-extra-low",
+    "-thinking",
+    "-minimal",
+    "-tiered",
+    "-medium",
+    "-agent",
+    "-xhigh",
+    "-high",
+    "-low",
+    "-max",
+)
+
+
+def _priceable_name(wire: str) -> str:
+    """``wire`` itself when the map knows it, else the name without its effort suffix.
+
+    Only falls back when the trimmed name actually has a rate: trimming blindly would
+    turn ``gemini-3-flash-agent`` into ``gemini-3-flash``, which has no rate either, and
+    would silently reprice a model that merely ends in a familiar word.
+    """
+    if wire in litellm.model_cost:
+        return wire
+    for suffix in _EFFORT_SUFFIXES:
+        if wire.endswith(suffix):
+            base = wire[: -len(suffix)]
+            return base if base in litellm.model_cost else wire
+    return wire
 
 
 def _stamp_logging_identity(model: str, kwargs: dict[str, Any]) -> None:
