@@ -1628,6 +1628,36 @@ class TestTheResponsesRouteIsLogged:
         assert log.calls[0]["usage"] is not None, "a row without usage cannot be priced"
 
     @pytest.mark.asyncio
+    async def test_the_router_recognises_the_stream_as_a_responses_iterator(self) -> None:
+        """`Router._aresponses_with_streaming_fallbacks` gates on the type::
+
+            if kwargs.get("stream") and isinstance(response, BaseResponsesAPIStreamingIterator):
+                return await self._aresponses_streaming_iterator(...)
+            return response
+
+        Anything else is handed back raw and never reaches the path that logs the turn.
+        Measured on the live gateway while this object was a plain async iterator: the
+        streamed turn answered correctly, logged nothing, and emitted no diagnostic of its
+        own because the code that would have logged was never reached.
+        """
+        from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
+
+        install_transport(FakeTransport(codex_responses_events(text="served")))
+
+        stream = await plugin.dispatch_responses(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            input="hi",
+            stream=True,
+            litellm_logging_obj=self.Recorder("mysubs/codex/gpt-5.5"),
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+
+        assert isinstance(stream, BaseResponsesAPIStreamingIterator), (
+            "the Router hands anything else back raw, unlogged"
+        )
+
+    @pytest.mark.asyncio
     async def test_the_stream_carries_the_finished_turn_on_itself(self) -> None:
         """The proxy reads the turn off the object, not off anything the stream yields.
 

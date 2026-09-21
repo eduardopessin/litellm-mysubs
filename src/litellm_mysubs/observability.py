@@ -25,6 +25,7 @@ from typing import Any, Final
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.litellm_core_utils.litellm_logging import Logging
+from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
 from litellm.types.utils import ModelResponseStream
 
 from .transport.client import RedeemRequired, RemapRequired, UpstreamError
@@ -168,23 +169,34 @@ def _stamp_cost(logging_obj: Any, response: Any, kwargs: dict[str, Any]) -> None
             response._hidden_params["response_cost"] = cost
 
 
-class _LoggedResponsesStream:
+class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
     """Relays a Responses stream, dispatches its spend row, and carries the turn.
 
-    A bare ``async_generator`` is not enough on this route, even though it streams
-    correctly. The proxy reads the finished turn off the **object** it was handed —
-    ``_extract_completed_responses_response`` does ``attribute_of(stream_response,
-    "completed_response")`` — rather than from anything the iteration yields. Measured on
-    the live gateway against the generator this class replaces::
+    Two separate things in LiteLLM have to recognise this object, and a bare
+    ``async_generator`` satisfies neither.
+
+    **The Router checks the type.** `_aresponses_with_streaming_fallbacks` ends with::
+
+        if kwargs.get("stream") and isinstance(response, BaseResponsesAPIStreamingIterator):
+            return await self._aresponses_streaming_iterator(...)
+        return response
+
+    Anything else is handed back raw and never reaches the path that logs the turn. That
+    is why subclassing is not cosmetic: the `isinstance` is the gate. ``__init__`` is not
+    called — the base wants an `httpx.Response` this object does not have and does not
+    need, since it relays events that are already parsed.
+
+    **The proxy reads the finished turn off the object**, not off anything the iteration
+    yields: `_extract_completed_responses_response` does ``attribute_of(stream_response,
+    "completed_response")``. The gateway said so about our own generator::
 
         15:18:35 WARNING common_request_processing.py:2814 - Container ownership
         recording skipped on streaming /v1/responses: no completed_response on
         stream iterator async_generator
 
-    ``async_generator`` in that line is ours. Same minute, same model, same key: the
-    streamed chat turn logged ``dur=3958 ttft=3794`` and the streamed Responses turn left
-    no row at all. So the attribute is the contract, and this class holds it while
-    remaining an async iterator — which is all `_is_streaming_response` requires.
+    Measured across those builds, same model and key: the streamed chat turn logged
+    ``dur=3958 ttft=3794``, the non-streamed Responses turn logged ``dur=1719``, and the
+    streamed Responses turn left no row at all.
 
     The row is dispatched **when the terminal event is seen**, not after iteration ends. A
     consumer that stops reading at ``response.completed`` closes the underlying generator,
@@ -196,6 +208,7 @@ class _LoggedResponsesStream:
     """
 
     def __init__(self, events: AsyncIterator[Any], kwargs: dict[str, Any]) -> None:
+        # Deliberately not calling `super().__init__`: see the class docstring.
         self._events = events
         self._kwargs = kwargs
         self._started = datetime.datetime.now()
