@@ -1382,6 +1382,7 @@ class TestTheNonStreamingPathIsLogged:
                     "model": self.model_call_details.get("model"),
                     "provider": self.model_call_details.get("custom_llm_provider"),
                     "usage": getattr(result, "usage", None),
+                    "cost": self.model_call_details.get("response_cost"),
                 }
             )
 
@@ -1402,6 +1403,39 @@ class TestTheNonStreamingPathIsLogged:
         assert log.calls[0]["model"] == "openai/gpt-5.5"
         assert log.calls[0]["provider"] == "openai"
         assert log.calls[0]["usage"] is not None, "a row without usage cannot be priced"
+
+    @pytest.mark.asyncio
+    async def test_the_row_carries_the_cost_of_the_turn(self) -> None:
+        """A logged row with no cost is a row the UI shows at zero.
+
+        `get_standard_logging_object_payload` reads the number from
+        `kwargs["response_cost"]`, which the `@client` wrapper in `litellm.utils` fills in
+        — and that wrapper is exactly what a served request never reaches. Measured on the
+        live gateway's own Logs tab: 49 of 50 rows at zero, including
+        `anthropic/claude-opus-5` turns of 123k tokens whose rate is in the map.
+
+        The identity fix was necessary but not sufficient: the row names the right model
+        and still bills nothing.
+        """
+        install_transport(
+            FakeTransport(
+                codex_events(
+                    text="served",
+                    usage={"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500},
+                )
+            )
+        )
+        log = self.Recorder("mysubs/codex/gpt-5.5")
+
+        await plugin.dispatch(
+            provider="openai-codex",
+            model="mysubs/codex/gpt-5.5",
+            messages=[{"role": "user", "content": "hi"}],
+            litellm_logging_obj=log,
+            **{observability._WIRE_MODEL_KEY: "openai/gpt-5.5"},
+        )
+
+        assert log.calls[0]["cost"], "the row has to carry what the turn cost"
 
     @pytest.mark.asyncio
     async def test_a_logging_failure_does_not_lose_the_response(self) -> None:

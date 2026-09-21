@@ -108,10 +108,51 @@ async def _logged(turn: Coroutine[Any, Any, Any], kwargs: dict[str, Any]) -> Any
     handler = getattr(logging_obj, "async_success_handler", None)
     if handler is None:
         return response
+    _stamp_cost(logging_obj, response, kwargs)
     with contextlib.suppress(Exception):
         now = datetime.datetime.now()
         await handler(result=response, start_time=now, end_time=now)
     return response
+
+
+def _stamp_cost(logging_obj: Any, response: Any, kwargs: dict[str, Any]) -> None:
+    """Prices the turn and records it where the spend row reads it from.
+
+    `get_standard_logging_object_payload` takes the number from
+    ``kwargs["response_cost"]``, which the `@client` wrapper in ``litellm.utils`` fills in
+    — and that wrapper is precisely what a request served here never reaches. Measured on
+    the live gateway's Logs tab: 49 of 50 rows at zero, `anthropic/claude-opus-5` turns of
+    123k tokens among them, whose rate is in the map.
+
+    So the identity fix was necessary and not sufficient: the row named the right model
+    and still billed nothing. `completion_cost` is asked under the **wire** identity, which
+    is what has a rate — the response keeps the public name the client asked for, and
+    `_select_model_name_for_cost_calc` prefers that name and prefixes the provider to it,
+    producing a key absent from the map. Pricing a copy sidesteps that.
+
+    A model with no rate leaves the cost unset rather than zero: `None` means "not priced"
+    to every consumer downstream, while a literal 0.0 asserts the turn was free.
+    """
+    details = getattr(logging_obj, "model_call_details", None)
+    if not isinstance(details, dict):
+        return
+    model = str(kwargs.get("model") or "")
+    cost_model, cost_provider = _cost_identity(model, kwargs)
+    if cost_model == model:
+        return
+    with contextlib.suppress(Exception):
+        priceable = response.model_copy()
+        priceable.model = cost_model
+        cost = float(
+            litellm.completion_cost(
+                completion_response=priceable,
+                model=cost_model,
+                custom_llm_provider=cost_provider,
+            )
+        )
+        if cost:
+            details["response_cost"] = cost
+            response._hidden_params["response_cost"] = cost
 
 
 async def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> AsyncIterator[Any]:
@@ -142,6 +183,8 @@ async def _logged_stream(events: AsyncIterator[Any], kwargs: dict[str, Any]) -> 
     handler = getattr(logging_obj, "async_success_handler", None)
     if handler is None:
         return
+    if terminal is not None:
+        _stamp_cost(logging_obj, terminal, kwargs)
     with contextlib.suppress(Exception):
         now = datetime.datetime.now()
         await handler(result=terminal, start_time=now, end_time=now)
