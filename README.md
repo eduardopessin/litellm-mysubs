@@ -25,6 +25,12 @@ LiteLLM side: the plugin, the UI, and the credential handling.
 > If you are looking for something to put in front of other people, use API keys. That is
 > what they are for, and every provider supports them in LiteLLM already.
 
+> **Related.** [tokengateway](https://github.com/eduardopessin/tokengateway) is the
+> broader project this came out of: an OAuth token manager, a quota dashboard and a
+> desktop app. Its LiteLLM plugin was a `sitecustomize.py` injected through
+> `PYTHONPATH`; this repository is that plugin, rebuilt as a normal package. Use this one
+> if all you want is subscriptions inside LiteLLM.
+
 ## The problem
 
 A subscription is not an API key, and the difference is not cosmetic:
