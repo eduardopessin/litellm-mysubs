@@ -42,6 +42,7 @@ import litellm.main
 from .credentials.store import ProviderId
 from .observability import (
     _WIRE_MODEL_KEY,
+    normalize_provider_response_model,
 )
 from .turns import (
     StreamError,
@@ -140,27 +141,35 @@ def wire_model_of_deployment(router: Any, model: str) -> str | None:
 # -- the three routes: see `routes.py` -----------------------------------------
 
 
-def _restore_aliases(response: Any, aliases: dict[str, str]) -> Any:
-    """Undo the fingerprint renaming on whatever the native path answered.
+def _adapt_native_response(response: Any, aliases: dict[str, str]) -> Any:
+    """Fix up what LiteLLM's own client answered, on its way back to the caller.
 
-    Anthropic has no branch in `dispatch`: the turn is served by LiteLLM's own client, so
-    the response never passes through this package's wire code and the renaming has to be
-    undone here. The model answers with the name it was given, and a client that declared
-    ``skills_list`` cannot dispatch a call to ``mcp__skills_list``.
+    Anthropic has no branch in `dispatch`: the turn is served natively, so the response
+    never passes through this package's wire code and two things have to be corrected
+    from here.
 
-    Streaming is wrapped rather than consumed: the chunks carry the name in the same
-    places, and materialising them here would defeat the point of streaming.
+    **Tool names.** The model answers with the name it was given, and a client that
+    declared ``skills_list`` cannot dispatch a call to ``mcp__skills_list``.
+
+    **Cost.** ``provider_response_model`` arrives as the dated build and is preferred
+    over ``response.model`` by the cost calculation, so a streamed turn is priced against
+    a name with no rate and logged free — see `normalize_provider_response_model`.
+    Unlike the renaming, this runs on every native turn, because there is nothing in the
+    request that predicts it.
+
+    Streaming is wrapped rather than consumed: the fields are in the same places on a
+    chunk, and materialising the stream here would defeat the point of streaming.
     """
-    if not aliases:
-        return response
     if hasattr(response, "__aiter__"):
 
-        async def renamed() -> Any:
+        async def adapted() -> Any:
             async for chunk in response:
-                yield anthropic.restore_tool_names(chunk, aliases)
+                normalize_provider_response_model(chunk)
+                yield anthropic.restore_tool_names(chunk, aliases) if aliases else chunk
 
-        return renamed()
-    return anthropic.restore_tool_names(response, aliases)
+        return adapted()
+    normalize_provider_response_model(response)
+    return anthropic.restore_tool_names(response, aliases) if aliases else response
 
 
 def _pop_aliases(kwargs: dict[str, Any]) -> dict[str, str]:
@@ -179,7 +188,7 @@ async def _wrapped_acompletion(*args: Any, **kwargs: Any) -> Any:
     kwargs.pop(_WIRE_MODEL_KEY, None)
     delegated = await _delegate_kwargs(kwargs)
     aliases = _pop_aliases(delegated)
-    return _restore_aliases(await original(**delegated), aliases)
+    return _adapt_native_response(await original(**delegated), aliases)
 
 
 def _wrapped_completion(*args: Any, **kwargs: Any) -> Any:
@@ -198,7 +207,7 @@ def _wrapped_completion(*args: Any, **kwargs: Any) -> Any:
     kwargs.pop(_WIRE_MODEL_KEY, None)
     delegated = _run_sync(_delegate_kwargs(kwargs))
     aliases = _pop_aliases(delegated)
-    return _restore_aliases(original(**delegated), aliases)
+    return _adapt_native_response(original(**delegated), aliases)
 
 
 def _run_sync(coroutine: Coroutine[Any, Any, Any]) -> Any:
@@ -321,7 +330,7 @@ async def _wrapped_router_acompletion(
     served = await original(
         self, model=model, messages=messages, stream=stream, **delegated
     )
-    return _restore_aliases(served, aliases)
+    return _adapt_native_response(served, aliases)
 
 
 def bind_responses_route(router: Any) -> bool:
@@ -444,7 +453,7 @@ def bind_messages_route(router: Any) -> bool:
                 kwargs, provider=declared, native_system=True
             )
             aliases = _pop_aliases(delegated)
-            return _restore_aliases(await original(**delegated), aliases)
+            return _adapt_native_response(await original(**delegated), aliases)
 
         return _wrapped
 

@@ -2467,3 +2467,133 @@ class TestEveryRouteRecordsAPriceableIdentity:
 
         assert log.model_call_details["model"] == "openai/gpt-5.5"
         assert log.model_call_details["custom_llm_provider"] == "openai"
+
+
+class TestTheDatedSlugDoesNotCostTheTurnItsPrice:
+    """Anthropic names the dated build in `message_start`, and since LiteLLM 134a4cd9fd
+    that name is preferred over `response.model` for pricing. The price map carries the
+    family (`claude-opus-5`) and not the build (`claude-opus-5-20250930`), so a streamed
+    turn was priced against a name with no rate and the spend row read zero.
+
+    Measured on litellm 1.101.0, same usage, one field apart::
+
+        provider_response_model=claude-opus-5-20250930  ->  0.0
+        provider_response_model=claude-opus-5           ->  0.00079
+        (field absent)                                  ->  0.00079
+
+    Non-streamed turns carry no such field, which is why only streaming lost the cost.
+    Upstream: BerriAI/litellm#42161.
+    """
+
+    @staticmethod
+    def _response(reported: str | None) -> Any:
+        from litellm.types.utils import Choices, Message, ModelResponse, Usage
+
+        response = ModelResponse(
+            model="anthropic/claude-opus-5",
+            choices=[Choices(message=Message(content="x"))],
+        )
+        response.usage = Usage(prompt_tokens=38, completion_tokens=24, total_tokens=62)
+        response._hidden_params = (
+            {} if reported is None else {"provider_response_model": reported}
+        )
+        return response
+
+    def test_the_dated_build_is_traded_for_the_name_that_has_a_rate(self) -> None:
+        response = self._response("claude-opus-5-20250930")
+        observability.normalize_provider_response_model(response)
+        assert response._hidden_params["provider_response_model"] == "claude-opus-5"
+
+    def test_the_turn_is_priced_again(self) -> None:
+        """The assertion that matters: not the name, the number on the row."""
+        from litellm.cost_calculator import completion_cost
+
+        response = self._response("claude-opus-5-20250930")
+        assert completion_cost(completion_response=response, custom_llm_provider="anthropic") == 0.0
+        observability.normalize_provider_response_model(response)
+        assert completion_cost(completion_response=response, custom_llm_provider="anthropic") > 0
+
+    def test_a_dated_name_that_has_its_own_rate_is_left_alone(self) -> None:
+        """`claude-haiku-4-5-20251001` is in the map under exactly that name. Trimming it
+        would reprice the turn against a different entry for no reason."""
+        response = self._response("claude-haiku-4-5-20251001")
+        observability.normalize_provider_response_model(response)
+        assert (
+            response._hidden_params["provider_response_model"]
+            == "claude-haiku-4-5-20251001"
+        )
+
+    def test_a_name_that_is_not_dated_is_left_alone(self) -> None:
+        """Only a trailing 8-digit date is trimmed: a build number or a size suffix must
+        not be mistaken for one."""
+        response = self._response("some-model-70b")
+        observability.normalize_provider_response_model(response)
+        assert response._hidden_params["provider_response_model"] == "some-model-70b"
+
+    def test_a_response_without_hidden_params_is_not_a_failure(self) -> None:
+        from litellm.types.utils import ModelResponse
+
+        observability.normalize_provider_response_model(ModelResponse(model="x"))
+
+
+class TestTheNativeResponseIsAdaptedOnBothPaths:
+    """Anthropic has no branch in `dispatch`, so the native response is the plugin's only
+    chance to correct the tool names and the cost identity. Streaming took the same fix
+    as non-streaming, because a chunk carries both fields in the same places.
+    """
+
+    @staticmethod
+    def _response(name: str = "mcp__skills_list") -> Any:
+        from litellm.types.utils import Choices, Message, ModelResponse
+
+        response = ModelResponse(
+            model="anthropic/claude-opus-5",
+            choices=[
+                Choices(
+                    message=Message(
+                        content=None,
+                        tool_calls=[
+                            {
+                                "id": "1",
+                                "type": "function",
+                                "function": {"name": name, "arguments": "{}"},
+                            }
+                        ],
+                    )
+                )
+            ],
+        )
+        response._hidden_params = {"provider_response_model": "claude-opus-5-20250930"}
+        return response
+
+    def test_a_non_streamed_turn_gets_both_corrections(self) -> None:
+        response = plugin._adapt_native_response(
+            self._response(), {"mcp__skills_list": "skills_list"}
+        )
+        assert response.choices[0].message.tool_calls[0].function.name == "skills_list"
+        assert response._hidden_params["provider_response_model"] == "claude-opus-5"
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_turn_gets_both_corrections(self) -> None:
+        async def chunks() -> Any:
+            yield self._response()
+
+        seen = [
+            chunk
+            async for chunk in plugin._adapt_native_response(
+                chunks(), {"mcp__skills_list": "skills_list"}
+            )
+        ]
+        assert seen[0].choices[0].message.tool_calls[0].function.name == "skills_list"
+        assert seen[0]._hidden_params["provider_response_model"] == "claude-opus-5"
+
+    @pytest.mark.asyncio
+    async def test_the_cost_is_corrected_even_with_no_tools_to_rename(self) -> None:
+        """The renaming is conditional on the request; the cost fix is not. Nothing in a
+        toolless request predicts that its price is about to be lost."""
+
+        async def chunks() -> Any:
+            yield self._response(name="read_file")
+
+        seen = [chunk async for chunk in plugin._adapt_native_response(chunks(), {})]
+        assert seen[0]._hidden_params["provider_response_model"] == "claude-opus-5"

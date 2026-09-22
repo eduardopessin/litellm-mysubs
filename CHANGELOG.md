@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-09-22
+
+### Fixed
+
+- **Streamed Claude turns are priced again.** The spend row for a streamed call read
+  `0.00000000` while the same prompt, unstreamed, was costed normally. Measured on the
+  live gateway, three pairs a second apart:
+
+  | streamed | prompt | completion | spend |
+  |---|---|---|---|
+  | no | 38 | 21 | 0.00071500 |
+  | yes | 38 | 24 | **0.00000000** |
+  | no | 38 | 24 | 0.00079000 |
+  | yes | 38 | 24 | **0.00000000** |
+
+  86 of the last 100 rows carrying tokens were at zero, including turns of 198k prompt
+  tokens.
+
+  The cause is upstream and needs no subscription to see
+  ([BerriAI/litellm#42161](https://github.com/BerriAI/litellm/issues/42161)). Anthropic
+  names the dated build in `message_start`, so a streamed turn arrives with
+  `provider_response_model = claude-opus-5-20250930`. Since LiteLLM `134a4cd9fd` the cost
+  calculation prefers that field over `response.model` — and the price map carries
+  `claude-opus-5`, not the dated build. Same usage, one field apart, on 1.101.0::
+
+      provider_response_model=claude-opus-5-20250930  ->  0.0
+      provider_response_model=claude-opus-5           ->  0.00079
+      (field absent)                                  ->  0.00079
+
+  Unstreamed turns carry no such field, fall through to `response.model` and price
+  correctly, which is why only streaming lost the money.
+
+  Anthropic has no branch in `dispatch` — it is served by LiteLLM's native client — so
+  the response on its way back through the wrapper is the only place this package can
+  correct it. The field is rewritten to the name that has a rate rather than dropped: it
+  is the provider's own answer about which build served the turn, and that belongs in the
+  log. A dated name that has a rate of its own (`claude-haiku-4-5-20251001`) is left
+  alone, and only a trailing 8-digit date is trimmed, so a build number or a size suffix
+  is never mistaken for one.
+
+  This is a workaround for a defect that is not ours, and it should come out when the
+  upstream fix lands. A deployment with an explicit `input_cost_per_token` in
+  `model_info` is unaffected either way: that sets `custom_pricing` and short-circuits
+  the preference.
+
 ## [0.1.7] - 2026-09-22
 
 ### Fixed
@@ -569,7 +614,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.4...v0.1.5
