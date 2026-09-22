@@ -399,9 +399,55 @@ def count_breakpoints(messages: list[Any]) -> int:
     return total
 
 
-def mark_breakpoint(message: dict[str, Any]) -> bool:
+def _client_marker_ttl(*sections: object) -> str | None:
+    """The ``ttl`` on markers the caller placed, or ``None`` when it placed none.
+
+    ``None`` is also what a marker without an explicit ``ttl`` means on the wire, and the
+    two cases are told apart by `client_uses_short_ttl`.
+    """
+    for section in sections:
+        for block in _marked_blocks(section):
+            ttl = block.get("cache_control", {}).get("ttl")
+            return ttl if isinstance(ttl, str) else None
+    return None
+
+
+def _marked_blocks(section: object) -> list[dict[str, Any]]:
+    if not isinstance(section, list):
+        return []
+    found: list[dict[str, Any]] = []
+    for item in section:
+        if not isinstance(item, dict):
+            continue
+        if isinstance(item.get("cache_control"), dict):
+            found.append(item)
+        for call in item.get("tool_calls") or ():
+            if isinstance(call, dict) and isinstance(call.get("cache_control"), dict):
+                found.append(call)
+        found.extend(_marked_blocks(item.get("content")))
+    return found
+
+
+def client_uses_short_ttl(*sections: object) -> bool:
+    """Whether the caller already marked the request with the base 5 min ttl.
+
+    Anthropic rejects a request where a ``1h`` marker comes after a ``5m`` one, in the
+    fixed order ``tools``, ``system``, ``messages``::
+
+        400 messages.1.content.0.cache_control.ttl: a ttl='1h' cache_control block must
+            not come after a ttl='5m' cache_control block
+
+    Claude Code marks its own prefix without an explicit ``ttl``, which is ``5m``, so
+    anchoring ours at the 1 h default behind it is a hard 400 and the turn never runs.
+    When the caller has already chosen, we follow its choice rather than its error.
+    """
+    marked = any(_marked_blocks(section) for section in sections)
+    return marked and _client_marker_ttl(*sections) is None
+
+
+def mark_breakpoint(message: dict[str, Any], ttl: str | None = LONG_CACHE_TTL) -> bool:
     """Mark the last non-reasoning anchor; give up if there is one already."""
-    control = cache_control()
+    control = cache_control(ttl)
     if message.get("role") == "tool" or message.get("tool_call_id"):
         if message.get("cache_control") is not None:
             return False
@@ -630,7 +676,9 @@ def count_head_breakpoints(system_blocks: list[Any] | None, tools: list[Any] | N
 
 
 # omp: providers/anthropic.ts :: applyHeadCaching
-def apply_head_cache(system_blocks: list[Any] | None, tools: list[Any] | None) -> int:
+def apply_head_cache(
+    system_blocks: list[Any] | None, tools: list[Any] | None, ttl: str | None = LONG_CACHE_TTL
+) -> int:
     """Anchor the stable head — last non-deferred tool and last stable system block.
 
     Returns how many markers ended up in the head. The order on the wire is tools ->
@@ -647,7 +695,7 @@ def apply_head_cache(system_blocks: list[Any] | None, tools: list[Any] | None) -
         for tool in reversed(tools):
             if not isinstance(tool, dict) or _is_deferred_tool(tool):
                 continue
-            tool["cache_control"] = cache_control()
+            tool["cache_control"] = cache_control(ttl)
             break
 
     if system_blocks:
@@ -658,7 +706,7 @@ def apply_head_cache(system_blocks: list[Any] | None, tools: list[Any] | None) -
             ):
                 last = system_blocks[-1]
                 if isinstance(last, dict):
-                    last["cache_control"] = cache_control()
+                    last["cache_control"] = cache_control(ttl)
         else:
             # With a volatile suffix the boundary marker goes in even if there is one
             # further back: otherwise the only system marker sits before the stable prompt
@@ -666,7 +714,7 @@ def apply_head_cache(system_blocks: list[Any] | None, tools: list[Any] | None) -
             anchor_index = len(system_blocks) - 1 if suffix_start == 0 else suffix_start - 1
             anchor = system_blocks[anchor_index]
             if isinstance(anchor, dict) and anchor.get("cache_control") is None:
-                anchor["cache_control"] = cache_control()
+                anchor["cache_control"] = cache_control(ttl)
 
     return count_head_breakpoints(system_blocks, tools)
 
@@ -695,11 +743,16 @@ def _decimation_indices(messages: list[Any], end: int) -> list[int]:
 
 # omp: providers/anthropic.ts :: applyPromptCaching
 # omp: providers/anthropic.ts :: cloneAnthropicCacheControl
-def apply_conversation_cache(messages: list[Any], head_breakpoints: int = 0) -> int:
+def apply_conversation_cache(
+    messages: list[Any], head_breakpoints: int = 0, ttl: str | None = LONG_CACHE_TTL
+) -> int:
     """Anchor the breakpoints in the messages. Mutates ``messages``.
 
     ``head_breakpoints`` is what `apply_head_cache` already spent on tools and system: it
     comes out of the budget because the ceiling of 4 is per request, not per section.
+
+    ``ttl`` follows the caller's own markers when it placed any; see
+    `client_uses_short_ttl` for why mixing the two is a 400.
     """
     anchors = [i for i, m in enumerate(messages) if is_markable(m)]
     if not anchors:
@@ -740,7 +793,7 @@ def apply_conversation_cache(messages: list[Any], head_breakpoints: int = 0) -> 
             message["tool_calls"] = [
                 dict(call) if isinstance(call, dict) else call for call in message["tool_calls"]
             ]
-        if mark_breakpoint(message):
+        if mark_breakpoint(message, ttl):
             messages[index] = message
             marked += 1
     return marked
@@ -988,8 +1041,9 @@ def build_request(
             blocks = [*blocks, {"type": "text", "text": existing}]
         kwargs["system"] = blocks
         tools = kwargs.get("tools")
-        head = apply_head_cache(blocks, tools if isinstance(tools, list) else None)
-        apply_conversation_cache(rest, head)
+        ttl = None if client_uses_short_ttl(tools, blocks, rest) else LONG_CACHE_TTL
+        head = apply_head_cache(blocks, tools if isinstance(tools, list) else None, ttl)
+        apply_conversation_cache(rest, head, ttl)
         kwargs["messages"] = rest
         return kwargs
 
@@ -999,7 +1053,8 @@ def build_request(
     # The head is anchored first so that the messages budget already discounts what it
     # spent: the ceiling of 4 is per request, and a fifth marker gives 400.
     tools = kwargs.get("tools")
-    head = apply_head_cache(system_blocks, tools if isinstance(tools, list) else None)
-    apply_conversation_cache(rest, head)
+    ttl = None if client_uses_short_ttl(tools, system_blocks, rest) else LONG_CACHE_TTL
+    head = apply_head_cache(system_blocks, tools if isinstance(tools, list) else None, ttl)
+    apply_conversation_cache(rest, head, ttl)
     kwargs["messages"] = [identity, *rest]
     return kwargs
