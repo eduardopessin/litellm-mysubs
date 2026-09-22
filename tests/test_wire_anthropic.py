@@ -7,7 +7,7 @@ rather than a description of the implementation.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -456,3 +456,166 @@ class TestBuildRequest:
         """With no token, whatever the caller set is not erased."""
         out = ant.build_request({"messages": [], "api_key": "existente"}, "claude-opus-5")
         assert out["api_key"] == "existente"
+
+
+class TestFingerprintTools:
+    """The subscription answers 400 "You're out of extra usage" to a request that declares
+    `skill_manage`, `skill_view` and `skills_list` together — with credit on the account,
+    and the same request passing once one of them is renamed.
+
+    Measured on the live gateway against `claude-opus-5`: 25 client tools untouched gave
+    400; the same 25 minus the trio gave 200; the trio alone gave 400; any two of the three
+    gave 200; the 25 with the trio under `mcp__` gave 200. Padding the set back to the same
+    byte count without the trio still passed, so it is the names and not the size.
+    """
+
+    @staticmethod
+    def _tool(name: str) -> dict[str, Any]:
+        return {"type": "function", "function": {"name": name, "parameters": {}}}
+
+    def _trio(self) -> list[dict[str, Any]]:
+        return [self._tool(n) for n in ("skill_manage", "skill_view", "skills_list")]
+
+    def test_the_trio_travels_under_the_mcp_namespace(self) -> None:
+        kwargs: dict[str, Any] = {"tools": self._trio()}
+        ant.apply_tool_aliases(kwargs)
+        assert [t["function"]["name"] for t in kwargs["tools"]] == [
+            "mcp__skill_manage",
+            "mcp__skill_view",
+            "mcp__skills_list",
+        ]
+
+    @pytest.mark.parametrize(
+        "names",
+        [("skill_manage", "skill_view"), ("skill_view", "skills_list"), ("skills_list",)],
+    )
+    def test_a_subset_is_left_alone(self, names: tuple[str, ...]) -> None:
+        """Two of the three pass upstream, so renaming them buys nothing and only risks
+        breaking a client that declared them deliberately."""
+        kwargs: dict[str, Any] = {"tools": [self._tool(n) for n in names]}
+        assert ant.apply_tool_aliases(kwargs) == {}
+        assert [t["function"]["name"] for t in kwargs["tools"]] == list(names)
+
+    def test_other_tools_keep_their_names(self) -> None:
+        kwargs: dict[str, Any] = {"tools": [*self._trio(), self._tool("read_file")]}
+        ant.apply_tool_aliases(kwargs)
+        assert kwargs["tools"][-1]["function"]["name"] == "read_file"
+
+    def test_a_name_already_taken_is_not_claimed_twice(self) -> None:
+        """Two identical tool names in one request is a hard 400 — worse than the
+        fingerprint this avoids."""
+        kwargs: dict[str, Any] = {
+            "tools": [*self._trio(), self._tool("mcp__skills_list")],
+        }
+        aliases = ant.apply_tool_aliases(kwargs)
+        assert "mcp__skills_list" not in aliases
+        names = [t["function"]["name"] for t in kwargs["tools"]]
+        assert names.count("mcp__skills_list") == 1
+
+    def test_tool_choice_follows_the_rename(self) -> None:
+        """Renaming the tools and leaving the choice behind names a tool the request no
+        longer declares: 400 Tool 'skills_list' not found in provided tools."""
+        kwargs: dict[str, Any] = {
+            "tools": self._trio(),
+            "tool_choice": {"type": "function", "function": {"name": "skills_list"}},
+        }
+        ant.apply_tool_aliases(kwargs)
+        assert kwargs["tool_choice"]["function"]["name"] == "mcp__skills_list"
+
+    def test_tool_choice_in_the_anthropic_spelling_follows_too(self) -> None:
+        kwargs: dict[str, Any] = {
+            "tools": self._trio(),
+            "tool_choice": {"type": "tool", "name": "skill_view"},
+        }
+        ant.apply_tool_aliases(kwargs)
+        assert kwargs["tool_choice"]["name"] == "mcp__skill_view"
+
+    @pytest.mark.parametrize("choice", ["auto", "none", "required"])
+    def test_a_tool_choice_that_names_nothing_is_untouched(self, choice: str) -> None:
+        kwargs: dict[str, Any] = {"tools": self._trio(), "tool_choice": choice}
+        ant.apply_tool_aliases(kwargs)
+        assert kwargs["tool_choice"] == choice
+
+    def test_build_request_leaves_the_map_for_its_caller(self) -> None:
+        kwargs = ant.build_request(
+            {"messages": [], "tools": self._trio()}, "claude-opus-5"
+        )
+        assert kwargs[ant.TOOL_ALIAS_KEY] == {
+            "mcp__skill_manage": "skill_manage",
+            "mcp__skill_view": "skill_view",
+            "mcp__skills_list": "skills_list",
+        }
+
+    def test_a_request_without_the_trio_carries_no_map(self) -> None:
+        """An empty map on every ordinary request would be a kwarg the upstream never
+        asked for."""
+        kwargs = ant.build_request(
+            {"messages": [], "tools": [self._tool("read_file")]}, "claude-opus-5"
+        )
+        assert ant.TOOL_ALIAS_KEY not in kwargs
+
+    def test_a_non_claude_model_is_not_touched(self) -> None:
+        kwargs = ant.build_request({"messages": [], "tools": self._trio()}, "gpt-5.5")
+        assert [t["function"]["name"] for t in kwargs["tools"]] == [
+            "skill_manage",
+            "skill_view",
+            "skills_list",
+        ]
+
+
+class TestRestoreToolNames:
+    """The model answers with the name it was given. A client that declared `skills_list`
+    cannot dispatch a call to `mcp__skills_list`, so the map has to be undone before the
+    response leaves.
+    """
+
+    ALIASES: ClassVar[dict[str, str]] = {
+        "mcp__skills_list": "skills_list",
+        "mcp__skill_view": "skill_view",
+    }
+
+    class _Node:
+        """Stands in for the pydantic models LiteLLM's native client answers with."""
+
+        def __init__(self, **fields: Any) -> None:
+            for key, value in fields.items():
+                setattr(self, key, value)
+
+    def test_a_pydantic_response_is_mapped_back(self) -> None:
+        """The chat path answers with `ModelResponse`, not a dict: reading only mappings
+        left the alias in place on the one route LiteLLM's own client serves."""
+        node = self._Node
+        response = node(
+            choices=[node(message=node(tool_calls=[node(function=node(name="mcp__skills_list"))]))]
+        )
+        ant.restore_tool_names(response, self.ALIASES)
+        assert response.choices[0].message.tool_calls[0].function.name == "skills_list"
+
+    def test_a_streaming_chunk_is_mapped_back(self) -> None:
+        """A chunk nests the call under `delta` rather than `message`."""
+        node = self._Node
+        chunk = node(
+            choices=[node(delta=node(tool_calls=[node(function=node(name="mcp__skill_view"))]))]
+        )
+        ant.restore_tool_names(chunk, self.ALIASES)
+        assert chunk.choices[0].delta.tool_calls[0].function.name == "skill_view"
+
+    def test_a_messages_tool_use_block_is_mapped_back(self) -> None:
+        """`/v1/messages` answers with dicts and puts the call in a top-level block."""
+        payload = {
+            "content": [
+                {"type": "text", "text": "x"},
+                {"type": "tool_use", "name": "mcp__skills_list"},
+            ]
+        }
+        ant.restore_tool_names(payload, self.ALIASES)
+        assert payload["content"][1]["name"] == "skills_list"
+
+    def test_a_name_that_was_never_aliased_is_left_alone(self) -> None:
+        payload = {"choices": [{"message": {"tool_calls": [{"function": {"name": "read_file"}}]}}]}
+        ant.restore_tool_names(payload, self.ALIASES)
+        assert payload["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "read_file"
+
+    def test_no_aliases_is_a_no_op(self) -> None:
+        payload = {"name": "mcp__skills_list"}
+        assert ant.restore_tool_names(payload, {})["name"] == "mcp__skills_list"

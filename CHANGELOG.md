@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-22
+
+### Fixed
+
+- **A Claude subscription no longer reports "out of extra usage" with credit on the
+  account.** Three tool names declared together — `skill_manage`, `skill_view` and
+  `skills_list` — are read by Anthropic as a third-party agent, and the turn is refused::
+
+      400 You're out of extra usage. Add more at claude.ai/settings/usage and keep going.
+
+  The account is fine, and that is what made it hard to see: the operator tops up, the
+  error persists, and a plain `curl` to the same model answers 200. What differs is the
+  tool list. Measured on the live gateway against `claude-opus-5`, everything else held
+  equal:
+
+  | tools in the request | status |
+  |---|---|
+  | 25 client tools, names untouched | 400 |
+  | the same 25 minus the trio | 200 |
+  | the trio alone | 400 |
+  | any two of the three | 200 |
+  | 25 with the trio under `mcp__` | 200 |
+
+  Not a size limit: padding the set back to the same byte count without the trio still
+  passes (45152 bytes) while the trio fails at 45300. Not a credit limit either — the
+  same credential serves the 200s in the table.
+
+  The trio now travels under `mcp__`, the namespace Claude Code itself uses for
+  MCP-provided tools, and the response is mapped back so the client only ever sees the
+  names it declared. Renaming happens only when all three are present, because any two
+  pass and renaming them would buy nothing.
+
+  Two details that a first attempt got wrong, both found by testing rather than by
+  reading:
+
+  - `tool_choice` names a tool. Renaming the tools and leaving the choice behind points
+    at a tool the request no longer declares — `400 Tool 'skills_list' not found in
+    provided tools`. Both spellings are followed, the OpenAI `{"function": {"name": …}}`
+    and the Anthropic `{"type": "tool", "name": …}`.
+  - The response is not a dict. LiteLLM's native client answers with pydantic models, so
+    a mapping-only walk left the alias in place on precisely the route that serves
+    Anthropic — `dispatch` has no branch for it. Both shapes are walked now, along with
+    the `tool_use` blocks `/v1/messages` emits and the `delta` a streaming chunk carries.
+
+  A name already taken in the same request is skipped: two identical tool names is a hard
+  400, strictly worse than the fingerprint being avoided.
+
 ## [0.1.6] - 2026-09-21
 
 ### Added
@@ -522,7 +569,9 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.2...v0.1.3

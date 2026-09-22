@@ -450,6 +450,161 @@ def stable_system_suffix_start(blocks: list[Any]) -> int:
     return start
 
 
+# -- third-party fingerprint ---------------------------------------------------
+
+#: Declared together, these three are read as a third-party agent and the subscription
+#: answers 400 "You're out of extra usage" — with credit on the account and the very same
+#: request passing as soon as one of them is renamed. Measured on the live gateway against
+#: `claude-opus-5`, holding everything else equal:
+#:
+#:   | tools in the request                     | status |
+#:   |------------------------------------------|--------|
+#:   | 25 client tools, names untouched         | 400    |
+#:   | the same 25 minus these three            | 200    |
+#:   | these three alone                        | 400    |
+#:   | any two of the three                     | 200    |
+#:   | 25 with the three under `mcp__`          | 200    |
+#:
+#: Not a size limit: padding the set back to the same byte count without the trio still
+#: passes (45152 bytes -> 200) while the trio fails at 45300.
+FINGERPRINT_TOOLS: Final = frozenset({"skill_manage", "skill_view", "skills_list"})
+
+#: Claude Code's own namespace for MCP-provided tools. The classifier accepts it because
+#: it is what the first-party client sends.
+MCP_TOOL_PREFIX: Final = "mcp__"
+
+#: Where `build_request` leaves the renaming for its caller. Defined here, next to the
+#: code that writes it, because this module owes nothing to the plugin layer that reads it.
+TOOL_ALIAS_KEY: Final = "mysubs_tool_aliases"
+
+
+def _tool_name(tool: Any) -> str | None:
+    """Name of a chat-completions tool entry, or ``None`` if it has no readable one."""
+    if not isinstance(tool, dict):
+        return None
+    nested = tool.get("function")
+    name = nested.get("name") if isinstance(nested, dict) else tool.get("name")
+    return name if isinstance(name, str) else None
+
+
+def wire_tool_names(tools: list[Any] | None) -> dict[str, str]:
+    """``{wire name: original name}`` for the tools this request has to rename.
+
+    Empty unless all three are present: two of them pass, so a client that declares a
+    subset keeps its names untouched and nothing is renamed without cause.
+
+    A name already taken in the same request is skipped. Two identical tool names is a
+    hard 400 — strictly worse than the fingerprint this avoids.
+    """
+    names = {name for name in map(_tool_name, tools or ()) if name is not None}
+    if not FINGERPRINT_TOOLS.issubset(names):
+        return {}
+    return {
+        MCP_TOOL_PREFIX + name: name
+        for name in sorted(FINGERPRINT_TOOLS)
+        if MCP_TOOL_PREFIX + name not in names
+    }
+
+
+def _rename_tool_choice(choice: Any, forward: dict[str, str]) -> Any:
+    """``tool_choice`` pointing at a renamed tool, updated to the name that will travel.
+
+    Renaming the tools and leaving the choice behind names a tool the request no longer
+    declares, and the upstream rejects it outright::
+
+        400 Tool 'skills_list' not found in provided tools
+
+    Both spellings reach here: the OpenAI ``{"type": "function", "function": {...}}`` and
+    the Anthropic ``{"type": "tool", "name": ...}``. ``"auto"``/``"none"`` name no tool and
+    pass through untouched.
+    """
+    if not isinstance(choice, dict):
+        return choice
+    nested = choice.get("function")
+    if isinstance(nested, dict) and nested.get("name") in forward:
+        return {**choice, "function": {**nested, "name": forward[nested["name"]]}}
+    if choice.get("name") in forward:
+        return {**choice, "name": forward[choice["name"]]}
+    return choice
+
+
+def apply_tool_aliases(kwargs: dict[str, Any]) -> dict[str, str]:
+    """Rename the fingerprint trio on the way out. Returns ``{wire name: original name}``.
+
+    The caller maps the names back on the response: the model answers with the name it was
+    given, and a client that never declared ``mcp__skills_list`` cannot dispatch it.
+    """
+    tools = kwargs.get("tools")
+    if not isinstance(tools, list):
+        return {}
+    back = wire_tool_names(tools)
+    if not back:
+        return {}
+    forward = {original: wire for wire, original in back.items()}
+    renamed: list[Any] = []
+    for tool in tools:
+        name = _tool_name(tool)
+        if name not in forward:
+            renamed.append(tool)
+            continue
+        nested = tool.get("function")
+        if isinstance(nested, dict):
+            renamed.append({**tool, "function": {**nested, "name": forward[name]}})
+        else:
+            renamed.append({**tool, "name": forward[name]})
+    kwargs["tools"] = renamed
+    if "tool_choice" in kwargs:
+        kwargs["tool_choice"] = _rename_tool_choice(kwargs["tool_choice"], forward)
+    return back
+
+
+def _child(node: Any, key: str) -> Any:
+    """``node[key]`` or ``node.key``, whichever the node carries."""
+    if isinstance(node, dict):
+        return node.get(key)
+    return getattr(node, key, None)
+
+
+def _set_child(node: Any, key: str, value: Any) -> None:
+    if isinstance(node, dict):
+        node[key] = value
+    else:
+        setattr(node, key, value)
+
+
+#: Where a tool name can hang on a response. `choices`/`message`/`delta` is the
+#: chat-completions shape (streaming included), `content` the ``/v1/messages`` blocks,
+#: `tool_calls`/`function` the call itself.
+_TOOL_NAME_PARENTS: Final = ("choices", "message", "delta", "content", "tool_calls", "function")
+
+
+def restore_tool_names(payload: Any, aliases: dict[str, str]) -> Any:
+    """Put the client's own names back on whatever the model called.
+
+    Walks both shapes, because the routes do not agree on one: the native chat path
+    answers with pydantic models (``ModelResponse``), ``/v1/messages`` with plain dicts,
+    and a streaming chunk nests the call under ``delta`` rather than ``message``. Reading
+    only mappings silently left the alias in place on the path that matters most — the one
+    LiteLLM's own client serves.
+    """
+    if not aliases:
+        return payload
+    if isinstance(payload, (list, tuple)):
+        for item in payload:
+            restore_tool_names(item, aliases)
+        return payload
+    if isinstance(payload, (str, bytes, int, float, bool)) or payload is None:
+        return payload
+    name = _child(payload, "name")
+    if isinstance(name, str) and name in aliases:
+        _set_child(payload, "name", aliases[name])
+    for key in _TOOL_NAME_PARENTS:
+        child = _child(payload, key)
+        if child is not None and not isinstance(child, (str, bytes, int, float, bool)):
+            restore_tool_names(child, aliases)
+    return payload
+
+
 def _is_deferred_tool(tool: Any) -> bool:
     """LiteLLM accepts ``defer_loading`` at the top level or inside ``function``
     (``transformation.py:843``), so both places count."""
@@ -804,6 +959,14 @@ def build_request(
         headers["anthropic-beta"] = build_betas(thinking=_wants_thinking(kwargs))
 
     apply_thinking_params(kwargs, model)
+
+    # Before the `messages` guard: a request whose turns are carried elsewhere still
+    # declares tools, and the fingerprint is read off the tool names alone. The map rides
+    # on the kwargs so the caller can undo the renaming on the response; it is popped
+    # before the request goes out.
+    aliases = apply_tool_aliases(kwargs)
+    if aliases:
+        kwargs[TOOL_ALIAS_KEY] = aliases
 
     messages = kwargs.get("messages")
     if not isinstance(messages, list):

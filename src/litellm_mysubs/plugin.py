@@ -140,6 +140,35 @@ def wire_model_of_deployment(router: Any, model: str) -> str | None:
 # -- the three routes: see `routes.py` -----------------------------------------
 
 
+def _restore_aliases(response: Any, aliases: dict[str, str]) -> Any:
+    """Undo the fingerprint renaming on whatever the native path answered.
+
+    Anthropic has no branch in `dispatch`: the turn is served by LiteLLM's own client, so
+    the response never passes through this package's wire code and the renaming has to be
+    undone here. The model answers with the name it was given, and a client that declared
+    ``skills_list`` cannot dispatch a call to ``mcp__skills_list``.
+
+    Streaming is wrapped rather than consumed: the chunks carry the name in the same
+    places, and materialising them here would defeat the point of streaming.
+    """
+    if not aliases:
+        return response
+    if hasattr(response, "__aiter__"):
+
+        async def renamed() -> Any:
+            async for chunk in response:
+                yield anthropic.restore_tool_names(chunk, aliases)
+
+        return renamed()
+    return anthropic.restore_tool_names(response, aliases)
+
+
+def _pop_aliases(kwargs: dict[str, Any]) -> dict[str, str]:
+    """Take the alias map out of the kwargs so it never reaches the upstream."""
+    aliases = kwargs.pop(anthropic.TOOL_ALIAS_KEY, None)
+    return aliases if isinstance(aliases, dict) else {}
+
+
 async def _wrapped_acompletion(*args: Any, **kwargs: Any) -> Any:
     kwargs = _normalize(args, kwargs)
     served = await dispatch(**kwargs)
@@ -148,7 +177,9 @@ async def _wrapped_acompletion(*args: Any, **kwargs: Any) -> Any:
     original = _state.original_acompletion
     assert original is not None
     kwargs.pop(_WIRE_MODEL_KEY, None)
-    return await original(**await _delegate_kwargs(kwargs))
+    delegated = await _delegate_kwargs(kwargs)
+    aliases = _pop_aliases(delegated)
+    return _restore_aliases(await original(**delegated), aliases)
 
 
 def _wrapped_completion(*args: Any, **kwargs: Any) -> Any:
@@ -165,7 +196,9 @@ def _wrapped_completion(*args: Any, **kwargs: Any) -> Any:
     original = _state.original_completion
     assert original is not None
     kwargs.pop(_WIRE_MODEL_KEY, None)
-    return original(**_run_sync(_delegate_kwargs(kwargs)))
+    delegated = _run_sync(_delegate_kwargs(kwargs))
+    aliases = _pop_aliases(delegated)
+    return _restore_aliases(original(**delegated), aliases)
 
 
 def _run_sync(coroutine: Coroutine[Any, Any, Any]) -> Any:
@@ -284,7 +317,11 @@ async def _wrapped_router_acompletion(
     delegated.pop("model", None)
     delegated.pop("messages", None)
     delegated.pop(_WIRE_MODEL_KEY, None)
-    return await original(self, model=model, messages=messages, stream=stream, **delegated)
+    aliases = _pop_aliases(delegated)
+    served = await original(
+        self, model=model, messages=messages, stream=stream, **delegated
+    )
+    return _restore_aliases(served, aliases)
 
 
 def bind_responses_route(router: Any) -> bool:
@@ -406,7 +443,8 @@ def bind_messages_route(router: Any) -> bool:
             delegated = await _delegate_kwargs(
                 kwargs, provider=declared, native_system=True
             )
-            return await original(**delegated)
+            aliases = _pop_aliases(delegated)
+            return _restore_aliases(await original(**delegated), aliases)
 
         return _wrapped
 
