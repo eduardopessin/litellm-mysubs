@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-22
+
+### Fixed
+
+- **0.1.8 did not actually fix the streamed spend.** The rollout went out, the row still
+  read `0.00000000`, and the mistake was in where the correction was applied rather than
+  in the diagnosis.
+
+  0.1.8 re-wrapped the stream in an async generator and rewrote the chunks it yielded.
+  Two things wrong with that. The cost is computed **inside** `CustomStreamWrapper`, from
+  `self._provider_response_model`, which `chunk_creator` reads off the raw chunk before
+  anything downstream sees it — so rewriting what comes out changes nothing. And the
+  proxy needs the wrapper object itself, because it reads the finished turn off it; a
+  generator in its place loses that interface.
+
+  The wrapper is now corrected in place and handed back as itself, with `chunk_creator`
+  wrapped — the one place every chunk passes through. Verified against a real
+  `CustomStreamWrapper` rather than a stand-in, which is what the new tests do: with
+  0.1.8's shape restored, five of them fail.
+
 ## [0.1.8] - 2026-09-22
 
 ### Fixed
@@ -614,7 +634,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.5...v0.1.6

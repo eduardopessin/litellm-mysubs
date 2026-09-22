@@ -43,6 +43,7 @@ from .credentials.store import ProviderId
 from .observability import (
     _WIRE_MODEL_KEY,
     normalize_provider_response_model,
+    priceable_provider_model,
 )
 from .turns import (
     StreamError,
@@ -152,24 +153,47 @@ def _adapt_native_response(response: Any, aliases: dict[str, str]) -> Any:
     declared ``skills_list`` cannot dispatch a call to ``mcp__skills_list``.
 
     **Cost.** ``provider_response_model`` arrives as the dated build and is preferred
-    over ``response.model`` by the cost calculation, so a streamed turn is priced against
-    a name with no rate and logged free — see `normalize_provider_response_model`.
-    Unlike the renaming, this runs on every native turn, because there is nothing in the
-    request that predicts it.
+    over ``response.model`` by the cost calculation, so the turn is priced against a name
+    with no rate and logged free — see `normalize_provider_response_model`. Unlike the
+    renaming, this runs on every native turn, because nothing in the request predicts it.
 
-    Streaming is wrapped rather than consumed: the fields are in the same places on a
-    chunk, and materialising the stream here would defeat the point of streaming.
+    A streamed turn is **not** re-wrapped in a generator. The proxy needs the
+    ``CustomStreamWrapper`` itself — it reads the finished turn off the object — and the
+    cost is computed inside it, from ``self._provider_response_model``, which
+    ``chunk_creator`` takes from the raw chunk before anything downstream sees it.
+    Rewriting the chunks we yield therefore fixes nothing: measured on the gateway, the
+    spend row still read ``0.00000000``. The attribute is corrected in place instead, and
+    the tool names are mapped back by wrapping ``chunk_creator``, which is the one place
+    every chunk passes through.
     """
-    if hasattr(response, "__aiter__"):
+    if not hasattr(response, "chunk_creator"):
+        normalize_provider_response_model(response)
+        return anthropic.restore_tool_names(response, aliases) if aliases else response
 
-        async def adapted() -> Any:
-            async for chunk in response:
-                normalize_provider_response_model(chunk)
-                yield anthropic.restore_tool_names(chunk, aliases) if aliases else chunk
+    original = response.chunk_creator
 
-        return adapted()
-    normalize_provider_response_model(response)
-    return anthropic.restore_tool_names(response, aliases) if aliases else response
+    def chunk_creator(chunk: Any) -> Any:
+        built = original(chunk)
+        _normalize_wrapper_model(response)
+        return anthropic.restore_tool_names(built, aliases) if aliases else built
+
+    response.chunk_creator = chunk_creator
+    return response
+
+
+def _normalize_wrapper_model(wrapper: Any) -> None:
+    """Point the wrapper's remembered provider model at a name that has a rate.
+
+    ``CustomStreamWrapper`` keeps the last model any chunk reported and hands it to the
+    cost calculation at end of stream. For Anthropic that is the dated build, which the
+    price map does not carry.
+    """
+    reported = getattr(wrapper, "_provider_response_model", None)
+    if not isinstance(reported, str):
+        return
+    priced = priceable_provider_model(reported)
+    if priced != reported:
+        wrapper._provider_response_model = priced
 
 
 def _pop_aliases(kwargs: dict[str, Any]) -> dict[str, str]:
