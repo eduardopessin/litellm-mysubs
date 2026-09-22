@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Coroutine, Mapping
@@ -532,53 +531,6 @@ def _priceable_name(wire: str) -> str:
             base = wire[: -len(suffix)]
             return base if base in litellm.model_cost else wire
     return wire
-
-
-#: A trailing 8-digit date, as Anthropic reports it on the wire
-#: (``claude-opus-5-20250930``). Only that shape is trimmed: a build number or a size
-#: suffix must not be mistaken for a date.
-_DATED_SLUG: Final = re.compile(r"-\d{8}$")
-
-
-def priceable_provider_model(reported: str) -> str:
-    """``reported`` itself when the price map carries it, else the undated name.
-
-    Anthropic's ``message_start`` names the dated build, so a turn is reported as
-    ``claude-opus-5-20250930`` while the map carries ``claude-opus-5``. Since 134a4cd9fd
-    `_select_model_name_for_cost_calc` prefers the reported name over ``response.model``,
-    so that is what gets priced — and it has no rate. Measured on litellm 1.101.0, same
-    usage, one field apart::
-
-        provider_response_model=claude-opus-5-20250930  ->  0.0
-        provider_response_model=claude-opus-5           ->  0.00079
-        (field absent)                                  ->  0.00079
-
-    Non-streamed turns carry no such field, fall through to ``response.model`` and price
-    correctly — which is why only streaming was logged free. Upstream:
-    BerriAI/litellm#42161.
-
-    A dated name that has a rate of its own (``claude-haiku-4-5-20251001``) is returned
-    unchanged: trimming it would reprice the turn against a different entry for no reason.
-    """
-    if reported in litellm.model_cost:
-        return reported
-    undated = _DATED_SLUG.sub("", reported)
-    return undated if undated != reported and undated in litellm.model_cost else reported
-
-
-def normalize_provider_response_model(response: Any) -> Any:
-    """Point a response's ``provider_response_model`` at a name that has a rate.
-
-    The field is rewritten rather than dropped: it is the provider's own answer about
-    which build served the turn, and that is worth keeping in the log.
-    """
-    hidden = getattr(response, "_hidden_params", None)
-    if not isinstance(hidden, dict):
-        return response
-    reported = hidden.get("provider_response_model")
-    if isinstance(reported, str):
-        hidden["provider_response_model"] = priceable_provider_model(reported)
-    return response
 
 
 def _stamp_logging_identity(model: str, kwargs: dict[str, Any]) -> None:

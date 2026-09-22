@@ -2469,90 +2469,20 @@ class TestEveryRouteRecordsAPriceableIdentity:
         assert log.model_call_details["custom_llm_provider"] == "openai"
 
 
-class TestTheDatedSlugDoesNotCostTheTurnItsPrice:
-    """Anthropic names the dated build in `message_start`, and since LiteLLM 134a4cd9fd
-    that name is preferred over `response.model` for pricing. The price map carries the
-    family (`claude-opus-5`) and not the build (`claude-opus-5-20250930`), so a streamed
-    turn was priced against a name with no rate and the spend row read zero.
+class TestTheNativeResponseKeepsTheClientsToolNames:
+    """Anthropic has no branch in `dispatch`, so the native response is the only place
+    the fingerprint renaming can be undone. A client that declared `skills_list` cannot
+    dispatch a call to `mcp__skills_list`.
 
-    Measured on litellm 1.101.0, same usage, one field apart::
-
-        provider_response_model=claude-opus-5-20250930  ->  0.0
-        provider_response_model=claude-opus-5           ->  0.00079
-        (field absent)                                  ->  0.00079
-
-    Non-streamed turns carry no such field, which is why only streaming lost the cost.
-    Upstream: BerriAI/litellm#42161.
-    """
-
-    @staticmethod
-    def _response(reported: str | None) -> Any:
-        from litellm.types.utils import Choices, Message, ModelResponse, Usage
-
-        response = ModelResponse(
-            model="anthropic/claude-opus-5",
-            choices=[Choices(message=Message(content="x"))],
-        )
-        response.usage = Usage(prompt_tokens=38, completion_tokens=24, total_tokens=62)
-        response._hidden_params = (
-            {} if reported is None else {"provider_response_model": reported}
-        )
-        return response
-
-    def test_the_dated_build_is_traded_for_the_name_that_has_a_rate(self) -> None:
-        response = self._response("claude-opus-5-20250930")
-        observability.normalize_provider_response_model(response)
-        assert response._hidden_params["provider_response_model"] == "claude-opus-5"
-
-    def test_the_turn_is_priced_again(self) -> None:
-        """The assertion that matters: not the name, the number on the row."""
-        from litellm.cost_calculator import completion_cost
-
-        response = self._response("claude-opus-5-20250930")
-        assert completion_cost(completion_response=response, custom_llm_provider="anthropic") == 0.0
-        observability.normalize_provider_response_model(response)
-        assert completion_cost(completion_response=response, custom_llm_provider="anthropic") > 0
-
-    def test_a_dated_name_that_has_its_own_rate_is_left_alone(self) -> None:
-        """`claude-haiku-4-5-20251001` is in the map under exactly that name. Trimming it
-        would reprice the turn against a different entry for no reason."""
-        response = self._response("claude-haiku-4-5-20251001")
-        observability.normalize_provider_response_model(response)
-        assert (
-            response._hidden_params["provider_response_model"]
-            == "claude-haiku-4-5-20251001"
-        )
-
-    def test_a_name_that_is_not_dated_is_left_alone(self) -> None:
-        """Only a trailing 8-digit date is trimmed: a build number or a size suffix must
-        not be mistaken for one."""
-        response = self._response("some-model-70b")
-        observability.normalize_provider_response_model(response)
-        assert response._hidden_params["provider_response_model"] == "some-model-70b"
-
-    def test_a_response_without_hidden_params_is_not_a_failure(self) -> None:
-        from litellm.types.utils import ModelResponse
-
-        observability.normalize_provider_response_model(ModelResponse(model="x"))
-
-
-class TestTheNativeResponseIsAdaptedOnBothPaths:
-    """Anthropic has no branch in `dispatch`, so the native response is the plugin's only
-    chance to correct the tool names and the cost identity.
-
-    Streaming needed a different shape from non-streaming, and the first attempt got it
-    wrong: re-wrapping the stream in a generator and rewriting the chunks it yields left
-    the spend row at 0.00000000 on the live gateway. The cost is computed inside
-    `CustomStreamWrapper` from `_provider_response_model`, which `chunk_creator` reads off
-    the raw chunk before anything downstream sees it — so the wrapper itself is what has
-    to be corrected, and it has to stay the object the proxy receives.
+    Streaming keeps the wrapper object: the proxy reads the finished turn off it, and a
+    generator in its place loses that interface.
     """
 
     @staticmethod
     def _response(name: str = "mcp__skills_list") -> Any:
         from litellm.types.utils import Choices, Message, ModelResponse
 
-        response = ModelResponse(
+        return ModelResponse(
             model="anthropic/claude-opus-5",
             choices=[
                 Choices(
@@ -2569,55 +2499,45 @@ class TestTheNativeResponseIsAdaptedOnBothPaths:
                 )
             ],
         )
-        response._hidden_params = {"provider_response_model": "claude-opus-5-20250930"}
-        return response
 
     @staticmethod
-    def _wrapper(reported: str = "claude-opus-5-20250930") -> Any:
-        """A real `CustomStreamWrapper`, not a stand-in: the whole point is that the
-        object handed back keeps working as one."""
+    def _wrapper() -> Any:
         from litellm.utils import CustomStreamWrapper
 
         wrapper = CustomStreamWrapper.__new__(CustomStreamWrapper)
-        wrapper._provider_response_model = reported
         wrapper.chunk_creator = lambda chunk: chunk
         return wrapper
 
-    def test_a_non_streamed_turn_gets_both_corrections(self) -> None:
+    def test_a_non_streamed_call_is_mapped_back(self) -> None:
         response = plugin._adapt_native_response(
             self._response(), {"mcp__skills_list": "skills_list"}
         )
         assert response.choices[0].message.tool_calls[0].function.name == "skills_list"
-        assert response._hidden_params["provider_response_model"] == "claude-opus-5"
 
-    def test_the_stream_wrapper_is_handed_back_as_itself(self) -> None:
-        """The proxy reads the finished turn off this object. Returning a generator in its
-        place loses the interface it needs."""
-        wrapper = self._wrapper()
-        assert plugin._adapt_native_response(wrapper, {}) is wrapper
-
-    def test_the_wrappers_remembered_model_is_the_one_that_has_a_rate(self) -> None:
-        wrapper = self._wrapper()
-        plugin._adapt_native_response(wrapper, {}).chunk_creator({"model": "x"})
-        assert wrapper._provider_response_model == "claude-opus-5"
-
-    def test_a_reported_model_that_prices_is_left_alone(self) -> None:
-        wrapper = self._wrapper("claude-haiku-4-5-20251001")
-        plugin._adapt_native_response(wrapper, {}).chunk_creator({"model": "x"})
-        assert wrapper._provider_response_model == "claude-haiku-4-5-20251001"
-
-    def test_the_original_chunk_creator_still_runs(self) -> None:
-        """Wrapping it must not replace it: it is what builds the chunk."""
-        seen: list[Any] = []
-        wrapper = self._wrapper()
-        wrapper.chunk_creator = lambda chunk: (seen.append(chunk), chunk)[1]
-        plugin._adapt_native_response(wrapper, {}).chunk_creator({"model": "x"})
-        assert seen == [{"model": "x"}]
-
-    def test_tool_names_are_mapped_back_on_streamed_chunks(self) -> None:
+    def test_a_streamed_call_is_mapped_back(self) -> None:
         wrapper = self._wrapper()
         wrapper.chunk_creator = lambda chunk: self._response()
         built = plugin._adapt_native_response(
             wrapper, {"mcp__skills_list": "skills_list"}
         ).chunk_creator({"model": "x"})
         assert built.choices[0].message.tool_calls[0].function.name == "skills_list"
+
+    def test_the_stream_wrapper_is_handed_back_as_itself(self) -> None:
+        wrapper = self._wrapper()
+        assert (
+            plugin._adapt_native_response(wrapper, {"mcp__skills_list": "skills_list"})
+            is wrapper
+        )
+
+    def test_a_request_with_nothing_renamed_is_untouched(self) -> None:
+        wrapper = self._wrapper()
+        assert plugin._adapt_native_response(wrapper, {}) is wrapper
+
+    def test_the_original_chunk_creator_still_runs(self) -> None:
+        seen: list[Any] = []
+        wrapper = self._wrapper()
+        wrapper.chunk_creator = lambda chunk: (seen.append(chunk), self._response())[1]
+        plugin._adapt_native_response(
+            wrapper, {"mcp__skills_list": "skills_list"}
+        ).chunk_creator({"model": "x"})
+        assert seen == [{"model": "x"}]

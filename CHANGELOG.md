@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-09-22
+
+### Removed
+
+- **The streamed-spend fix from 0.1.8 and 0.1.9, which never worked.** Both releases
+  claimed to stop streamed Claude turns being logged at zero cost. Neither did, and the
+  code sat in the package doing nothing. It is gone.
+
+  The diagnosis in those changelogs was right: Anthropic reports the dated build, LiteLLM
+  prefers that name for pricing since `134a4cd9fd`, and the price map carries the family.
+  What was wrong was where the fix was applied.
+
+  0.1.8 rewrote the chunks coming out of the stream, but the cost is computed inside
+  `CustomStreamWrapper` from a value `chunk_creator` reads off the raw chunk first.
+  0.1.9 corrected that attribute through `chunk_creator`, which is the right place for a
+  plain wrapper, except the Router interposes a `FallbackStreamWrapper` that overrides
+  `__anext__` and never calls `chunk_creator` at all. That class is defined inside
+  `_acompletion_streaming_iterator`, so it is not importable and the tests could not have
+  constructed it. All three attempts were verified against a hand-built
+  `CustomStreamWrapper` that behaves differently from the object the proxy actually gets.
+
+  The bug is upstream and is being fixed there: BerriAI/litellm#42161, with a PR at
+  BerriAI/litellm#42467. Until that lands, an explicit `input_cost_per_token` in a
+  deployment's `model_info` works around it, by setting `custom_pricing` and
+  short-circuiting the preference.
+
+  Tool-name aliasing from 0.1.7 is untouched and still works. Only the cost handling was
+  removed.
+
+### Fixed
+
+- `LICENSE` is plain MIT again, so GitHub recognises it instead of reporting
+  `NOASSERTION`. The oh-my-pi attribution it used to carry mid-file moved to `NOTICE`,
+  which ships in the wheel alongside it.
+
 ## [0.1.9] - 2026-09-22
 
 ### Fixed
@@ -634,7 +669,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.6...v0.1.7

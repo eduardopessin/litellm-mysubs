@@ -42,8 +42,6 @@ import litellm.main
 from .credentials.store import ProviderId
 from .observability import (
     _WIRE_MODEL_KEY,
-    normalize_provider_response_model,
-    priceable_provider_model,
 )
 from .turns import (
     StreamError,
@@ -143,57 +141,29 @@ def wire_model_of_deployment(router: Any, model: str) -> str | None:
 
 
 def _adapt_native_response(response: Any, aliases: dict[str, str]) -> Any:
-    """Fix up what LiteLLM's own client answered, on its way back to the caller.
+    """Map tool names back on whatever LiteLLM's own client answered.
 
     Anthropic has no branch in `dispatch`: the turn is served natively, so the response
-    never passes through this package's wire code and two things have to be corrected
-    from here.
+    never passes through this package's wire code and the renaming has to be undone from
+    here. The model answers with the name it was given, and a client that declared
+    ``skills_list`` cannot dispatch a call to ``mcp__skills_list``.
 
-    **Tool names.** The model answers with the name it was given, and a client that
-    declared ``skills_list`` cannot dispatch a call to ``mcp__skills_list``.
-
-    **Cost.** ``provider_response_model`` arrives as the dated build and is preferred
-    over ``response.model`` by the cost calculation, so the turn is priced against a name
-    with no rate and logged free — see `normalize_provider_response_model`. Unlike the
-    renaming, this runs on every native turn, because nothing in the request predicts it.
-
-    A streamed turn is **not** re-wrapped in a generator. The proxy needs the
-    ``CustomStreamWrapper`` itself — it reads the finished turn off the object — and the
-    cost is computed inside it, from ``self._provider_response_model``, which
-    ``chunk_creator`` takes from the raw chunk before anything downstream sees it.
-    Rewriting the chunks we yield therefore fixes nothing: measured on the gateway, the
-    spend row still read ``0.00000000``. The attribute is corrected in place instead, and
-    the tool names are mapped back by wrapping ``chunk_creator``, which is the one place
-    every chunk passes through.
+    A streamed turn keeps its ``CustomStreamWrapper`` -- the proxy reads the finished
+    turn off that object, so a generator in its place loses the interface it needs.
+    ``chunk_creator`` is wrapped instead, being the one place every chunk passes through.
     """
+    if not aliases:
+        return response
     if not hasattr(response, "chunk_creator"):
-        normalize_provider_response_model(response)
-        return anthropic.restore_tool_names(response, aliases) if aliases else response
+        return anthropic.restore_tool_names(response, aliases)
 
     original = response.chunk_creator
 
     def chunk_creator(chunk: Any) -> Any:
-        built = original(chunk)
-        _normalize_wrapper_model(response)
-        return anthropic.restore_tool_names(built, aliases) if aliases else built
+        return anthropic.restore_tool_names(original(chunk), aliases)
 
     response.chunk_creator = chunk_creator
     return response
-
-
-def _normalize_wrapper_model(wrapper: Any) -> None:
-    """Point the wrapper's remembered provider model at a name that has a rate.
-
-    ``CustomStreamWrapper`` keeps the last model any chunk reported and hands it to the
-    cost calculation at end of stream. For Anthropic that is the dated build, which the
-    price map does not carry.
-    """
-    reported = getattr(wrapper, "_provider_response_model", None)
-    if not isinstance(reported, str):
-        return
-    priced = priceable_provider_model(reported)
-    if priced != reported:
-        wrapper._provider_response_model = priced
 
 
 def _pop_aliases(kwargs: dict[str, Any]) -> dict[str, str]:

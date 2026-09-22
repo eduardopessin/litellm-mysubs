@@ -1,0 +1,16 @@
+litellm-mysubs
+Copyright (c) 2026 Eduardo Pessin
+
+Portions of this software are a port of oh-my-pi
+(https://github.com/can1357/oh-my-pi), used under the MIT License:
+
+    Copyright (c) 2025 Mario Zechner
+    Copyright (c) 2025-2026 Can Bölük
+    Copyright (c) 2026 Stencil Labs, Inc.
+
+The wire-protocol modules carry `# omp:` anchors naming the source file and
+symbol each was ported from, so the provenance of any given function can be
+traced back to the original.
+
+The full MIT terms, covering both this work and the ported portions, are in
+LICENSE.
