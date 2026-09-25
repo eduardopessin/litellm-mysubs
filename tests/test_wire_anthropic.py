@@ -537,9 +537,7 @@ class TestFingerprintTools:
         assert kwargs["tool_choice"] == choice
 
     def test_build_request_leaves_the_map_for_its_caller(self) -> None:
-        kwargs = ant.build_request(
-            {"messages": [], "tools": self._trio()}, "claude-opus-5"
-        )
+        kwargs = ant.build_request({"messages": [], "tools": self._trio()}, "claude-opus-5")
         assert kwargs[ant.TOOL_ALIAS_KEY] == {
             "mcp__skill_manage": "skill_manage",
             "mcp__skill_view": "skill_view",
@@ -619,3 +617,71 @@ class TestRestoreToolNames:
     def test_no_aliases_is_a_no_op(self) -> None:
         payload = {"name": "mcp__skills_list"}
         assert ant.restore_tool_names(payload, {})["name"] == "mcp__skills_list"
+
+
+class TestTheClientsTtlDecidesOurs:
+    """Anthropic rejects a `1h` marker placed after a `5m` one, in the fixed order
+    `tools`, `system`, `messages`::
+
+        400 messages.1.content.0.cache_control.ttl: a ttl='1h' cache_control block must
+            not come after a ttl='5m' cache_control block
+
+    Claude Code marks its own prefix without an explicit `ttl`, which is `5m` on the wire.
+    Anchoring ours at the 1 h default behind it meant every request from it failed before
+    reaching the model, measured against the live gateway.
+    """
+
+    @staticmethod
+    def _ttls(payload: Any) -> list[str | None]:
+        found: list[str | None] = []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                control = node.get("cache_control")
+                if isinstance(control, dict):
+                    found.append(control.get("ttl"))
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(payload)
+        return found
+
+    @staticmethod
+    def _conversation(marker: dict[str, Any] | None) -> dict[str, Any]:
+        first: dict[str, Any] = {"type": "text", "text": "a"}
+        if marker is not None:
+            first["cache_control"] = marker
+        return {
+            "model": "claude-opus-5",
+            "system": [{"type": "text", "text": "s"}],
+            "messages": [
+                {"role": "user", "content": [first, {"type": "text", "text": "b"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                {"role": "user", "content": [{"type": "text", "text": "c"}]},
+            ],
+        }
+
+    def test_a_client_marking_at_five_minutes_is_not_undercut_by_ours(self) -> None:
+        payload = ant.build_request(
+            self._conversation({"type": "ephemeral"}), "claude-opus-5", native_system=True
+        )
+        assert self._ttls(payload)
+        assert all(ttl is None for ttl in self._ttls(payload))
+
+    def test_an_unmarked_request_still_gets_the_long_ttl(self) -> None:
+        """The 1 h default is the point of the anchoring: a 1 h write bills 2x once
+        against 1.25x on every cold rewrite. Following the client must not cost that."""
+        payload = ant.build_request(self._conversation(None), "claude-opus-5", native_system=True)
+        assert "1h" in self._ttls(payload)
+
+    def test_a_client_that_asked_for_an_hour_keeps_it(self) -> None:
+        payload = ant.build_request(
+            self._conversation({"type": "ephemeral", "ttl": "1h"}),
+            "claude-opus-5",
+            native_system=True,
+        )
+        assert self._ttls(payload)
+        assert "5m" not in self._ttls(payload)

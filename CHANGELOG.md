@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-09-25
+
+### Fixed
+
+- **Claude Code works through the gateway again: the cache ttl follows the caller.**
+  Claude Code marks its own prefix with `cache_control` and no explicit `ttl`, which is 5m
+  on the wire. Anchoring ours at the 1h default behind it is a hard 400, so every Claude
+  Code request failed before reaching the model:
+
+  ```
+  messages.1.content.0.cache_control.ttl: a ttl='1h' cache_control block must
+  not come after a ttl='5m' cache_control block
+  ```
+
+  The order Anthropic enforces is fixed — `tools`, `system`, `messages` — so a 1h marker
+  anywhere behind the caller's 5m one is rejected regardless of where ours went.
+
+  `client_uses_short_ttl` tells the two cases apart. A request the caller never marked still
+  gets the 1h anchor, which is where the long cache pays off; one it marked without a ttl
+  follows the caller's choice rather than its error. Verified on a live gateway: the Claude
+  Code shape answers 200 where it used to 400, Codex and Antigravity are unaffected, and an
+  unmarked request still caches for an hour (`cache_creation=2630`, then `cache_read=2630`).
+
+- **Codex discovery asks the account what it serves, instead of shipping a list of names.**
+  `CURATED_CODEX` was the source of truth for the family, so a model the constant did not
+  name could not be found however well the probe worked. `gpt-6-luna` and `gpt-6-sol` were
+  served for days while discovery kept reporting five models. Reported in
+  [#2](https://github.com/eduardopessin/litellm-mysubs/issues/2) by @hanzhichao2000.
+
+  The module used to skip `/backend-api/codex/models` on the grounds that what it
+  advertises had not been measured against a subscription account here. Measured on
+  2026-09-25 against a `plus` account, it answers 200 and lists exactly what the probe
+  verifies, plus the two names the constant lacked:
+
+  ```
+  GET /backend-api/codex/models?client_version=0.153.0  ->  7 models
+  GET /backend-api/codex/models?client_version=0.155.1  ->  9 models (+gpt-6-sol, +gpt-6-luna)
+  ```
+
+  Two details cost the earlier attempt its verdict. `client_version` is a **query
+  parameter**, not only the `version` header the inference path sends — omit it and the
+  endpoint answers `400 Field required`, which reads as "no catalog here". And the payload
+  is large enough that a truncated read leaves invalid JSON, which reads as a broken one.
+
+  So the gate applies to the catalog, not just to inference: at `0.153.0` those two names
+  are absent from the listing, and no probe finds a name nobody asked about.
+
+  `CURATED_CODEX` stays as the fallback for an unreachable catalog, and falling back is
+  labelled — a list assembled from the constant must not read as one the account confirmed.
+  Anthropic keeps its curated list: `/v1/models` answers 401 with a subscription token and
+  the public catalog does not predict the served set.
+
+  The `gpt-5.6-*` family is left alone. The issue reports it as no longer served; on the
+  measured account all three answer at both client versions, so removing them would drop
+  three working models. An account that does not serve them will now say so itself.
+
+### Changed
+
+- `CLIENT_VERSION` to `0.155.1`, which is also what `pi-catalog` 18.3.1 pins, independently
+  of the measurement above.
+- `codex-auto-review` and `gpt-reserve` are filtered out of the catalog listing. Both are
+  advertised in every measured response and neither serves a turn.
+
 ## [0.1.10] - 2026-09-22
 
 ### Removed
@@ -669,7 +732,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.7...v0.1.8
