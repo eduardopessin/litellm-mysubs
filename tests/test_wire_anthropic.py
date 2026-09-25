@@ -537,9 +537,7 @@ class TestFingerprintTools:
         assert kwargs["tool_choice"] == choice
 
     def test_build_request_leaves_the_map_for_its_caller(self) -> None:
-        kwargs = ant.build_request(
-            {"messages": [], "tools": self._trio()}, "claude-opus-5"
-        )
+        kwargs = ant.build_request({"messages": [], "tools": self._trio()}, "claude-opus-5")
         assert kwargs[ant.TOOL_ALIAS_KEY] == {
             "mcp__skill_manage": "skill_manage",
             "mcp__skill_view": "skill_view",
@@ -676,9 +674,7 @@ class TestTheClientsTtlDecidesOurs:
     def test_an_unmarked_request_still_gets_the_long_ttl(self) -> None:
         """The 1 h default is the point of the anchoring: a 1 h write bills 2x once
         against 1.25x on every cold rewrite. Following the client must not cost that."""
-        payload = ant.build_request(
-            self._conversation(None), "claude-opus-5", native_system=True
-        )
+        payload = ant.build_request(self._conversation(None), "claude-opus-5", native_system=True)
         assert "1h" in self._ttls(payload)
 
     def test_a_client_that_asked_for_an_hour_keeps_it(self) -> None:

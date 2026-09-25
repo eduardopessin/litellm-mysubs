@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Claude Code works through the gateway again: the cache ttl follows the caller.**
+  Claude Code marks its own prefix with `cache_control` and no explicit `ttl`, which is 5m
+  on the wire. Anchoring ours at the 1h default behind it is a hard 400, so every Claude
+  Code request failed before reaching the model:
+
+  ```
+  messages.1.content.0.cache_control.ttl: a ttl='1h' cache_control block must
+  not come after a ttl='5m' cache_control block
+  ```
+
+  The order Anthropic enforces is fixed — `tools`, `system`, `messages` — so a 1h marker
+  anywhere behind the caller's 5m one is rejected regardless of where ours went.
+
+  `client_uses_short_ttl` tells the two cases apart. A request the caller never marked still
+  gets the 1h anchor, which is where the long cache pays off; one it marked without a ttl
+  follows the caller's choice rather than its error. Verified on a live gateway: the Claude
+  Code shape answers 200 where it used to 400, Codex and Antigravity are unaffected, and an
+  unmarked request still caches for an hour (`cache_creation=2630`, then `cache_read=2630`).
+
 - **Codex discovery asks the account what it serves, instead of shipping a list of names.**
   `CURATED_CODEX` was the source of truth for the family, so a model the constant did not
   name could not be found however well the probe worked. `gpt-6-luna` and `gpt-6-sol` were
