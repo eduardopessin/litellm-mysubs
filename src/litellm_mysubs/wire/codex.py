@@ -134,8 +134,15 @@ ORIGINATOR: Final = "omp"
 # omp: wire/codex.ts :: CODEX_CLIENT_VERSION
 #: The backend gates model availability against this version, both on `/models` and on
 #: `/responses` — `gpt-6-astra` requires >= 0.153.0. An old version silently hides new SKUs
-#: from discovery.
-CLIENT_VERSION: Final = "0.153.0"
+#: from discovery. Measured against a `plus` account on 2026-09-25, asking
+#: `/backend-api/codex/models?client_version=<v>` and counting what came back:
+#:
+#:     0.153.0 -> 7 models (no gpt-6-luna, no gpt-6-sol)
+#:     0.155.1 -> 9 models (both present)
+#:
+#: The gate is on the catalog, not only on inference: at 0.153.0 the two names are absent
+#: from the listing, so no amount of probing finds them. Reported in #2.
+CLIENT_VERSION: Final = "0.155.1"
 
 # omp: wire/codex.ts :: OPENAI_HEADER_VALUES
 BETA_RESPONSES: Final = "responses=experimental"
