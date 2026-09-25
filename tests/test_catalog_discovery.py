@@ -33,7 +33,7 @@ from litellm_mysubs.catalog.discovery import (
 from litellm_mysubs.credentials.store import Credential
 from litellm_mysubs.transport.hosts import HOSTS, MODELS_PATH
 from litellm_mysubs.wire.antigravity_models import BROKEN_WIRE, ModelCatalog
-from litellm_mysubs.wire.codex import resolve_model
+from litellm_mysubs.wire.codex import CLIENT_VERSION, resolve_model
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -62,6 +62,27 @@ def catalog_payload(*ids: str, deprecated: tuple[str, ...] = ()) -> dict[str, ob
         "models": {model: {"displayName": model} for model in ids},
         "deprecatedModelIds": list(deprecated),
     }
+
+
+def codex_catalog(*slugs: str) -> dict[str, object]:
+    """Shape of ``/backend-api/codex/models``: a ``models`` list of ``slug`` entries."""
+    return {"models": [{"slug": slug} for slug in slugs]}
+
+
+def codex_catalog_down(handler: Handler) -> Handler:
+    """Wrap a probe handler so the catalog 500s and discovery falls back to the curated list.
+
+    Needed because the Codex path asks the account first now. Without this the catalog
+    request would be answered by the probe handler, and a test meaning to exercise probing
+    would silently be testing the catalog instead.
+    """
+
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/codex/models"):
+            return httpx.Response(500, text="catalog down")
+        return handler(request)
+
+    return wrapped
 
 
 class TestGoogleCatalog:
@@ -525,7 +546,10 @@ class TestProbedProviders:
         assert all(m.note == "" for m in models)
 
     async def test_codex_unsupported_marker_removes_the_model(self) -> None:
-        """The Codex refusal is a 400 with its own marker, not a 404."""
+        """The Codex refusal is a 400 with its own marker, not a 404.
+
+        Exercises the fallback path: the catalog is down, so the curated list is probed.
+        """
         refused = CURATED_CODEX[0]
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -541,7 +565,7 @@ class TestProbedProviders:
                 )
             return httpx.Response(200, json={})
 
-        async with client(handler) as http:
+        async with client(codex_catalog_down(handler)) as http:
             models = await discover(CODEX, client=http)
 
         assert refused not in by_name(models)
@@ -553,7 +577,7 @@ class TestProbedProviders:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(400, json={"error": {"message": "invalid_request"}})
 
-        async with client(handler) as http:
+        async with client(codex_catalog_down(handler)) as http:
             models = await discover(CODEX, client=http)
 
         assert [m.wire_name for m in models] == list(CURATED_CODEX)
@@ -577,7 +601,7 @@ class TestProbedProviders:
             requested.append(str(json.loads(request.read())["model"]))
             return httpx.Response(200, json={})
 
-        async with client(handler) as http:
+        async with client(codex_catalog_down(handler)) as http:
             await discover(CODEX, client=http)
 
         assert sorted(requested) == sorted(CURATED_CODEX)
@@ -612,6 +636,102 @@ class TestProbedProviders:
         assert len(models) == len(CURATED_ANTHROPIC)
         assert peak > 1, "the probes have to run in parallel"
         assert peak <= PROBE_CONCURRENCY
+
+    async def test_codex_catalog_is_what_the_list_comes_from(self) -> None:
+        """The account's own catalog decides, and no turn is spent confirming it.
+
+        The curated constant used to be the source: a name it lacked could not be found at
+        all, however well the probe worked. `gpt-6-luna` and `gpt-6-sol` were served for days
+        while discovery kept reporting five models (#2). Asking the account is what fixes
+        that class of defect, not a longer constant.
+        """
+        served = ("gpt-5.5", "gpt-6-luna", "gpt-6-sol")
+        posts: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                posts.append(str(request.url))
+                return httpx.Response(200, json={})
+            return httpx.Response(200, json=codex_catalog(*served))
+
+        async with client(handler) as http:
+            models = await discover(CODEX, client=http)
+
+        assert [m.wire_name for m in models] == list(served)
+        assert all(m.verified for m in models)
+        assert posts == [], "the catalog is the answer; probing it again would bill a turn"
+
+    async def test_codex_catalog_carries_the_gated_client_version(self) -> None:
+        """`client_version` travels as a query parameter, and the gate is the reason.
+
+        Measured on a `plus` account: 0.153.0 lists seven models, 0.155.1 lists nine. Omit
+        the parameter entirely and the endpoint answers 400 `Field required`, so sending it
+        in the header alone — where the inference path carries it — finds nothing.
+        """
+        seen: list[httpx.URL] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.url)
+            return httpx.Response(200, json=codex_catalog("gpt-5.5"))
+
+        async with client(handler) as http:
+            await discover(CODEX, client=http)
+
+        assert seen, "the catalog has to be asked"
+        assert seen[0].params["client_version"] == CLIENT_VERSION
+
+    async def test_codex_catalog_slugs_that_are_not_models_are_dropped(self) -> None:
+        """`codex-auto-review` and `gpt-reserve` are advertised but serve no turn.
+
+        Both came back in every measured response. They are not selectable models: one is the
+        reviewer the backend invokes on its own, the other answers nothing.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json=codex_catalog("gpt-5.5", "codex-auto-review", "gpt-reserve")
+            )
+
+        async with client(handler) as http:
+            models = await discover(CODEX, client=http)
+
+        assert [m.wire_name for m in models] == ["gpt-5.5"]
+
+    async def test_codex_falls_back_to_the_curated_list_and_says_so(self) -> None:
+        """An unreachable catalog degrades to probing, labelled.
+
+        Silent degradation is the failure this package exists to avoid: a list assembled from
+        a constant shipped last release must not read as one the account confirmed.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(503, text="unavailable")
+            return httpx.Response(200, json={})
+
+        async with client(handler) as http:
+            models = await discover(CODEX, client=http)
+
+        assert [m.wire_name for m in models] == list(CURATED_CODEX)
+        assert all("curated list probed instead" in m.note for m in models)
+
+    async def test_codex_empty_catalog_does_not_empty_the_list(self) -> None:
+        """A 200 advertising nothing is not an account with no models.
+
+        Returning it verbatim would report a subscription that serves nothing while the
+        curated names still answer.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json={"models": []})
+            return httpx.Response(200, json={})
+
+        async with client(handler) as http:
+            models = await discover(CODEX, client=http)
+
+        assert [m.wire_name for m in models] == list(CURATED_CODEX)
+        assert all("no usable models" in m.note for m in models)
 
     async def test_anthropic_probe_leads_with_the_identity_block(self) -> None:
         """Measured: a `system` carrying only the client prompt returns 429 on the OAuth

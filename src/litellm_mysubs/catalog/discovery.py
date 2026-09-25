@@ -7,10 +7,14 @@ uniform interface:
   is the account's truth, including the variants that no longer answer
   (``deprecatedModelIds``). Subtracting those is `ModelCatalog.update`'s job, not this
   module's.
-* **Anthropic** and **OpenAI Codex** have no catalog. ``/v1/models`` returns 401 with a
-  subscription token, and the served set **is not derivable** from the public list:
-  ``claude-sonnet-4-20250514`` exists in the Anthropic API and returns 404 on a Max
-  account. What is left is a curated list of measured names and a real probe of each one.
+* **OpenAI Codex** has one too: ``/backend-api/codex/models?client_version=<v>``, gated by
+  that version — the same gate the inference path is subject to, so the listing and what
+  ``/responses`` accepts agree by construction. `CURATED_CODEX` is now only the fallback for
+  when it cannot be reached.
+* **Anthropic** has none. ``/v1/models`` returns 401 with a subscription token, and the
+  served set **is not derivable** from the public list: ``claude-sonnet-4-20250514`` exists
+  in the Anthropic API and returns 404 on a Max account. What is left is a curated list of
+  measured names and a real probe of each one.
 
 Three rules govern the result, and all of them come from the same principle — never invent
 a fact about someone else's account:
@@ -23,11 +27,11 @@ a fact about someone else's account:
 3. An unreachable catalog does not produce a plausible list. Either the real snapshot is
    returned labelled with its age, or `DiscoveryError` is raised.
 
-Note about OMP: `pi-catalog` has `discovery/codex.ts :: fetchCodexModels`, which reads
-``/backend-api/codex/models``. It is not used here because what that endpoint advertises
-has not been measured against a subscription account on this installation, and the
-measurement that does exist says the opposite (the public catalog does not predict what the
-subscription serves). The probe measures; the upstream list would, for now, be a guess.
+Note about OMP: `pi-catalog` has `discovery/codex.ts :: fetchCodexModels`, reading the same
+Codex endpoint. This module used to skip it, on the grounds that what it advertises had not
+been measured against a subscription account here. It has been now — 2026-09-25, a `plus`
+account: 200, and the slugs match what the probe verifies, with the two the curated constant
+lacked. Asking the account beats maintaining a list of names by hand.
 """
 
 from __future__ import annotations
@@ -158,6 +162,18 @@ CURATED_CODEX: Final[tuple[str, ...]] = (
     "gpt-daybreak-blue-latest",
 )
 
+#: Codex catalog endpoint. `client_version` is a **query parameter**, not the `version`
+#: header the inference path sends: without it the endpoint answers 400 `Field required`.
+#: Measured on 2026-09-25 (see `wire/codex.py :: CLIENT_VERSION`) — it returns exactly what
+#: the account serves at that client version, which is what makes `CURATED_CODEX` a
+#: fallback rather than the source of truth.
+CODEX_MODELS_URL: Final = "https://chatgpt.com/backend-api/codex/models"
+
+#: Slugs the catalog advertises that are not selectable models. `codex-auto-review` is the
+#: reviewer the backend invokes on its own; `gpt-reserve` is a placeholder that answers no
+#: turn. Both appeared in every measured response and neither belongs on a selection screen.
+CODEX_NON_MODELS: Final = frozenset({"codex-auto-review", "gpt-reserve"})
+
 
 class DiscoveryError(RuntimeError):
     """It was not possible to learn what the account serves.
@@ -257,14 +273,87 @@ async def discover(
             credential, client=client, catalog=catalog or ModelCatalog(), now=now, probe=probe
         )
     if credential.provider == "anthropic":
-        # These two have no catalog with ``modelProvider``, and they do not need one: the
-        # one who serves is the owner of the family. The Max subscription only serves
-        # `claude-*`, the Codex one only serves `gpt-*`. The constant here is measured by
-        # the curated list above.
+        # Anthropic has no catalog: `/v1/models` answers 401 with a subscription token, and
+        # the public list does not predict the served set. A curated list of measured names,
+        # each one probed, is all there is.
         return await _discover_probed(
             credential, CURATED_ANTHROPIC, _probe_anthropic, client, family="anthropic"
         )
-    return await _discover_probed(credential, CURATED_CODEX, _probe_codex, client, family="openai")
+    return await _discover_codex(credential, client=client)
+
+
+# -- OpenAI Codex: real catalog, curated list as the fallback ------------------
+
+
+# omp: discovery/codex.ts :: fetchCodexModels
+async def _discover_codex(
+    credential: Credential, *, client: httpx.AsyncClient
+) -> list[DiscoveredModel]:
+    """What the account serves, asked rather than guessed.
+
+    The earlier note here said this endpoint was not used because it had not been measured
+    against a subscription account. It has been now (2026-09-25, `plus`): it answers 200 and
+    lists exactly the names the probe verifies, plus the two the curated list was missing.
+    That settles it — an account's own catalog beats a constant maintained by hand, which
+    ages every time the upstream ships a model.
+
+    The curated list stays as the fallback, and only for the case the endpoint cannot be
+    reached. Falling back is labelled: a name carried over from the constant says so in
+    ``note``, because "the account advertises this" and "we shipped this name last release"
+    are different facts and the caller is entitled to tell them apart.
+    """
+    try:
+        response = await client.get(
+            CODEX_MODELS_URL,
+            params={"client_version": codex.CLIENT_VERSION},
+            headers=codex.build_headers(
+                credential.access_token, window_id=_probe_window_id(credential)
+            ),
+            timeout=PROBE_TIMEOUT_S,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        return await _discover_probed(
+            credential,
+            CURATED_CODEX,
+            _probe_codex,
+            client,
+            family="openai",
+            note=(
+                f"the account catalog did not answer ({type(exc).__name__}); "
+                "curated list probed instead"
+            ),
+        )
+
+    slugs = [
+        slug
+        for entry in payload.get("models") or ()
+        if isinstance(entry, dict) and (slug := entry.get("slug")) and slug not in CODEX_NON_MODELS
+    ]
+    if not slugs:
+        return await _discover_probed(
+            credential,
+            CURATED_CODEX,
+            _probe_codex,
+            client,
+            family="openai",
+            note="the account catalog answered with no usable models; curated list probed instead",
+        )
+
+    # Advertised by the account at this client version. No probe: unlike Google's, this
+    # catalog is gated by `client_version` and returned exactly the served set on every
+    # measurement, so a turn per name would spend quota to confirm what was just asked.
+    return [
+        DiscoveredModel(
+            wire_name=slug,
+            suggested_name=suggested_name(slug),
+            verified=True,
+            note="",
+            family="openai",
+        )
+        for slug in slugs
+    ]
 
 
 # -- Google Antigravity: real catalog ------------------------------------------
@@ -552,6 +641,7 @@ async def _discover_probed(
     client: httpx.AsyncClient,
     *,
     family: str,
+    note: str = "",
 ) -> list[DiscoveredModel]:
     """Probe the curated list, in parallel and under a concurrency ceiling.
 
@@ -559,6 +649,10 @@ async def _discover_probed(
     a deployment that only knows how to return 404. A name the probe could not ask about
     stays, with ``verified=False`` and the reason: this machine's network is not a fact
     about the account.
+
+    ``note`` prefixes every entry's own note. Codex passes it when it falls back here from
+    the account catalog, so a list assembled from the constant is not mistaken for one the
+    account confirmed.
     """
     limit = asyncio.Semaphore(PROBE_CONCURRENCY)
 
@@ -577,7 +671,7 @@ async def _discover_probed(
                 wire_name=wire,
                 suggested_name=suggested_name(wire),
                 verified=result.served is True,
-                note=result.note,
+                note="; ".join(part for part in (note, result.note) if part),
                 family=family,
             )
         )
