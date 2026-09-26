@@ -114,7 +114,7 @@ MODEL_FAMILY_BY_PROVIDER: Final[dict[str, str]] = {
 # subscription token. The source of each one is inside the package itself, which makes this
 # list a consequence of measurements and not of taste:
 #
-#   opus-5, fable-5, sonnet-5, opus-4-8, opus-4-6, sonnet-4-6, opus-4-5, sonnet-4-5,
+#   opus-5-5, opus-5, fable-5, sonnet-5, opus-4-8, opus-4-6, sonnet-4-6, opus-4-5, sonnet-4-5,
 #   haiku-4-5  -> `wire/anthropic.py`, the `ADAPTIVE_EFFORT` table, where every row carries
 #                 the reasoning characters the upstream returned. A model that does not
 #                 answer does not produce that count.
@@ -123,11 +123,13 @@ MODEL_FAMILY_BY_PROVIDER: Final[dict[str, str]] = {
 #   haiku-4-5   -> the model the original uses in the proxy health probe.
 #
 # Deliberately out: `claude-sonnet-4-20250514` (it exists in the public API, 404 on the Max
-# account — the counter-example that justifies this module) and the OMP catalog names with
-# no measurement of ours (`claude-mythos-5`, `claude-fable-5-1`, ...). Adding them is one
+# account — the counter-example that justifies this module), `claude-mythos-preview` (in
+# the OMP 18.3.2 catalog, `not_found_error` on the Max account) and the OMP catalog names
+# with no measurement of ours (`claude-mythos-5`, `claude-fable-5-1`, ...). Adding them is one
 # line, once measured; putting them here now would make the probe look like confirmation of
 # a guess.
 CURATED_ANTHROPIC: Final[tuple[str, ...]] = (
+    "claude-opus-5-5",
     "claude-opus-5",
     "claude-sonnet-5",
     "claude-fable-5",

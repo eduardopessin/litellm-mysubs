@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-09-26
+
+### Added
+
+- **Claude Opus 5.5 (`claude-opus-5-5`) in the curated Anthropic list.** New in the OMP
+  18.3.2 catalog. Measured on the Max subscription through the live gateway: the probe
+  answers 200, and thinking behaves like Opus 5 — adaptive 76 chars, budget 0 — so it
+  takes the adaptive default and stays off `BUDGET_ONLY_MODELS`. LiteLLM already prices it
+  ($4 / $20 per Mtok). `claude-mythos-preview`, also new there, answers `not_found_error`
+  on the same account and stays out.
+
+### Changed
+
+- **OMP anchors follow 18.3.2** (was 18.2.6). Three anchors had moved upstream, with no
+  change on the wire:
+  - the usage endpoint's base left `usage/claude.ts` (`DEFAULT_ENDPOINT`) for
+    `usage/claude-api.ts` (`DEFAULT_CLAUDE_API_BASE_URL` + `claudeOAuthBaseUrl`); the URL
+    is still `https://api.anthropic.com/api/oauth/usage`;
+  - `claudeCodeUserAgent` became `getClaudeCodeUserAgent`, and the pinned CLI version
+    `2.1.257` → `2.1.280` (`DEFAULT_CLAUDE_CODE_VERSION`), now anchored by value.
+    `CLAUDE_CODE_VERSION` follows it. It does not reach the wire: the `User-Agent` stays
+    this package's own.
+
 ## [0.1.11] - 2026-09-25
 
 ### Fixed
@@ -732,7 +755,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.11...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.8...v0.1.9

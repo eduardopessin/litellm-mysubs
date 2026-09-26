@@ -33,8 +33,9 @@ from ..credentials.store import Credential
 from ..wire.anthropic import USER_AGENT
 from .usage import UsageSnapshot, from_anthropic_usage, from_codex_usage
 
-# omp: usage/claude.ts :: fetchClaudeUsage, DEFAULT_ENDPOINT
-# omp= usage/claude.ts :: DEFAULT_ENDPOINT = "https://api.anthropic.com/api/oauth"
+# omp: usage/claude.ts :: fetchClaudeUsage
+# omp: usage/claude-api.ts :: claudeOAuthBaseUrl, DEFAULT_CLAUDE_API_BASE_URL
+# omp= DEFAULT_CLAUDE_API_BASE_URL = "https://api.anthropic.com"
 ANTHROPIC_USAGE_URL: Final = "https://api.anthropic.com/api/oauth/usage"
 
 # omp: usage/openai-codex.ts :: CODEX_USAGE_PATH, buildCodexUsageUrl

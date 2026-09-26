@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Final, NamedTuple
 
 #: OMP version the anchors were written against.
-OMP_VERSION = "18.2.6"
+OMP_VERSION = "18.3.2"
 
 #: The wiring is split across **three** packages: `pi-ai` has the logic, `pi-catalog` has
 #: the wire constants (header values, pinned client versions), and `pi-utils` has what is
