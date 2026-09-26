@@ -87,6 +87,7 @@ ADAPTIVE_EFFORT: Final[dict[str, str]] = {
 # The default is adaptive, and this list enumerates who *rejects* it, not who accepts it.
 # Measured model by model (max_tokens 1024/4096, display="summarized"), thinking chars
 # returned with each form:
+#   opus-5-5     adaptive  76 | budget    0   <- adaptive mandatory
 #   opus-5       adaptive  82 | budget    0   <- adaptive mandatory
 #   fable-5      adaptive  83 | budget    0   <- adaptive mandatory
 #   sonnet-5     adaptive  58 | budget   59
@@ -196,10 +197,11 @@ def build_betas(*, thinking: bool) -> str:
     return ",".join(betas)
 
 
-# omp: providers/claude-code-fingerprint.ts :: claudeCodeUserAgent
+# omp: providers/claude-code-fingerprint.ts :: getClaudeCodeUserAgent, DEFAULT_CLAUDE_CODE_VERSION
+# omp= DEFAULT_CLAUDE_CODE_VERSION = "2.1.280"
 #: The version the real CLI pins. Kept as a constant because the anchor above has to match
 #: something, and because a future measurement may show it matters again — it does not now.
-CLAUDE_CODE_VERSION: Final = "2.1.257"
+CLAUDE_CODE_VERSION: Final = "2.1.280"
 
 #: What this package calls itself on the wire.
 #:
