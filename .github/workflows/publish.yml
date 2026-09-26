@@ -29,3 +29,36 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # The GitHub release used to be created by hand, and 0.1.4, 0.1.11 and 0.1.12 ended up
+  # tagged and on PyPI with no release. After PyPI, so a release never announces a version
+  # that failed to publish.
+  github-release:
+    needs: [pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release from the tag and the changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists"; exit 0
+          fi
+          # The checkout leaves the tag lightweight; fetch it again for its annotation.
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          title=$(git tag -l --format='%(contents:subject)' "$TAG")
+          [ -n "$title" ] && [ "$title" != "$TAG" ] || title="${TAG#v}"
+          # The version's section of CHANGELOG.md, up to the next heading. A tag with no
+          # section fails here instead of publishing an empty release.
+          awk -v v="${TAG#v}" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          grep -q '[^[:space:]]' notes.md || { echo "no CHANGELOG section for $TAG"; exit 1; }
+          gh release create "$TAG" --verify-tag --title "$title" --notes-file notes.md
