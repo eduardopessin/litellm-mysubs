@@ -6,8 +6,8 @@ on:
 
 jobs:
   # The same gates as every other push. A tag is not a reason to publish something
-  # that was never tested: ruff, mypy, pytest, the LiteLLM contract job and the
-  # anchor check all have to pass before anything leaves the runner.
+  # that was never tested: ruff, mypy and pytest on LiteLLM 1.101.0 and on the current
+  # release, and the anchor check, all have to pass before anything leaves the runner.
   ci:
     uses: ./.github/workflows/ci.yml
 

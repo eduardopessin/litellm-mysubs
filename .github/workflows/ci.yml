@@ -13,7 +13,18 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# LiteLLM fetches its price map from GitHub at import and silently falls back to the copy in
+# the wheel when that fails. The two differ (the remote one carries extra rules), so a test
+# of `completion_cost` could pass or fail depending on the network. The bundled map is the
+# one pinned by the version under test; every run reads that one.
+env:
+  LITELLM_LOCAL_MODEL_COST_MAP: "True"
+
 jobs:
+  # The plugin runs inside someone else's image and touches LiteLLM internals, so the whole
+  # suite — the contract test on the internal symbols included — runs against the version
+  # the reference installation runs and against the current release. The contract test
+  # alone against 1.101.0 left every other behaviour measured only on `latest`.
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -21,28 +32,6 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.11", "3.12", "3.13"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - run: pip install -e ".[dev]"
-      - name: ruff
-        run: ruff check .
-      - name: mypy
-        run: mypy
-      - name: pytest
-        # --cov-fail-under comes from pyproject: falling coverage goes red.
-        run: pytest --cov=litellm_mysubs --cov-report=term-missing
-
-  # The plugin runs inside someone else's image and touches LiteLLM internals.
-  # This job is what turns a silently incompatible upgrade into a red CI run,
-  # instead of a production outage.
-  litellm-contract:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
         # The pinned version is the one the reference installation runs; "latest" catches
         # incompatibilities before they reach it.
         litellm: ["1.101.0", "latest"]
@@ -50,20 +39,44 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - name: install litellm ${{ matrix.litellm }}
+          python-version: ${{ matrix.python }}
+      - name: install (litellm ${{ matrix.litellm }})
+        # One resolution, by uv. `pip install -e ".[dev]"` left litellm free (`>=1.70`),
+        # and twice on 2026-09-28 pip's backtracking through older litellm releases ended in
+        # ResolutionImpossible. uv is the installer of the local gate; it resolves in seconds
+        # and names the conflicting requirement when there is one.
+        # A version is pinned exactly. "latest" is left to the resolver rather than pinned to
+        # PyPI's JSON `info.version`: the same day the simple index uv reads lagged the JSON
+        # API by over an hour for a new release, and an exact pin would have failed CI for a
+        # version the index did not serve yet. The installed version is printed, and a
+        # warning is raised when it is behind the JSON API's latest, so a silent downgrade is
+        # still visible.
         # The proxy extras are required: route_llm_request imports fastapi, and that is
         # where the /v1/responses route is intercepted.
         run: |
-          pip install -e ".[dev]"
+          set -euo pipefail
+          python -m pip install uv
           if [ "${{ matrix.litellm }}" = "latest" ]; then
-            pip install --upgrade "litellm[proxy]"
+            uv pip install --system -e ".[dev]" "litellm[proxy]"
           else
-            pip install "litellm[proxy]==${{ matrix.litellm }}"
+            uv pip install --system -e ".[dev]" "litellm[proxy]==${{ matrix.litellm }}"
           fi
-      - name: symbols the patch depends on
-        # No --no-cov: this job runs a subset and the coverage gate belongs to the test job.
-        run: pytest tests/test_litellm_contract.py -v --no-cov
+          installed=$(python -c 'from importlib.metadata import version; print(version("litellm"))')
+          echo "litellm $installed"
+          if [ "${{ matrix.litellm }}" = "latest" ]; then
+            newest=$(curl -fsSL --retry 3 https://pypi.org/pypi/litellm/json \
+              | python -c 'import json, sys; print(json.load(sys.stdin)["info"]["version"])') || newest=""
+            if [ -n "$newest" ] && [ "$newest" != "$installed" ]; then
+              echo "::warning::latest cell installed litellm $installed; PyPI's JSON API says $newest"
+            fi
+          fi
+      - name: ruff
+        run: ruff check .
+      - name: mypy
+        run: mypy
+      - name: pytest
+        # --cov-fail-under comes from pyproject: falling coverage goes red.
+        run: pytest --cov=litellm_mysubs --cov-report=term-missing
 
   # The wiring comes from OMP. A rename on their side leaves the `# omp:` anchors pointing
   # at nothing, and the `# omp=` ones catch the worse case: the name stays and the **value**
@@ -80,7 +93,7 @@ jobs:
 
   build:
     # A hand-built artifact hides a dead pipeline. What gets published is what CI built.
-    needs: [test, litellm-contract, omp-anchors]
+    needs: [test, omp-anchors]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

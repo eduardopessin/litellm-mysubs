@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-09-28
+
+### Fixed
+
+- **`/v1/messages` streamed by Codex or Antigravity is readable by Anthropic clients.** Four
+  defects in the same stream, each measured through the real proxy and the `anthropic` SDK:
+  - frames carried no `event:` line, and the SDK (and Claude Code) dispatch on it, so SDK
+    clients received nothing while a curl-style read looked fine;
+  - text and thinking deltas used the key `text_delta` / `thinking_delta` instead of
+    `text` / `thinking` — confirmed on the live gateway;
+  - `tool_use` and `thinking` blocks were never streamed, only the text;
+  - a failure mid-stream ended the turn as if it had finished; an Anthropic `error` event
+    is now sent before the failure is raised.
+  The encoder is now ported from omp 18.4.1 `providers/anthropic-messages-server.ts` and
+  anchored to it. A blocked answer (Antigravity SAFETY) reports `end_turn`, per omp's
+  `mapStopReasonOut`, instead of claiming `stop_sequence`.
+- **`tool_choice` on `/v1/messages` reaches Codex and Antigravity in their own shape.** The
+  Messages form (`{"type": "auto" | "any" | "none" | "tool"}`) went through untranslated,
+  and Codex answered every explicit choice with 400 `Invalid value` — found while validating
+  this release on the live gateway, and already broken on 0.1.14. Ported from omp's
+  `mapToolChoice`: `auto`, `required`, `none`, or the named function.
+- **An operator's deployment with its own credentials is never served by a subscription.**
+  On the Router chat path the name heuristic claimed unmarked deployments: an operator's
+  `gpt-4o` with its own key was answered by Codex, and an operator's `claude-*` went out with
+  the Claude Max token and was cloned by the Router. The same happened on a second hop
+  (the Router calls `litellm.acompletion`) and through LiteLLM's own `/v1/responses` and
+  `/v1/messages` bridges. Unmarked deployments with `api_key`, `api_base`, `base_url` or
+  `litellm_credential_name` are now left untouched on every hop. Config-declared `claude-*`
+  entries without credentials (DECISIONS D2) are still served by Claude Max, and their token
+  now goes on the deployment, so they are no longer cloned on every rotation.
+- **mysubs never pushes a Claude request past 4 `cache_control` markers.** An omp 18.4.1
+  agent with `<project-context>` and `<memories>` in its system prompt, or any client already
+  spending 4 markers outside the system prompt, got a fifth one from mysubs, and Anthropic
+  answers that with 400.
+
+### Changed
+
+- **Anthropic system cache breakpoint follows omp 18.4.1.** `<project-context>` joins
+  `<memories>` as volatile; the breakpoint sits before the first volatile block, and a
+  client's system marker is moved there rather than joined by a second one. The chat route
+  keeps each client system message as its own block, as LiteLLM would, and the breakpoint
+  never lands on the injected identity alone.
+- **omp pin 18.3.2 → 18.4.1**, and the Codex `User-Agent` says `omp/18.4.1` (it said
+  `omp/18.2.6`).
+- **CI runs the whole suite on LiteLLM 1.101.0 as well as the latest release**, on Python
+  3.11–3.13. Until now only the contract tests ran against 1.101.0. Installs go through uv,
+  the cost map is the bundled one, and the `anthropic` SDK is a dev dependency so the
+  client-side tests run.
+
+### Removed
+
+- `registry.is_declared`, `ModelRegistry.evict_shadow`, `remember_not_found` and
+  `is_known_bad`: no production caller, and `is_declared` was wrong against the real Router,
+  which gives config entries a hashed id.
+
 ## [0.1.14] - 2026-09-28
 
 ### Removed
@@ -806,7 +861,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.11...v0.1.12

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from litellm.types.utils import ModelResponse, ModelResponseStream
@@ -678,6 +678,11 @@ async def dispatch_messages(*, provider: ProviderId | None = None, **kwargs: Any
     tools = messages.to_tools(payload)
     if tools:
         converted["tools"] = tools
+    choice = messages.to_tool_choice(payload)
+    if choice is None:
+        converted.pop("tool_choice", None)
+    else:
+        converted["tool_choice"] = choice
     converted.pop("system", None)
     converted.pop("stream", None)
 
@@ -702,27 +707,25 @@ async def dispatch_messages(*, provider: ProviderId | None = None, **kwargs: Any
         response = await _logged(turn, kwargs)
     except UpstreamError as error:
         raise _as_litellm_error(error, model, kwargs) from error
-    return messages.from_model_response(response, model)
+    return messages.encode_response(response, model)
 
 
 async def _messages_events(
     chunks: AsyncIterator[ModelResponseStream], model: str, kwargs: dict[str, Any]
 ) -> AsyncIterator[dict[str, Any]]:
-    """Relays canonical chunks as the Anthropic event sequence, text first.
+    """Relays canonical chunks as the Anthropic event sequence, each block as it arrives.
 
     Both subscriptions reach this through their own reader, so the sequence a client sees
-    does not depend on which one answered. Reasoning and tool calls are known only once
-    the turn closes and are emitted as whole blocks after the text — the same division the
-    Responses route makes, because neither upstream streams them in a form that can be
-    replayed without a second interpretation of the same events.
+    does not depend on which one answered. Reasoning, text and tool calls all arrive as
+    chunk deltas while the turn runs, and each becomes its own block — relaying the text
+    alone, as this did, left a streamed tool call with ``stop_reason: tool_use`` and no
+    ``tool_use`` block, while the non-streamed call returned it.
 
     The chunks carry the finished turn's own finish reason and usage on their tail, which
     `_finish_chunk` and `_usage_chunk` appended; they are read here rather than rebuilt,
     so a streamed turn and a non-streamed one cannot disagree about either.
     """
-    state = messages.MessagesStreamState()
-    envelope = messages.envelope(model)
-    text_parts: list[str] = []
+    encoder = messages.MessagesStreamEncoder()
     tail: dict[str, Any] = {}
 
     # Opened before the first chunk, not on it. `message_start` carries no content — it is
@@ -730,29 +733,36 @@ async def _messages_events(
     # back until the model spoke made the route look slower than it is: measured against
     # `/v1/responses`, which emits `response.created` immediately, 4003 ms to first event
     # against 32 ms for the same prompt and ceiling.
-    yield state.start(envelope)
+    yield encoder.start(model)
 
     async for chunk in chunks:
         _absorb_tail(tail, chunk)
-        text = _chunk_text(chunk)
-        if not text:
-            continue
-        for out in state.open_text():
+        for out in _chunk_events(encoder, chunk):
             yield out
-        text_parts.append(text)
-        yield state.delta(text)
 
-    for out in state.close_text():
+    for out in encoder.done(tail.get("finish_reason"), tail.get("usage")):
         yield out
 
-    payload = {
-        **envelope,
-        "content": [{"type": "text", "text": "".join(text_parts)}],
-        "stop_reason": messages.stop_reason(tail.get("finish_reason")),
-        "usage": tail.get("usage") or {},
-    }
-    for out in state.finish(payload):
-        yield out
+
+def _chunk_events(
+    encoder: messages.MessagesStreamEncoder, chunk: ModelResponseStream
+) -> list[dict[str, Any]]:
+    """The block events one canonical chunk produces, in the order the readers emit them."""
+    # Every chunk the readers and `_finish_chunk`/`_usage_chunk` build has one choice.
+    delta = chunk.choices[0].delta
+    out: list[dict[str, Any]] = []
+    if reasoning := getattr(delta, "reasoning_content", None):
+        out.extend(encoder.thinking(str(reasoning)))
+    if text := getattr(delta, "content", None):
+        out.extend(encoder.text(str(text)))
+    for call in getattr(delta, "tool_calls", None) or []:
+        function = call.function
+        # Only the opening chunk carries the id; the argument chunks carry the index.
+        if call.id:
+            out.extend(encoder.tool_call(call.index, call.id, str(function.name or "")))
+        if function.arguments:
+            out.extend(encoder.tool_arguments(call.index, function.arguments))
+    return out
 
 
 def _absorb_tail(tail: dict[str, Any], chunk: ModelResponseStream) -> None:
@@ -765,29 +775,48 @@ def _absorb_tail(tail: dict[str, Any], chunk: ModelResponseStream) -> None:
     """
     usage = getattr(chunk, "usage", None)
     if usage is not None:
-        tail["usage"] = {
-            "input_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
-            "output_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
-        }
+        tail["usage"] = usage
     choices = getattr(chunk, "choices", None) or []
     if choices and getattr(choices[0], "finish_reason", None):
         tail["finish_reason"] = choices[0].finish_reason
 
 
-def _wrap_messages_stream(
+async def _wrap_messages_stream(
     chunks: AsyncIterator[ModelResponseStream], model: str, kwargs: dict[str, Any]
-) -> AsyncIterator[dict[str, Any]]:
-    """The Messages event stream, with the turn's spend row dispatched at its end.
+) -> AsyncIterator[bytes]:
+    """The Messages stream as SSE frames, with the turn's spend row dispatched at its end.
 
     The chat route gets its row from `CustomStreamWrapper`; this route never reaches that
     wrapper, because it emits Anthropic events rather than chat chunks. `_logged_messages`
     closes the same accounting hole `_logged_stream` closes on the Responses route.
+
+    Frames, not dicts: see `messages.sse_frame` for why a dict reached the Anthropic SDK as
+    an empty stream. Framing runs outside the accounting so `_logged_messages` still reads
+    the events themselves, and the explicit `aclose` hands it a client disconnect at once
+    — its `finally` is what bills a turn the client stopped reading.
+
+    A failure after the stream opened goes out as omp's `error` event and is then
+    re-raised: the event is what the SDK raises on, and the exception is what still
+    reaches LiteLLM's failure hook — whose own error frame the SDK drops unread.
     """
-    return _logged_messages(
-        _messages_events(_translate_errors(chunks, model, kwargs), model, kwargs),
-        model,
-        kwargs,
+    # `_logged_messages` is an async generator; its declared type is only the iterator.
+    events = cast(
+        "AsyncGenerator[dict[str, Any], None]",
+        _logged_messages(
+            _messages_events(_translate_errors(chunks, model, kwargs), model, kwargs),
+            model,
+            kwargs,
+        ),
     )
+    try:
+        async for event in events:
+            yield messages.sse_frame(event["type"], event)
+    except Exception as error:
+        failure = messages.stream_error(str(getattr(error, "message", None) or error))
+        yield messages.sse_frame("error", failure)
+        raise
+    finally:
+        await events.aclose()
 
 
 async def dispatch(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:

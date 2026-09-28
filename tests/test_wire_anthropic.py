@@ -71,12 +71,12 @@ class TestNormalizeEffort:
 class TestSystemBlocks:
     def test_identity_is_first_block(self) -> None:
         """system=[client] returns 429; the identity has to come first."""
-        blocks = ant.build_system_blocks("be brief")
+        blocks = ant.build_system_blocks({"type": "text", "text": "be brief"})
         assert blocks[0]["text"] == ant.CLAUDE_CODE_PROMPT
         assert blocks[1]["text"] == "be brief"
 
     def test_identity_alone_when_no_client_prompt(self) -> None:
-        assert ant.build_system_blocks("") == [{"type": "text", "text": ant.CLAUDE_CODE_PROMPT}]
+        assert ant.build_system_blocks() == [{"type": "text", "text": ant.CLAUDE_CODE_PROMPT}]
 
     def test_client_prompt_keeps_system_authority(self) -> None:
         """Stuffing the client prompt into a user turn stripped its system authority."""
@@ -91,23 +91,25 @@ class TestSystemBlocks:
         assert len(out["messages"][0]["content"]) == 2
         assert out["messages"][1]["role"] == "user"
 
-    def test_merges_multiple_system_messages(self) -> None:
-        client, rest = ant.split_system_messages(
+    def test_each_system_message_stays_its_own_block(self) -> None:
+        """Joined, `[static, <project-context>]` became one block the head anchor could not
+        split; see tests/test_anthropic_cache_omp1841.py for the wire effect."""
+        blocks, rest = ant.split_system_messages(
             [
                 {"role": "system", "content": "one"},
                 {"role": "user", "content": "x"},
                 {"role": "system", "content": "two"},
             ]
         )
-        assert client == "one\n\ntwo"
+        assert [b["text"] for b in blocks] == ["one", "two"]
         assert len(rest) == 1
 
     def test_strips_duplicated_identity(self) -> None:
         """A client that already sends the identity must not duplicate it in its own block."""
-        client, _ = ant.split_system_messages(
+        blocks, _ = ant.split_system_messages(
             [{"role": "system", "content": ant.CLAUDE_CODE_PROMPT}]
         )
-        assert client == ""
+        assert blocks == []
 
 
 class TestCacheAnchors:

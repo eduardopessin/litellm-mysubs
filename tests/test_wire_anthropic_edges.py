@@ -66,7 +66,7 @@ class TestMalformedInput:
         assert out["extra_headers"] == "x"
 
     def test_system_content_list_extracts_text_blocks(self) -> None:
-        client, rest = ant.split_system_messages(
+        blocks, rest = ant.split_system_messages(
             [
                 {
                     "role": "system",
@@ -77,7 +77,7 @@ class TestMalformedInput:
                 }
             ]
         )
-        assert client == "instruction"
+        assert blocks == [{"type": "text", "text": "instruction"}]
         assert rest == []
 
 
