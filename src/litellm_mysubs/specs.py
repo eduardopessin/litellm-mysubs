@@ -37,9 +37,8 @@ ANTIGRAVITY_USER_AGENT: Final = (
 #: ends.
 _SIGNATURE_LIMIT: Final = 512
 
-#: This instance's transport identity. Per process, as in the real client: a new
-#: `window_id` on every request invalidated the backend's prompt cache.
-_WINDOW_ID: Final = str(uuid.uuid4())
+#: This instance's transport identity (Antigravity's request ids). Codex's thread and
+#: window ids are per conversation, not per process: see `codex.turn_metadata`.
 _AGENT_ID: Final = uuid.uuid4().hex[:16]
 _TRAJECTORY_ID: Final = uuid.uuid4().hex[:16]
 
@@ -199,25 +198,31 @@ def _request_id() -> str:
     return f"agent/{_AGENT_ID}/{int(time.time() * 1000)}/{_TRAJECTORY_ID}/{_state.step}"
 
 
+# omp: providers/openai-codex-responses.ts :: createCodexRequestContext
 async def _codex_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> RequestSpec:
     # No output caps to strip: `build_request_body` builds the body from scratch and does
     # not read `max_tokens`/`max_output_tokens`/`max_completion_tokens` from the kwargs. The
     # original had to delete them because it passed the kwargs on; here they never reach
     # the wire.
     token = await _access_token("codex")
+    # One identity per request, shared by the body's `client_metadata` and the headers,
+    # as omp builds it once and hands it to both.
+    session_id = codex.session_key(model, messages, extra.get("tools"), extra)
+    metadata = codex.turn_metadata(session_id, messages)
     body = codex.build_request_body(
         model,
         messages,
         tools=extra.get("tools"),
         extra=extra,
-        session_id=extra.get("litellm_session_id") or extra.get("user"),
+        session_id=session_id,
+        metadata=metadata,
     )
     headers = codex.build_headers(
         token,
-        window_id=_WINDOW_ID,
-        session_id=extra.get("litellm_session_id") or extra.get("user"),
-        model=str(body.get("model") or model),
-        service_tier=extra.get("service_tier"),
+        session_id=session_id,
+        metadata=metadata,
+        model=str(body["model"]),
+        service_tier=body.get("service_tier"),
     )
     return RequestSpec(url=CODEX_URL, headers=headers, body=body, provider="codex", model=model)
 
