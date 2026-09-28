@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.16] - 2026-09-28
 
 More of the upstream protocol inherited from omp 18.4.1, so that following omp stays a
-mechanical port: 340 anchors (201 in 0.1.15), and the anchor check now also catches a
+mechanical port: 342 anchors (201 in 0.1.15), and the anchor check now also catches a
 changed declaration, not only a renamed one.
 
 ### Fixed
