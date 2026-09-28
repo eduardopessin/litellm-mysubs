@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The encoder is now ported from omp 18.4.1 `providers/anthropic-messages-server.ts` and
   anchored to it. A blocked answer (Antigravity SAFETY) reports `end_turn`, per omp's
   `mapStopReasonOut`, instead of claiming `stop_sequence`.
+- **`tool_choice` on `/v1/messages` reaches Codex and Antigravity in their own shape.** The
+  Messages form (`{"type": "auto" | "any" | "none" | "tool"}`) went through untranslated,
+  and Codex answered every explicit choice with 400 `Invalid value` — found while validating
+  this release on the live gateway, and already broken on 0.1.14. Ported from omp's
+  `mapToolChoice`: `auto`, `required`, `none`, or the named function.
 - **An operator's deployment with its own credentials is never served by a subscription.**
   On the Router chat path the name heuristic claimed unmarked deployments: an operator's
   `gpt-4o` with its own key was answered by Codex, and an operator's `claude-*` went out with

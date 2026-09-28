@@ -387,6 +387,41 @@ class TestAStreamedMessagesTurnIsWhatAClientReads:
         assert events[0][0] == "message_start"
         assert "message_stop" not in [name for name, _ in events], "a failed turn cannot stop"
 
+    @pytest.mark.parametrize(
+        ("choice", "codex_wire", "antigravity_wire"),
+        [
+            ({"type": "auto"}, "auto", {"mode": "VALIDATED"}),
+            ({"type": "any"}, "required", {"mode": "ANY"}),
+            ({"type": "none"}, "none", {"mode": "NONE"}),
+            (
+                {"type": "tool", "name": "get_weather"},
+                {"type": "function", "name": "get_weather"},
+                {"mode": "ANY", "allowedFunctionNames": ["get_weather"]},
+            ),
+        ],
+    )
+    async def test_the_tool_choice_reaches_the_upstream_in_its_own_shape(
+        self, choice: dict[str, Any], codex_wire: Any, antigravity_wire: dict[str, Any]
+    ) -> None:
+        """Messages' ``tool_choice`` went through untranslated, and Codex answered every
+        explicit one with 400 ``Invalid value: 'auto'`` (``'any'``, ``'tool'``) — measured on
+        the live gateway on 0.1.14. omp's `mapToolChoice` maps it to the canonical form."""
+        for model, upstream in ((CODEX, codex_turn), (ANTIGRAVITY, antigravity_turn)):
+            transport = install_transport(FakeTransport(upstream(tool=True)))
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_server.app), base_url="http://proxy"
+            ) as client:
+                response = await client.post(
+                    "/v1/messages",
+                    json={**REQUEST, "model": model, "stream": True, "tool_choice": choice},
+                )
+            assert response.status_code == 200, response.text
+            body = transport.specs[0].body
+            if model == CODEX:
+                assert body["tool_choice"] == codex_wire
+            else:
+                assert body["request"]["toolConfig"]["functionCallingConfig"] == antigravity_wire
+
 
 def sdk_client() -> tuple[Any, Any]:
     """The Anthropic SDK pointed at the proxy app, or a skip where it is not installed."""

@@ -678,6 +678,11 @@ async def dispatch_messages(*, provider: ProviderId | None = None, **kwargs: Any
     tools = messages.to_tools(payload)
     if tools:
         converted["tools"] = tools
+    choice = messages.to_tool_choice(payload)
+    if choice is None:
+        converted.pop("tool_choice", None)
+    else:
+        converted["tool_choice"] = choice
     converted.pop("system", None)
     converted.pop("stream", None)
 

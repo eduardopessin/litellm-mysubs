@@ -140,6 +140,33 @@ def to_tools(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return tools
 
 
+# omp: providers/anthropic-messages-server.ts :: mapToolChoice
+def to_tool_choice(payload: dict[str, Any]) -> object | None:
+    """Messages ``tool_choice`` as the canonical (chat-completions) one, or ``None``.
+
+    Messages spells it ``{"type": "auto" | "any" | "none"}`` or ``{"type": "tool", "name"}``;
+    the canonical form is ``"auto"``, ``"required"``, ``"none"`` or ``{"type": "function",
+    "function": {"name"}}``, which the Codex and Antigravity builders already translate.
+    Passing the Messages shape through was answered by Codex with 400 ``Invalid value:
+    'auto'`` (``'any'``, ``'tool'``) — every explicit choice failed, measured on the live
+    gateway on 0.1.14. ``disable_parallel_tool_use`` has no counterpart in either builder
+    and is not carried.
+    """
+    choice = payload.get("tool_choice")
+    if not isinstance(choice, dict):
+        return None
+    kind = choice.get("type")
+    if kind == "auto":
+        return "auto"
+    if kind == "any":
+        return "required"
+    if kind == "none":
+        return "none"
+    if kind == "tool" and choice.get("name"):
+        return {"type": "function", "function": {"name": str(choice["name"])}}
+    return None
+
+
 # -- outbound: ported from omp's Anthropic Messages server ---------------------
 #
 # omp serves Anthropic Messages from other providers' streams with the same shapes this
