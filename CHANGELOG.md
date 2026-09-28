@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-09-28
+
+### Fixed
+
+- **A rotating Claude token no longer clones the deployment.** The router path handed the
+  OAuth token to LiteLLM in the request kwargs, which the Router reads as a client-side
+  credential: `Router._handle_clientside_credential` upserts a copy of the deployment per
+  distinct key. Measured on the live gateway after 21 h: 60 managed deployments for 49
+  names, `claude-opus-5-5` seven times, every copy carrying `managed_by` and a stale token.
+  The token now goes on our deployment's `litellm_params`, and the copies stop. Existing
+  copies go away on the next restart or apply.
+- **Claude requests go out at the model's own output ceiling**, as Claude Code and omp
+  18.4.1 do ("OAuth and API-key requests alike get the full model ceiling; Claude Code
+  itself requests 128k on Opus 5.5"). The ceiling comes from Anthropic's `/v1/models`,
+  carried on the deployment: 128000 for the 5.x and 4.6-and-later families, 64000 for the
+  4.5 ones — measured, the first value the upstream refuses is one above each. A caller
+  asking for more is lowered to it; a caller asking for nothing gets it, where the thinking
+  path used to fill in budget + margin. A model with no declared ceiling gets 64000, omp's
+  value for that case. Existing deployments carry no ceiling until re-applied from
+  `/mysubs`, and run at 64000 until then.
+- **Antigravity no longer invents an output ceiling.** A flat 64000 was sent whenever the
+  caller asked for none: below the 65536 the gemini 3.x variants accept, above the 4096 and
+  32768 of the `tab_*` models and `gpt-oss-120b-medium`. The caller's value is sent,
+  lowered only to what the catalog declares; with neither, the catalog's is sent; with no
+  declaration, the field is omitted, as omp does.
+- **The Responses stream works on LiteLLM 1.103.0.** Its base iterator gained
+  `_generated_tool_arguments`, which inherited methods append to and read; the plugin's
+  stream did not set it, so the read raised mid-stream.
+
+### Added
+
+- **`model_info.max_output_tokens` states what the provider declares.** Anthropic from
+  `/v1/models` (which now answers a subscription token); Antigravity from `maxOutputTokens`
+  in its catalog; Codex as explicitly empty, because its backend refuses
+  `max_output_tokens` and LiteLLM would otherwise fill 128000 from its price map.
+  Undeclared ceilings are left out. Declared ceilings reach existing selections when they
+  are next applied from `/mysubs`; the Codex one is added on read.
+
 ## [0.1.12] - 2026-09-26
 
 ### Added
@@ -755,7 +793,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.13...HEAD
+[0.1.13]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.9...v0.1.10

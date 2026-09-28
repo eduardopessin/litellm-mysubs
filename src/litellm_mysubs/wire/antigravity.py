@@ -54,8 +54,6 @@ THINKING_LEVEL: Final[dict[str, str]] = {
 #: without the text coming back.
 SUPPRESSED_THINKING_LEVEL: Final = "MINIMAL"
 
-DEFAULT_MAX_OUTPUT_TOKENS: Final = 64000
-
 # omp: providers/google-shared.ts :: SKIP_THOUGHT_SIGNATURE
 #: The CCA requires the sentinel when the **first** call of an assistant turn goes without
 #: a signature; later calls in the same turn go bare.
@@ -557,6 +555,52 @@ def _fit_budget(budget: int, max_output_tokens: int | None) -> int | None:
     return max(MIN_THINKING_BUDGET, max_output_tokens - 1)
 
 
+# omp: wire/gemini-headers.ts :: ANTIGRAVITY_MODEL_WIRE_PROFILES
+def declared_output_tokens(entry: Any) -> int | None:
+    """The output ceiling the catalog declares for a model, or ``None`` if it declares none.
+
+    ``maxOutputTokens`` is per model and not uniform — measured on 2026-09-28 against the
+    account's ``:fetchAvailableModels``: 65536 for the gemini 3.x variants, 65535 for 2.5
+    and 3.1, 64000 for the two `claude-*`, 32768 for `gpt-oss-120b-medium`, 4096 for the
+    `tab_*` ones, and absent for `chat_20706`, `chat_23310` and `gemini-3.1-flash-image`.
+    Absent stays absent: a ceiling filled in here would be one the provider never set.
+    """
+    if not isinstance(entry, Mapping):
+        return None
+    value = entry.get("maxOutputTokens")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+# omp: providers/google-gemini-cli.ts :: buildRequest
+def output_ceiling(requested: Any, entry: Any) -> int | None:
+    """``maxOutputTokens`` for one request: the caller's, never above what the model accepts.
+
+    Three cases, none of which invents a number:
+
+    - the caller asked for a ceiling: it is sent, lowered only to the declared one — Claude
+      on this backend answers ``maxOutputTokens > 64000`` with 400 (omp,
+      ``ANTIGRAVITY_MODEL_WIRE_PROFILES``);
+    - the caller asked for none and the catalog declares one: the declared one is sent. It
+      is the model's own limit, and for the ids omp profiles it is also the fixed cap the
+      real client sends (65535/65536 for gemini, 64000 for claude);
+    - neither: the field is omitted, as omp does, and the backend applies its own.
+
+    A flat 64000 used to fill the gap. That was a limit nobody set: below the 65536 the
+    gemini 3.x variants accept, and above the 4096 and 32768 of the `tab_*` models and
+    `gpt-oss-120b-medium`.
+    """
+    declared = declared_output_tokens(entry)
+    try:
+        asked = int(requested) if requested else None
+    except (TypeError, ValueError):
+        asked = None
+    if asked is None or asked <= 0:
+        return declared
+    return asked if declared is None else min(asked, declared)
+
+
 def build_payload(
     model: str,
     messages: list[Any],
@@ -681,18 +725,17 @@ def build_payload(
     flush()
 
     # omp sends max_completion_tokens (OpenAI style); accept both spellings, otherwise the
-    # output ceiling the client asked for is silently replaced by the default.
-    max_tokens = (
-        extra.get("max_tokens") or extra.get("max_completion_tokens") or DEFAULT_MAX_OUTPUT_TOKENS
-    )
+    # output ceiling the client asked for is silently replaced.
     info = (catalog.info.get(mapped_model) if catalog else None) or {}
-    request: dict[str, Any] = {
-        "contents": contents,
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,
-            "thinkingConfig": _thinking_config(effort, info, max_tokens),
-        },
-    }
+    max_tokens = output_ceiling(
+        extra.get("max_tokens") or extra.get("max_completion_tokens"), info
+    )
+    generation: dict[str, Any] = {}
+    if max_tokens is not None:
+        # Ahead of `thinkingConfig`, the slot the real client gives it.
+        generation["maxOutputTokens"] = max_tokens
+    generation["thinkingConfig"] = _thinking_config(effort, info, max_tokens)
+    request: dict[str, Any] = {"contents": contents, "generationConfig": generation}
 
     # The native field is accepted with role "user" and with no practical size limit —
     # verified with 2520 chars: HTTP 200.
@@ -715,7 +758,6 @@ def build_payload(
 
 
 __all__ = [
-    "DEFAULT_MAX_OUTPUT_TOKENS",
     "INLINE_MAX_BYTES",
     "NON_VISION_IMAGE_PLACEHOLDER",
     "RETIREMENT_MARKERS",
@@ -727,12 +769,14 @@ __all__ = [
     "base_family",
     "build_payload",
     "content_parts",
+    "declared_output_tokens",
     "inline_part",
     "is_retired_response",
     "is_retirement_notice",
     "media_from_url",
     "media_part",
     "normalize_effort",
+    "output_ceiling",
     "raise_if_retired",
     "tool_config",
     "tool_result_value",

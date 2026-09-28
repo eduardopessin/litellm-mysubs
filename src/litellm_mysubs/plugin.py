@@ -136,6 +136,25 @@ def wire_model_of_deployment(router: Any, model: str) -> str | None:
     return None
 
 
+def output_ceiling_of_deployment(router: Any, model: str) -> int | None:
+    """``model_info.max_output_tokens`` of our Anthropic deployment for `model`, or `None`.
+
+    Discovery writes it from Anthropic's `/v1/models` (`catalog/discovery.py`); a
+    deployment applied before that, or a name that is not ours, has none, and the wire
+    falls back to `anthropic.UNKNOWN_MODEL_MAX_OUTPUT_TOKENS`.
+    """
+    for deployment in getattr(router, "model_list", None) or []:
+        if not isinstance(deployment, dict) or deployment.get("model_name") != model:
+            continue
+        info = deployment.get("model_info") or {}
+        if info.get(_PROVIDER_KEY) != _PROVIDER_IDS["anthropic"]:
+            continue
+        ceiling = info.get("max_output_tokens")
+        if isinstance(ceiling, int) and not isinstance(ceiling, bool) and ceiling > 0:
+            return ceiling
+    return None
+
+
 
 # -- the three routes: see `routes.py` -----------------------------------------
 
@@ -256,6 +275,7 @@ async def _delegate_kwargs(
     *,
     provider: ProviderId | None = None,
     native_system: bool = False,
+    output_ceiling: int | None = None,
 ) -> dict[str, Any]:
     """Kwargs for the original, with the Claude prompt applied when it is a Claude model.
 
@@ -269,13 +289,18 @@ async def _delegate_kwargs(
     endpoint — one account's credential sent to another.
 
     ``native_system`` is passed through for ``/v1/messages``, where the identity belongs in
-    the top-level ``system`` rather than in ``messages[0]``.
+    the top-level ``system`` rather than in ``messages[0]``. ``output_ceiling`` is the
+    model's, read off the deployment where there is one (`output_ceiling_of_deployment`).
     """
     model = str(kwargs.get("model") or "")
     if provider is not None and provider != "anthropic":
         return kwargs
     return anthropic.build_request(
-        kwargs, model, await _access_token("anthropic"), native_system=native_system
+        kwargs,
+        model,
+        await _access_token("anthropic"),
+        native_system=native_system,
+        output_ceiling=output_ceiling,
     )
 
 
@@ -315,16 +340,52 @@ async def _wrapped_router_acompletion(
     original = _state.original_router_acompletion
     assert original is not None
     delegated = await _delegate_kwargs(
-        {"model": model, "messages": messages, **kwargs}, provider=declared
+        {"model": model, "messages": messages, **kwargs},
+        provider=declared,
+        output_ceiling=output_ceiling_of_deployment(self, model),
     )
     delegated.pop("model", None)
     delegated.pop("messages", None)
     delegated.pop(_WIRE_MODEL_KEY, None)
     aliases = _pop_aliases(delegated)
+    _credential_onto_deployments(self, model, delegated)
     served = await original(
         self, model=model, messages=messages, stream=stream, **delegated
     )
     return _adapt_native_response(served, aliases)
+
+
+def _credential_onto_deployments(router: Any, model: str, delegated: dict[str, Any]) -> None:
+    """Hands the injected token to the Router on our deployment, not in the kwargs.
+
+    LiteLLM's Router reads an ``api_key`` in the request kwargs as a *client-side
+    credential*: `Router._handle_clientside_credential` upserts a new deployment whose id
+    hashes the params, key included, and keeps ours in ``model_info.original_model_id``.
+    The OAuth access token rotates, so every token minted a permanent copy carrying our
+    `managed_by` mark and a stale token. Measured on the live gateway on 2026-09-28: 60
+    managed deployments for 49 names after 21 h, `claude-opus-5-5` seven times, every
+    extra one with ``original_model_id`` pointing back at ours.
+
+    Set on the deployment, the token takes the ordinary path: the Router copies the chosen
+    deployment's ``litellm_params`` into the call. Only our Anthropic entries for this name
+    are touched, by the same mark `provider_of_deployment` reads. With none of them in the
+    list the token stays in the kwargs, because a call without it answers 401.
+    """
+    token = delegated.get("api_key")
+    if not token:
+        return
+    placed = False
+    for deployment in getattr(router, "model_list", None) or []:
+        if not isinstance(deployment, dict) or deployment.get("model_name") != model:
+            continue
+        info = deployment.get("model_info") or {}
+        params = deployment.get("litellm_params")
+        if info.get(_PROVIDER_KEY) != _PROVIDER_IDS["anthropic"] or not isinstance(params, dict):
+            continue
+        params["api_key"] = token
+        placed = True
+    if placed:
+        delegated.pop("api_key", None)
 
 
 def bind_responses_route(router: Any) -> bool:
@@ -444,9 +505,13 @@ def bind_messages_route(router: Any) -> bool:
             # be injected, exactly as the chat route does before delegating, or the native
             # client answers `Missing Anthropic API Key`.
             delegated = await _delegate_kwargs(
-                kwargs, provider=declared, native_system=True
+                kwargs,
+                provider=declared,
+                native_system=True,
+                output_ceiling=output_ceiling_of_deployment(router, model),
             )
             aliases = _pop_aliases(delegated)
+            _credential_onto_deployments(router, model, delegated)
             return _adapt_native_response(await original(**delegated), aliases)
 
         return _wrapped

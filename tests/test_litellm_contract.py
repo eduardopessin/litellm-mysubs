@@ -41,6 +41,24 @@ class TestRouterSurface:
         assert {"model", "messages"} <= set(params)
 
 
+class TestProxyModelInfo:
+    """`catalog/deployments.py` states the output ceiling in ``model_info`` and relies on the
+    proxy filling only the keys a deployment lacks. If LiteLLM starts overwriting them,
+    `/model/info` goes back to showing its price map's 128000 for every Claude and Codex
+    model."""
+
+    def test_a_stated_ceiling_survives_enrichment(self) -> None:
+        proxy_server = pytest.importorskip("litellm.proxy.proxy_server")
+        for stated in (64000, None):
+            model = {
+                "model_name": "m",
+                "litellm_params": {"model": "anthropic/claude-opus-5-5"},
+                "model_info": {"max_output_tokens": stated},
+            }
+            out = proxy_server._enrich_model_info_with_litellm_data(model)
+            assert out["model_info"]["max_output_tokens"] == stated
+
+
 class TestModuleSurface:
     def test_acompletion_entrypoints_exist(self) -> None:
         assert inspect.iscoroutinefunction(litellm.acompletion)

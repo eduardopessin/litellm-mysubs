@@ -2315,7 +2315,13 @@ class TestEveryDialectReachesEverySubscription:
             plugin.unbind_messages_route()
 
         assert out == "native", "the native path still answers it"
-        assert seen and seen[0].get("api_key"), "without a key the upstream returns 401"
+        deployment = router.model_list[0]
+        assert deployment["litellm_params"].get("api_key") == "tok-claude", (
+            "without a key the upstream returns 401"
+        )
+        # In the kwargs it would be a client-side credential, which makes the Router clone
+        # the deployment once per token.
+        assert "api_key" not in seen[0]
         # `/v1/messages` has its own top-level `system`, and the upstream rejects the
         # identity as `messages[0]` outright:
         #   400 messages.0: use the top-level 'system' parameter for the initial system
@@ -2324,6 +2330,40 @@ class TestEveryDialectReachesEverySubscription:
         assert all(
             message.get("role") != "system" for message in seen[0].get("messages") or []
         ), "no system message may survive in the turn list"
+
+    @pytest.mark.asyncio
+    async def test_the_deployments_ceiling_reaches_the_request(self) -> None:
+        """Discovery puts the model's declared ceiling on the deployment; the wire has no
+        other way to learn it, and without it `claude-opus-5-5` went out at 64000 where
+        Claude Code itself asks for 128000."""
+        seen: list[dict[str, Any]] = []
+
+        async def original(**kwargs: Any) -> str:
+            seen.append(kwargs)
+            return "native"
+
+        install_transport(FakeTransport())
+        router = SimpleNamespace(
+            aanthropic_messages=original,
+            anthropic_messages=original,
+            model_list=[
+                {
+                    "model_name": "mysubs/claudecode/claude-opus-5-5",
+                    "litellm_params": {"model": "anthropic/claude-opus-5-5"},
+                    "model_info": {"mysubs_provider": "anthropic", "max_output_tokens": 128000},
+                }
+            ],
+        )
+        plugin.bind_messages_route(router)
+        try:
+            await router.aanthropic_messages(
+                model="mysubs/claudecode/claude-opus-5-5",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        finally:
+            plugin.unbind_messages_route()
+
+        assert seen[0]["max_tokens"] == 128000
 
     @pytest.mark.asyncio
     async def test_the_system_prompt_is_not_lost(self) -> None:
@@ -2541,3 +2581,47 @@ class TestTheNativeResponseKeepsTheClientsToolNames:
             wrapper, {"mcp__skills_list": "skills_list"}
         ).chunk_creator({"model": "x"})
         assert seen == [{"model": "x"}]
+
+
+class TestARotatingTokenDoesNotCloneTheDeployment:
+    """LiteLLM's Router reads an `api_key` in the request kwargs as a client-side credential
+    and upserts a copy of the deployment for every distinct key. The subscription token
+    rotates, and the live gateway held 60 managed deployments for 49 names after 21 h —
+    `claude-opus-5-5` seven times. Against the real Router, not a fake, because the copy is
+    made inside it."""
+
+    NAME = "mysubs/claudecode/claude-opus-5"
+
+    async def test_three_tokens_leave_one_deployment(self) -> None:
+        store = FakeStore()
+        plugin.configure(store=store, transport=FakeTransport())
+        router = litellm.Router(
+            model_list=[
+                {
+                    "model_name": self.NAME,
+                    "litellm_params": {
+                        "model": "anthropic/claude-opus-5",
+                        "custom_llm_provider": "anthropic",
+                    },
+                    "model_info": {
+                        "id": self.NAME,
+                        "mysubs_provider": "anthropic",
+                        "managed_by": "mysubs",
+                    },
+                }
+            ]
+        )
+        plugin.install()
+
+        for token in ("tok-1", "tok-2", "tok-3"):
+            store.set("anthropic", Credential(provider="anthropic", access_token=token))
+            await router.acompletion(
+                model=self.NAME,
+                messages=[{"role": "user", "content": "hi"}],
+                mock_response="ok",
+            )
+
+        assert [d["model_info"]["id"] for d in router.model_list] == [self.NAME]
+        assert router.model_list[0]["litellm_params"]["api_key"] == "tok-3", (
+            "the call has to carry the current token, or the upstream answers 401"
+        )

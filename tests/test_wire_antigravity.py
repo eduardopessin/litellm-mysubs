@@ -49,9 +49,39 @@ class TestEnvelope:
         body = payload([{"role": "assistant", "content": "answer"}])
         assert body["request"]["contents"][0]["role"] == "model"
 
-    def test_default_output_ceiling(self) -> None:
+    def test_no_ceiling_is_invented_when_nothing_declares_one(self) -> None:
+        """A flat 64000 filled this gap: below the 65536 the gemini 3.x variants accept, and
+        above the 4096 of the `tab_*` models. With no caller value and no catalog entry the
+        field is left out, as omp does, and the backend applies its own."""
         body = payload([{"role": "user", "content": "x"}])
-        assert body["request"]["generationConfig"]["maxOutputTokens"] == 64000
+        assert "maxOutputTokens" not in body["request"]["generationConfig"]
+
+    def test_the_declared_ceiling_fills_the_gap(self) -> None:
+        wire = payload([{"role": "user", "content": "x"}])["model"]
+        catalog = ModelCatalog(
+            ids=(wire,), info={wire: {"maxOutputTokens": 65536}}, fetched_at=1.0
+        )
+        body = payload([{"role": "user", "content": "x"}], catalog=catalog)
+        assert body["request"]["generationConfig"]["maxOutputTokens"] == 65536
+
+    def test_the_caller_is_held_to_the_declared_ceiling(self) -> None:
+        """Claude on this backend answers `maxOutputTokens > 64000` with 400."""
+        wire = payload([{"role": "user", "content": "x"}])["model"]
+        catalog = ModelCatalog(
+            ids=(wire,), info={wire: {"maxOutputTokens": 64000}}, fetched_at=1.0
+        )
+        above = payload(
+            [{"role": "user", "content": "x"}], catalog=catalog, extra={"max_tokens": 100000}
+        )
+        below = payload(
+            [{"role": "user", "content": "x"}], catalog=catalog, extra={"max_tokens": 1000}
+        )
+        assert above["request"]["generationConfig"]["maxOutputTokens"] == 64000
+        assert below["request"]["generationConfig"]["maxOutputTokens"] == 1000
+
+    def test_only_a_positive_integer_is_a_declaration(self) -> None:
+        for entry in ({}, {"maxOutputTokens": 0}, {"maxOutputTokens": True}, None, "x"):
+            assert ag.declared_output_tokens(entry) is None, entry
 
     def test_accepts_openai_spelling_of_max_tokens(self) -> None:
         """OMP sends max_completion_tokens; ignoring it overrode the client's ceiling."""

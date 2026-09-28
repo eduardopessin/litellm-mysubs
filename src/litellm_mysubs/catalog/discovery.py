@@ -37,9 +37,10 @@ lacked. Asking the account beats maintaining a list of names by hand.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final
 
 import httpx
@@ -48,7 +49,7 @@ from ..credentials.store import Credential
 from ..transport import hosts, sse
 from ..transport.retry import is_unsupported_model
 from ..wire import anthropic, codex
-from ..wire.antigravity import is_retired_response
+from ..wire.antigravity import declared_output_tokens, is_retired_response
 from ..wire.antigravity_models import BROKEN_WIRE, ModelCatalog
 
 #: Probes in flight at once. The limit exists because a curated list fires one request per
@@ -71,6 +72,16 @@ PROBE_MAX_OUTPUT_TOKENS: Final = 8
 #: LiteLLM; importing it from there would drag the whole of LiteLLM into discovery, which is
 #: precisely the dependency this package keeps apart.
 ANTHROPIC_MESSAGES_URL: Final = "https://api.anthropic.com/v1/messages"
+
+#: Anthropic model listing. It does not decide which names are offered — that stays with
+#: the probe — only what each one declares. Measured on 2026-09-28 with a subscription
+#: token: 200, with ``max_tokens`` and ``max_input_tokens`` per model. An earlier
+#: measurement answered 401, which is why discovery still does not depend on it.
+ANTHROPIC_MODELS_URL: Final = "https://api.anthropic.com/v1/models"
+
+#: A dated build in the Anthropic listing: ``claude-opus-4-5-20251101`` is what the
+#: curated alias ``claude-opus-4-5`` resolves to.
+ANTHROPIC_DATED_BUILD: Final = re.compile(r"^(?P<alias>.+)-\d{8}$")
 
 #: Value of ``anthropic-version``. Fixed in OMP's `providers/anthropic.ts` (it carries no
 #: anchor because the anchor checker only accepts identifier symbols).
@@ -217,6 +228,10 @@ class DiscoveredModel:
     default is empty so that older callers do not start asserting a family nobody measured.
     """
 
+    max_output_tokens: int | None = None
+    """Output ceiling a request through this plugin can actually use, when the provider
+    declares one. ``None`` means nothing was declared — never a default filled in."""
+
 
 def suggested_name(wire_name: str) -> str:
     """Public name from the wire name: ``anthropic/claude-opus-5`` -> ``claude-opus-5``.
@@ -275,12 +290,19 @@ async def discover(
             credential, client=client, catalog=catalog or ModelCatalog(), now=now, probe=probe
         )
     if credential.provider == "anthropic":
-        # Anthropic has no catalog: `/v1/models` answers 401 with a subscription token, and
-        # the public list does not predict the served set. A curated list of measured names,
-        # each one probed, is all there is.
-        return await _discover_probed(
+        # The served set comes from probing a curated list of measured names: the public
+        # list does not predict what a subscription serves (see `CURATED_ANTHROPIC`). The
+        # listing only contributes what each probed name declares. After the probes, not
+        # beside them: it is one more request to the same upstream, and `PROBE_CONCURRENCY`
+        # is a ceiling on everything in flight.
+        probed = await _discover_probed(
             credential, CURATED_ANTHROPIC, _probe_anthropic, client, family="anthropic"
         )
+        ceilings = await _anthropic_output_ceilings(credential, client=client)
+        return [
+            replace(model, max_output_tokens=ceilings.get(model.wire_name))
+            for model in probed
+        ]
     return await _discover_codex(credential, client=client)
 
 
@@ -448,6 +470,7 @@ async def _discover_google(
                 verified=served,
                 note="; ".join(notes),
                 family=_catalog_family(catalog.info.get(wire)),
+                max_output_tokens=declared_output_tokens(catalog.info.get(wire)),
             )
         )
     return discovered
@@ -719,14 +742,7 @@ async def _probe_anthropic(client: httpx.AsyncClient, credential: Credential, wi
         "system": anthropic.build_system_blocks(""),
         "messages": [{"role": "user", "content": "."}],
     }
-    headers = {
-        "Authorization": f"Bearer {credential.access_token}",
-        "Content-Type": "application/json",
-        "accept": "application/json",
-        "anthropic-version": ANTHROPIC_API_VERSION,
-        "anthropic-beta": anthropic.build_betas(thinking=False),
-        **anthropic.CLIENT_HEADERS,
-    }
+    headers = _anthropic_headers(credential)
     try:
         status, text = await _post_status(
             client, ANTHROPIC_MESSAGES_URL, body=body, headers=headers
@@ -743,6 +759,62 @@ async def _probe_anthropic(client: httpx.AsyncClient, credential: Credential, wi
         f"upstream responded HTTP {status}, which does not distinguish a nonexistent "
         f"model from a temporary refusal; unverified",
     )
+
+
+def _anthropic_headers(credential: Credential) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {credential.access_token}",
+        "Content-Type": "application/json",
+        "accept": "application/json",
+        "anthropic-version": ANTHROPIC_API_VERSION,
+        "anthropic-beta": anthropic.build_betas(thinking=False),
+        **anthropic.CLIENT_HEADERS,
+    }
+
+
+async def _anthropic_output_ceilings(
+    credential: Credential, *, client: httpx.AsyncClient
+) -> dict[str, int]:
+    """Output ceiling per wire name, as Anthropic's listing declares it.
+
+    It is the model's full ceiling, and it is what the wire sends when the caller asks for
+    none (`anthropic.fit_output_ceiling`), as omp 18.4.1 and Claude Code do. Measured on
+    2026-09-28: 128000 for the 5.x and 4.6-and-later families, 64000 for the 4.5 ones —
+    each matching the first value the upstream refuses above it.
+
+    The listing names some models by dated build only, so each dated id also answers for
+    its undated alias — the name the curated list and the wire use.
+
+    Any failure yields ``{}``: no declaration, which leaves the field empty rather than
+    guessed.
+    """
+    try:
+        response = await client.get(
+            ANTHROPIC_MODELS_URL,
+            params={"limit": 100},
+            headers=_anthropic_headers(credential),
+            timeout=PROBE_TIMEOUT_S,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return {}
+    entries = payload.get("data") if isinstance(payload, dict) else None
+
+    ceilings: dict[str, int] = {}
+    for entry in entries if isinstance(entries, list) else ():
+        if not isinstance(entry, dict):
+            continue
+        ident, limit = entry.get("id"), entry.get("max_tokens")
+        if not isinstance(ident, str) or isinstance(limit, bool) or not isinstance(limit, int):
+            continue
+        if limit <= 0:
+            continue
+        ceilings[ident] = limit
+        dated = ANTHROPIC_DATED_BUILD.match(ident)
+        if dated:
+            ceilings.setdefault(dated.group("alias"), limit)
+    return ceilings
 
 
 async def _probe_codex(client: httpx.AsyncClient, credential: Credential, wire: str) -> _Probe:

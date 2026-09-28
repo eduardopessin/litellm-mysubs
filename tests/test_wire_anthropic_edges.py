@@ -218,9 +218,40 @@ class TestThinkingEdges:
         assert out["temperature"] == 0.3
         assert "thinking" not in out
 
-    def test_default_max_tokens_when_absent(self) -> None:
-        out = ant.apply_thinking_params({"reasoning_effort": "low"}, "claude-haiku-4-5")
-        assert out["max_tokens"] == ant.EFFORT_BUDGET["low"] + ant.OUTPUT_FALLBACK_BUFFER
+    def test_nothing_asked_takes_the_models_ceiling(self) -> None:
+        """Claude Code sends 128000 on `claude-opus-5-5`, and omp 18.4.1 the full model
+        ceiling. Budget + margin used to fill the gap on the thinking path: a limit below the
+        model's that nobody asked for."""
+        plain = ant.apply_thinking_params({}, "claude-opus-5-5", ceiling=128000)
+        thinking = ant.apply_thinking_params(
+            {"reasoning_effort": "low"}, "claude-haiku-4-5", ceiling=64000
+        )
+        assert plain["max_tokens"] == 128000
+        assert thinking["max_tokens"] == 64000
+
+    def test_a_request_above_the_ceiling_is_lowered_to_it(self) -> None:
+        """Measured: the 4.5 family answers `max_tokens: 64001 > 64000` with 400."""
+        out = ant.apply_thinking_params({"max_tokens": 100000}, "claude-opus-4-5", ceiling=64000)
+        assert out["max_tokens"] == 64000
+
+    def test_an_unknown_ceiling_falls_back_to_omps_default(self) -> None:
+        """The Messages API requires `max_tokens`; without a declared ceiling it is omp's
+        value for the same case, not LiteLLM's price map."""
+        out = ant.apply_thinking_params({}, "claude-opus-5-5")
+        assert out["max_tokens"] == ant.UNKNOWN_MODEL_MAX_OUTPUT_TOKENS
+
+    def test_a_lower_request_is_kept(self) -> None:
+        out = ant.apply_thinking_params(
+            {"max_completion_tokens": 1000}, "claude-opus-5-5", ceiling=128000
+        )
+        assert out["max_tokens"] == 1000
+        assert "max_completion_tokens" not in out
+
+    def test_thinking_room_never_passes_the_ceiling(self) -> None:
+        out = ant.apply_thinking_params(
+            {"reasoning_effort": "high", "max_tokens": 100}, "claude-haiku-4-5", ceiling=4096
+        )
+        assert out["max_tokens"] == 4096
 
     def test_unknown_effort_uses_medium_default(self) -> None:
         out = ant.apply_thinking_params({"reasoning_effort": "turbo"}, "claude-opus-5")
