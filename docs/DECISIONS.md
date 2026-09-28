@@ -113,6 +113,29 @@ Config for stable names, aliases and metadata. Wildcard as a safety net for what
 not been declared yet — that is what makes it possible to serve a new model of the family
 on day one.
 
+### Note — 2026-09-28: which `config.yaml` entries the subscription serves
+
+On the Router, ownership of a chat call is decided per deployment:
+
+- **Marked** (`model_info.mysubs_provider`, written by the plugin on what it injects):
+  served by the plugin, from the provider in the mark.
+- **Unmarked, with credentials of its own** — any of `api_key`, `api_base`, `base_url`,
+  `litellm_credential_name` set in `litellm_params`: the operator's. The call goes to
+  LiteLLM untouched, on this hop and on the ones below it (`litellm.acompletion`,
+  `litellm.completion`). Measured on 1.101.0 with a real Router before this rule: an
+  operator's `gpt-4o` with its own key was answered by the Codex subscription, and an
+  operator's `claude-*` with its own key went upstream with the Claude Max token and was
+  cloned by the Router once per token rotation.
+- **Unmarked, without credentials** — the entries this decision describes: still served by
+  name, `claude-*` with the Claude Max token. The token is written onto the deployment
+  rather than into the request, so a rotation no longer clones it.
+- **A name not in `model_list`**, resolved by the Router through a wildcard or an alias:
+  served by name as before, unless what it resolves to brings its own credentials.
+
+`/v1/responses` and `/v1/messages` serve only marked deployments at the Router, as before;
+the operator rule holds on the hops LiteLLM makes below them too. Direct
+`litellm.acompletion` calls, with no Router, are still decided by name alone.
+
 ---
 
 ## D3 — Injection into the Router, not `POST /model/new`

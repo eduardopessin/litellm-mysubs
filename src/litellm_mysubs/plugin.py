@@ -33,7 +33,9 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Final
 
 import litellm
@@ -102,8 +104,8 @@ def provider_of_deployment(router: Any, model: str) -> ProviderId | None:
     """The provider declared for `model`, or `None` if it is not one of our entries.
 
     Looks up `model_name` in the Router's list. A name that is not there — or that is there
-    without the mark — returns `None`, and dispatch falls back to the name heuristic, which
-    is what serves callers of `litellm.acompletion` directly, without a Router.
+    without the mark — returns `None`; whether the call is then left alone or served by
+    name is `is_operator_deployment`'s question, not this one's.
     """
     for deployment in getattr(router, "model_list", None) or []:
         if not isinstance(deployment, dict):
@@ -155,6 +157,96 @@ def output_ceiling_of_deployment(router: Any, model: str) -> int | None:
     return None
 
 
+#: `litellm_params` keys that say a deployment brings its own upstream. Any of them, set,
+#: makes an unmarked deployment the operator's (`is_operator_deployment`). The first three
+#: are what LiteLLM itself treats as a credential (`clientside_credential_keys` in
+#: `router_utils/clientside_credential_handler.py`); `litellm_credential_name` is the
+#: proxy's named credential, which resolves to the same thing.
+_OWN_CREDENTIAL_KEYS: Final = ("api_key", "api_base", "base_url", "litellm_credential_name")
+
+#: Written into ``model_info`` of an unmarked deployment whose ``api_key`` this plugin set
+#: (`_credential_onto_deployments`), so that key is not mistaken for the operator's on the
+#: next call — without it, the second request to a DECISIONS.md D2 entry would find a key
+#: on the deployment and leave the call alone with the previous, rotated-out token.
+_PLACED_TOKEN_KEY: Final = "mysubs_placed_token"
+
+
+def _is_marked(deployment: dict[str, Any]) -> bool:
+    info = deployment.get("model_info") or {}
+    return info.get(_PROVIDER_KEY) in _PROVIDER_IDS.values()
+
+
+def _carries_own_credentials(deployment: dict[str, Any]) -> bool:
+    params = deployment.get("litellm_params")
+    if not isinstance(params, dict):
+        return False
+    placed = bool((deployment.get("model_info") or {}).get(_PLACED_TOKEN_KEY))
+    return any(
+        params.get(key) and not (placed and key == "api_key") for key in _OWN_CREDENTIAL_KEYS
+    )
+
+
+def _router_deployments(router: Any, model: str) -> list[dict[str, Any]]:
+    """The deployments a Router call for `model` can land on.
+
+    The exact name first; a name that is not in ``model_list`` resolves the way the Router
+    resolves it — ``model_group_alias`` and wildcards — through `Router.get_model_list`.
+    """
+    exact = [
+        d
+        for d in getattr(router, "model_list", None) or []
+        if isinstance(d, dict) and d.get("model_name") == model
+    ]
+    if exact:
+        return exact
+    resolve = getattr(router, "get_model_list", None)
+    if not callable(resolve):
+        return []
+    return [d for d in resolve(model_name=model) or [] if isinstance(d, dict)]
+
+
+def is_operator_deployment(router: Any, model: str) -> bool:
+    """Whether a Router call for `model` belongs to the operator, not to this plugin.
+
+    It does when a deployment it can land on carries no mark of ours and brings its own
+    credentials. Measured on 1.101.0 with a real Router before this existed: an operator's
+    ``gpt-4o`` with its own key was answered by the Codex subscription, because
+    `codex.is_codex_model` matches any name containing ``gpt-``; and an operator's
+    ``claude-opus-4-5`` with its own ``sk-ant-api03-...`` key went upstream with the Claude
+    Max token, which the Router then read as a client-side credential and cloned the
+    deployment for.
+
+    An unmarked deployment **without** credentials stays served by name: that is the
+    documented ``config.yaml`` setup of DECISIONS.md D2, where ``claude-*`` entries and
+    aliases ride on the Claude Max subscription.
+    """
+    return any(
+        _carries_own_credentials(d)
+        for d in _router_deployments(router, model)
+        if not _is_marked(d)
+    )
+
+
+#: Set while the Router serves a call `is_operator_deployment` gave to the operator.
+#:
+#: The Router answers a chat call with ``litellm.acompletion(**input_kwargs)`` — the module
+#: function, which this plugin patches too — and LiteLLM reaches the same function from
+#: `/v1/responses` for providers without a native Responses API (measured for Anthropic)
+#: and from the `/v1/messages` adapter (`anthropic/experimental_pass_through/adapters`).
+#: Leaving the Router wrapper alone was not enough: one hop down, `_wrapped_acompletion`
+#: saw the deployment's wire name (``openai/gpt-4o``) and the name heuristic claimed it.
+#: A context variable, and not a kwarg, because the call has to reach LiteLLM unmodified.
+_OPERATOR_CALL: ContextVar[bool] = ContextVar("mysubs_operator_call", default=False)
+
+
+@contextmanager
+def _operators_call() -> Iterator[None]:
+    marker = _OPERATOR_CALL.set(True)
+    try:
+        yield
+    finally:
+        _OPERATOR_CALL.reset(marker)
+
 
 # -- the three routes: see `routes.py` -----------------------------------------
 
@@ -192,12 +284,14 @@ def _pop_aliases(kwargs: dict[str, Any]) -> dict[str, str]:
 
 
 async def _wrapped_acompletion(*args: Any, **kwargs: Any) -> Any:
+    original = _state.original_acompletion
+    assert original is not None
+    if _OPERATOR_CALL.get():
+        return await original(*args, **kwargs)
     kwargs = _normalize(args, kwargs)
     served = await dispatch(**kwargs)
     if served is not None:
         return served
-    original = _state.original_acompletion
-    assert original is not None
     kwargs.pop(_WIRE_MODEL_KEY, None)
     delegated = await _delegate_kwargs(kwargs)
     aliases = _pop_aliases(delegated)
@@ -210,13 +304,19 @@ def _wrapped_completion(*args: Any, **kwargs: Any) -> Any:
     Duplicating the logic in a synchronous version is what made the two drift apart in the
     original. The loop is private because `asyncio.run` refuses to run inside an already
     active loop, and the proxy calls this from threads with no loop at all.
+
+    It is also the second hop of every async call: LiteLLM's own `acompletion` runs
+    `completion` in an executor, under a copy of the caller's context — which is how
+    `_OPERATOR_CALL` reaches here, and why it has to be honoured here as well.
     """
+    original = _state.original_completion
+    assert original is not None
+    if _OPERATOR_CALL.get():
+        return original(*args, **kwargs)
     kwargs = _normalize(args, kwargs)
     served = _run_sync(dispatch(**kwargs))
     if served is not None:
         return served
-    original = _state.original_completion
-    assert original is not None
     kwargs.pop(_WIRE_MODEL_KEY, None)
     delegated = _run_sync(_delegate_kwargs(kwargs))
     aliases = _pop_aliases(delegated)
@@ -319,11 +419,20 @@ async def _wrapped_router_acompletion(
     through Router.acompletion, not necessarily the module functions above."* The port
     patched only the module functions, and the symptom showed up only in the proxy — never
     on a library call.
+
+    On the Router a deployment is served by this plugin when it carries our mark, or when it
+    carries no credentials of its own (DECISIONS.md D2). One that brings its own is the
+    operator's, and the call goes to the original untouched — see `is_operator_deployment`.
     """
+    original = _state.original_router_acompletion
+    assert original is not None
     # The provider comes from the deployment, not from the name: this is where the Router
     # has the information, and it is the only way to tell Anthropic's `claude-sonnet-4-6`
     # from the namesake served by Antigravity.
     declared = provider_of_deployment(self, model)
+    if declared is None and is_operator_deployment(self, model):
+        with _operators_call():
+            return await original(self, model=model, messages=messages, stream=stream, **kwargs)
     # Read here because this is where the Router still has the deployment: the streaming
     # path needs the wire name to price the call, and by then the deployment is gone.
     wire = wire_model_of_deployment(self, model)
@@ -337,8 +446,6 @@ async def _wrapped_router_acompletion(
     )
     if served is not None:
         return served
-    original = _state.original_router_acompletion
-    assert original is not None
     delegated = await _delegate_kwargs(
         {"model": model, "messages": messages, **kwargs},
         provider=declared,
@@ -348,15 +455,17 @@ async def _wrapped_router_acompletion(
     delegated.pop("messages", None)
     delegated.pop(_WIRE_MODEL_KEY, None)
     aliases = _pop_aliases(delegated)
-    _credential_onto_deployments(self, model, delegated)
+    _credential_onto_deployments(self, model, delegated, declared)
     served = await original(
         self, model=model, messages=messages, stream=stream, **delegated
     )
     return _adapt_native_response(served, aliases)
 
 
-def _credential_onto_deployments(router: Any, model: str, delegated: dict[str, Any]) -> None:
-    """Hands the injected token to the Router on our deployment, not in the kwargs.
+def _credential_onto_deployments(
+    router: Any, model: str, delegated: dict[str, Any], declared: ProviderId | None
+) -> None:
+    """Hands the injected token to the Router on the deployment, not in the kwargs.
 
     LiteLLM's Router reads an ``api_key`` in the request kwargs as a *client-side
     credential*: `Router._handle_clientside_credential` upserts a new deployment whose id
@@ -367,9 +476,14 @@ def _credential_onto_deployments(router: Any, model: str, delegated: dict[str, A
     extra one with ``original_model_id`` pointing back at ours.
 
     Set on the deployment, the token takes the ordinary path: the Router copies the chosen
-    deployment's ``litellm_params`` into the call. Only our Anthropic entries for this name
-    are touched, by the same mark `provider_of_deployment` reads. With none of them in the
-    list the token stays in the kwargs, because a call without it answers 401.
+    deployment's ``litellm_params`` into the call. What is touched for this name: our
+    Anthropic entries, by the same mark `provider_of_deployment` reads; and, when nothing
+    of ours is declared, the unmarked entries with no credentials of their own — the D2
+    ``config.yaml`` entries served by name, which the Router cloned the same way (one copy
+    per rotation, measured with a real Router). Those get `_PLACED_TOKEN_KEY` so the key
+    reads as ours next time. With none of either in the list — a name the Router resolves
+    by wildcard or alias — the token stays in the kwargs, because a call without it
+    answers 401.
     """
     token = delegated.get("api_key")
     if not token:
@@ -378,10 +492,17 @@ def _credential_onto_deployments(router: Any, model: str, delegated: dict[str, A
     for deployment in getattr(router, "model_list", None) or []:
         if not isinstance(deployment, dict) or deployment.get("model_name") != model:
             continue
-        info = deployment.get("model_info") or {}
+        info = deployment.get("model_info")
         params = deployment.get("litellm_params")
-        if info.get(_PROVIDER_KEY) != _PROVIDER_IDS["anthropic"] or not isinstance(params, dict):
+        if not isinstance(info, dict) or not isinstance(params, dict):
             continue
+        if _is_marked(deployment):
+            if info.get(_PROVIDER_KEY) != _PROVIDER_IDS["anthropic"]:
+                continue
+        elif declared is not None or _carries_own_credentials(deployment):
+            continue
+        else:
+            info[_PLACED_TOKEN_KEY] = True
         params["api_key"] = token
         placed = True
     if placed:
@@ -423,7 +544,12 @@ def bind_responses_route(router: Any) -> bool:
         # `codex.is_codex_model` matches any name containing "gpt-", so an operator's own
         # `gpt-4o` deployment would be answered from our subscription — measured, and the
         # reason this guard exists rather than deferring to `dispatch_responses` alone.
+        # LiteLLM bridges providers without a native Responses API through
+        # `litellm.acompletion`, so the operator's call is flagged for that hop too.
         if declared is None:
+            if is_operator_deployment(router, model):
+                with _operators_call():
+                    return await original(**kwargs)
             return await original(**kwargs)
         # Read here for the same reason the chat wrapper does: this is where the Router
         # still has the deployment, and without the wire name the spend log records the
@@ -489,8 +615,12 @@ def bind_messages_route(router: Any) -> bool:
             declared = provider_of_deployment(router, model)
             # The deployment mark is authoritative, as on the other two routes: a name
             # heuristic would answer an operator's own `claude-*` deployment from our
-            # subscription.
+            # subscription. LiteLLM answers non-Anthropic providers on this route through
+            # `litellm.acompletion`, so the operator's call is flagged for that hop too.
             if declared is None:
+                if is_operator_deployment(router, model):
+                    with _operators_call():
+                        return await original(**kwargs)
                 return await original(**kwargs)
             # Same as the other two routes: the wire name is only available here, and the
             # spend log needs it to price the call and draw a provider icon.
@@ -511,7 +641,7 @@ def bind_messages_route(router: Any) -> bool:
                 output_ceiling=output_ceiling_of_deployment(router, model),
             )
             aliases = _pop_aliases(delegated)
-            _credential_onto_deployments(router, model, delegated)
+            _credential_onto_deployments(router, model, delegated, declared)
             return _adapt_native_response(await original(**delegated), aliases)
 
         return _wrapped

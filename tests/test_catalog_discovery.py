@@ -834,8 +834,9 @@ class TestSuggestedName:
         """The prefix belongs in `litellm_params["model"]`, never in `model_name`.
 
         It is `model_name` that echoes in the spend log. An `anthropic/claude-opus-5` there
-        names something no client asked for, and `registry.is_declared` compares it against
-        `model_info["id"]` — one extra prefix made the managed entry look declared.
+        names something no client asked for, and the since-removed `registry.is_declared`
+        compared it against `model_info["id"]` — one extra prefix made the managed entry
+        look declared.
         """
         assert suggested_name("anthropic/claude-opus-5") == "claude-opus-5"
 

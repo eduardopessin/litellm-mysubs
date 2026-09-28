@@ -8,16 +8,18 @@ model and the call failing with 400 ``no healthy deployments``. An "apply" that 
 success and does nothing is the worst possible failure mode, so the plugin injects
 directly and persists on its own.
 
-The guard against phantom deployments comes from a defect measured in production: a
-``claude-*`` wildcard makes the native provider materialize a deployment for **any**
-requested name, before it even talks to the upstream. The 404 that follows is correct, but
-the entry stays glued to the Router forever — 25 accumulated, and with ``simple-shuffle``
-the copies join the draw against the legitimate model of the same name.
+The phantom-deployment defect was measured in production: a ``claude-*`` wildcard makes
+the native provider materialize a deployment for **any** requested name, before it even
+talks to the upstream. The 404 that follows is correct, but the entry stays glued to the
+Router forever — 25 accumulated, and with ``simple-shuffle`` the copies join the draw
+against the legitimate model of the same name. What keeps this plugin's entries out of it
+is the provider prefix every injected ``litellm_params.model`` carries
+(`catalog/deployments.py :: wire_prefix`), not a cleanup here.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 #: Marks the entries created by this plugin. What came from config.yaml is never touched.
@@ -32,18 +34,6 @@ class RouterLike(Protocol):
     def set_model_list(self, model_list: list[dict[str, Any]]) -> None: ...
 
 
-def is_declared(deployment: dict[str, Any]) -> bool:
-    """Whether the deployment came from ``config.yaml``.
-
-    LiteLLM gives config entries the ``model_info.id`` they declare — and our config
-    declares ``id`` equal to ``model_name``. The ones created by wildcard resolution get a
-    hashed id. That difference is what tells a real entry from a shadow, and it is what
-    stops the cleanup from deleting a declared model.
-    """
-    info = deployment.get("model_info") or {}
-    return str(info.get("id") or "") == deployment.get("model_name")
-
-
 def is_managed(deployment: dict[str, Any]) -> bool:
     """Whether the deployment was added by this plugin."""
     info = deployment.get("model_info") or {}
@@ -55,59 +45,6 @@ class ModelRegistry:
     """Injects, removes and reapplies the plugin's deployments."""
 
     router: RouterLike
-    #: Names the upstream refused with "does not exist". See ``remember_not_found``.
-    not_found: set[str] = field(default_factory=set)
-
-    # -- guards ----------------------------------------------------------------
-
-    def remember_not_found(self, wire_name: str) -> bool:
-        """Remembers a name the upstream said it does not serve.
-
-        Only a "does not exist" error gets here. A 429 or a 500 are transient: treating
-        them as non-existence would disable a good model until the next restart.
-        """
-        wire = wire_name.strip().lower()
-        if not wire or wire in self.not_found:
-            return False
-        self.not_found.add(wire)
-        return True
-
-    def is_known_bad(self, wire_name: str) -> bool:
-        return wire_name.strip().lower() in self.not_found
-
-    def evict_shadow(self, wire_name: str, *, only_if_declared: bool = False) -> int:
-        """Removes deployments that wildcard resolution materialized for ``wire_name``.
-
-        ``only_if_declared=True`` is the success path: a request to a declared model
-        matches the config entry **and** the wildcard, and the wildcard copy ends up
-        competing in the draw without the real entry's ``model_info``. It is only removed
-        when a declared twin exists, that is, when the copy is redundant by construction.
-
-        ``only_if_declared=False`` is the error path: the name has already been refused by
-        the upstream, so it is never a served model.
-
-        A name with no twin in the config survives the success path on purpose — it is the
-        new model of a family, served on day one without editing configuration.
-        """
-        wire = wire_name.strip().lower()
-        model_list = list(self.router.model_list or [])
-        declared = {d.get("model_name") for d in model_list if is_declared(d)}
-
-        keep: list[dict[str, Any]] = []
-        dropped = 0
-        for deployment in model_list:
-            name = str(deployment.get("model_name") or "").lower()
-            shadow = name == wire and not is_declared(deployment) and not is_managed(deployment)
-            if shadow and (not only_if_declared or deployment.get("model_name") in declared):
-                dropped += 1
-                continue
-            keep.append(deployment)
-
-        if dropped:
-            self.router.set_model_list(keep)
-        return dropped
-
-    # -- injection --------------------------------------------------------------
 
     def apply(self, deployments: list[dict[str, Any]]) -> int:
         """Replaces the plugin's entries with the given ones, preserving the config's."""
