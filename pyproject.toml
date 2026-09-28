@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "litellm-mysubs"
-version = "0.1.14"
+version = "0.1.15"
 description = "Serve Claude Max, ChatGPT Plus/Codex and Google Antigravity subscriptions as OpenAI-compatible models through a LiteLLM proxy"
 readme = "README.md"
 license = "MIT"
@@ -56,6 +56,10 @@ dev = [
   "pytest-cov>=5",
   "ruff>=0.6",
   "mypy>=1.11",
+  # The real Anthropic client, for the tests that read /v1/messages the way Claude Code
+  # and SDK users do: it dispatches on the SSE `event:` line, which a curl-style read
+  # does not need, and that is how the unframed stream went unnoticed.
+  "anthropic",
 ]
 
 [project.urls]

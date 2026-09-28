@@ -41,28 +41,35 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: install (litellm ${{ matrix.litellm }})
-        # One resolution with litellm pinned exactly. `pip install -e ".[dev]"` left it free
-        # (`>=1.70`), so when the newest release could not be installed pip backtracked
-        # through older ones: twice on 2026-09-28 that ended in ResolutionImpossible, and
-        # when backtracking succeeds it installs an older LiteLLM than the job claims to
-        # test. "latest" is therefore looked up on PyPI and pinned like any other version;
-        # `info.version` skips pre-releases (1.104.0rc1 was the newest upload when this was
-        # written, and it answered 1.103.0). If that release cannot be installed the job
-        # fails naming it, instead of testing something else.
-        # uv is the installer of the local gate; it resolves the same pins in seconds and
-        # names the conflicting requirement when there is one.
+        # One resolution, by uv. `pip install -e ".[dev]"` left litellm free (`>=1.70`),
+        # and twice on 2026-09-28 pip's backtracking through older litellm releases ended in
+        # ResolutionImpossible. uv is the installer of the local gate; it resolves in seconds
+        # and names the conflicting requirement when there is one.
+        # A version is pinned exactly. "latest" is left to the resolver rather than pinned to
+        # PyPI's JSON `info.version`: the same day the simple index uv reads lagged the JSON
+        # API by over an hour for a new release, and an exact pin would have failed CI for a
+        # version the index did not serve yet. The installed version is printed, and a
+        # warning is raised when it is behind the JSON API's latest, so a silent downgrade is
+        # still visible.
         # The proxy extras are required: route_llm_request imports fastapi, and that is
         # where the /v1/responses route is intercepted.
         run: |
           set -euo pipefail
-          version="${{ matrix.litellm }}"
-          if [ "$version" = "latest" ]; then
-            version=$(curl -fsSL --retry 3 https://pypi.org/pypi/litellm/json \
-              | python -c 'import json, sys; print(json.load(sys.stdin)["info"]["version"])')
-          fi
           python -m pip install uv
-          uv pip install --system -e ".[dev]" "litellm[proxy]==$version"
-          python -c 'from importlib.metadata import version; print("litellm", version("litellm"))'
+          if [ "${{ matrix.litellm }}" = "latest" ]; then
+            uv pip install --system -e ".[dev]" "litellm[proxy]"
+          else
+            uv pip install --system -e ".[dev]" "litellm[proxy]==${{ matrix.litellm }}"
+          fi
+          installed=$(python -c 'from importlib.metadata import version; print(version("litellm"))')
+          echo "litellm $installed"
+          if [ "${{ matrix.litellm }}" = "latest" ]; then
+            newest=$(curl -fsSL --retry 3 https://pypi.org/pypi/litellm/json \
+              | python -c 'import json, sys; print(json.load(sys.stdin)["info"]["version"])') || newest=""
+            if [ -n "$newest" ] && [ "$newest" != "$installed" ]; then
+              echo "::warning::latest cell installed litellm $installed; PyPI's JSON API says $newest"
+            fi
+          fi
       - name: ruff
         run: ruff check .
       - name: mypy
