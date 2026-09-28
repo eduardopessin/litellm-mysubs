@@ -20,17 +20,8 @@ on one route cannot break on another.
 from __future__ import annotations
 
 import json
-import time
 import uuid
-from typing import Any, Final
-
-#: Anthropic's stop reasons, keyed by the OpenAI finish reason the readers produce.
-_STOP_REASON: Final = {
-    "stop": "end_turn",
-    "length": "max_tokens",
-    "tool_calls": "tool_use",
-    "content_filter": "stop_sequence",
-}
+from typing import Any
 
 
 def _text_of(content: Any) -> str:
@@ -149,16 +140,67 @@ def to_tools(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return tools
 
 
-def from_model_response(response: Any, model: str) -> dict[str, Any]:
-    """A canonical response as a Messages payload.
+# -- outbound: ported from omp's Anthropic Messages server ---------------------
+#
+# omp serves Anthropic Messages from other providers' streams with the same shapes this
+# route needs, so the encoding is theirs. The one structural difference is the input: omp
+# drives `encodeStream` from explicit `*_start`/`*_delta`/`*_end` events, while this
+# plugin's readers produce canonical LiteLLM chunks with no start or end markers. So a
+# block here opens when the kind of content changes and closes when the next one opens,
+# which is the same sequence for the same turn.
 
-    The id is minted here with Anthropic's `msg_` prefix: a client that matches on it would
-    not recognise the `chatcmpl-` one the chat route produces, and the two routes must be
-    indistinguishable from the outside.
+
+# omp: providers/anthropic-messages-server.ts :: newMessageId
+def new_message_id() -> str:
+    """Anthropic's `msg_` prefix and 24 hex digits.
+
+    A client that matches on the prefix would not recognise the `chatcmpl-` id the chat
+    route produces, and the two routes must be indistinguishable from the outside.
     """
+    return f"msg_{uuid.uuid4().hex[:24]}"
+
+
+# omp: providers/anthropic-messages-server.ts :: mapStopReasonOut
+def map_stop_reason_out(reason: object, has_tool_use: bool) -> str:
+    """The Anthropic stop reason for a canonical finish reason.
+
+    The canonical reasons are OpenAI's, which is what the readers produce: `length` and
+    `tool_calls` are omp's `length` and `toolUse`. The fallback is omp's too — a turn that
+    hands a tool back owes the client `tool_use` even when the upstream closed it with a
+    plain stop, or the Anthropic loop (run tools while `stop_reason == "tool_use"`) never
+    runs the call.
+
+    `content_filter` falls to the default, as every unlisted reason does in omp. It used to
+    map to `stop_sequence`, which tells the client that one of *its* stop sequences
+    matched; none was sent.
+    """
+    if reason == "length":
+        return "max_tokens"
+    if reason == "tool_calls":
+        return "tool_use"
+    return "tool_use" if has_tool_use else "end_turn"
+
+
+def _usage(usage: Any) -> dict[str, int]:
+    """Canonical usage as Messages counts.
+
+    Not omp's `encodeUsage`: that one adds `cache_read_input_tokens` beside an
+    `input_tokens` that excludes them. The canonical `prompt_tokens` has no single cache
+    convention here — Codex includes cached tokens, Antigravity subtracts them
+    (`wire/usage.py`) — so a cache count next to it would double-count Codex for any
+    client that sums the fields, and the spend row is priced from these two alone.
+    """
+    return {
+        "input_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+        "output_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+    }
+
+
+# omp: providers/anthropic-messages-server.ts :: encodeResponse, encodeContentBlocks
+def encode_response(response: Any, model: str) -> dict[str, Any]:
+    """A canonical response as a Messages payload."""
     choice = (getattr(response, "choices", None) or [None])[0]
     message = getattr(choice, "message", None)
-    usage = getattr(response, "usage", None)
 
     blocks: list[dict[str, Any]] = []
     reasoning = getattr(message, "reasoning_content", None)
@@ -185,240 +227,148 @@ def from_model_response(response: Any, model: str) -> dict[str, Any]:
             }
         )
 
-    finish = str(getattr(choice, "finish_reason", "") or "stop")
+    has_tool_use = any(block["type"] == "tool_use" for block in blocks)
     return {
-        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "id": new_message_id(),
         "type": "message",
         "role": "assistant",
         "model": model,
         "content": blocks,
-        "stop_reason": _STOP_REASON.get(finish, "end_turn"),
+        "stop_reason": map_stop_reason_out(getattr(choice, "finish_reason", None), has_tool_use),
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
-            "output_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
-        },
+        "usage": _usage(getattr(response, "usage", None)),
     }
 
 
-def sse(event: str, data: dict[str, Any]) -> dict[str, Any]:
-    """One Messages stream event, in the shape the Anthropic SDK expects."""
-    return {"type": event, **data}
+# omp: providers/anthropic-messages-server.ts :: sseFrame
+def sse_frame(event: str, data: dict[str, Any]) -> bytes:
+    """One event as the SSE frame a Messages client parses, ``event:`` line included.
 
-
-def envelope(model: str) -> dict[str, Any]:
-    """The `message_start` envelope for a turn that has not produced content yet.
-
-    Same shape `from_model_response` builds, minus what only the finished turn knows.
-    Streaming needs it before any of that exists, and a client reads the id and the model
-    from the opening event.
+    The Anthropic SDKs dispatch on the SSE ``event`` field and drop a frame without one —
+    ``anthropic/_streaming.py`` yields only when ``sse.event`` is ``message_start``,
+    ``content_block_delta`` and so on. LiteLLM's proxy writes a dict chunk as a bare
+    ``data:`` line (`ProxyBaseLLMRequestProcessing.return_sse_chunk`), so the dicts this
+    route used to hand it reached `client.messages.stream(...)` as nothing at all: measured
+    through the real proxy app and the real SDK, `get_final_message()` failed with no
+    snapshot while ``curl`` showed every line. Bytes pass through that serializer as-is.
     """
-    return {
-        "id": f"msg_{uuid.uuid4().hex[:24]}",
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": [],
-        "stop_reason": None,
-        "stop_sequence": None,
-        "usage": {"input_tokens": 0, "output_tokens": 0},
-    }
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
 
-def stop_reason(finish: Any) -> str:
-    """The Anthropic stop reason for a canonical finish reason."""
-    return _STOP_REASON.get(str(finish or ""), "end_turn")
+# omp: providers/anthropic-messages-server.ts :: encodeStream
+def stream_error(message: str) -> dict[str, Any]:
+    """The `error` event omp's encoder sends when the stream fails after it opened.
+
+    Without it the SDK sees the stream simply end: LiteLLM's own error frame is a bare
+    ``data:`` line, which the SDK drops like any other (see `sse_frame`).
+    """
+    return {"type": "error", "error": {"type": "api_error", "message": message}}
 
 
-class MessagesStreamState:
-    """Block indices for one Messages stream, assigned as the text arrives.
+# omp: providers/anthropic-messages-server.ts :: encodeStream, closeBlock
+class MessagesStreamEncoder:
+    """The Anthropic event sequence for one streamed turn, each block as it arrives.
 
-    `stream_events` numbers the blocks of a turn that has already finished, which is easy
-    and is not streaming. The objection that made the replay look necessary — that a
-    translated stream would have to invent block indices mid-flight — is answered the same
-    way the Responses route answers it: the indices are **ours** either way. The upstream
-    never sends them, so assigning them as blocks open is no more invented than assigning
-    them at the end, and it is what lets the text leave as it arrives.
-
-    A turn that produces text opens exactly one text block; reasoning and tool calls are
-    known only once the turn closes and are emitted as whole blocks after it, which is the
-    same division `_codex_responses_stream` makes and for the same reason.
+    Block indices are **ours**: the upstreams never send them, so numbering blocks as they
+    open is no more invented than numbering them at the end, and it is what lets each block
+    leave as it arrives. Thinking and tool calls stream like text: both readers emit them
+    as canonical deltas (`reasoning_content`, `tool_calls`) while the turn runs, and
+    relaying the text alone made a streamed tool call vanish — the client got
+    `stop_reason: tool_use` and no `tool_use` block to answer.
     """
 
-    __slots__ = ("index", "text_open", "text_started")
+    __slots__ = ("_index", "_open", "_tool_blocks")
 
     def __init__(self) -> None:
-        self.index = 0
-        self.text_open = False
-        self.text_started = False
+        #: Index of the open block, or of the next one when none is open.
+        self._index = 0
+        #: What the open block holds: ``"text"``, ``"thinking"``, ``"tool_use:<n>"``.
+        self._open: str | None = None
+        #: Canonical tool-call index -> the block index it was given.
+        self._tool_blocks: dict[int, int] = {}
 
-    def start(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Opens the turn. Carries the envelope with no content, as Anthropic does."""
-        return sse(
-            "message_start",
-            {"message": {**{k: v for k, v in payload.items() if k != "content"}, "content": []}},
-        )
+    def start(self, model: str) -> dict[str, Any]:
+        """`message_start`: the envelope, with no content and zero usage yet."""
+        return {
+            "type": "message_start",
+            "message": {
+                "id": new_message_id(),
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        }
 
-    def open_text(self) -> list[dict[str, Any]]:
-        """Opens the text block, once, on the first visible token."""
-        if self.text_open:
-            return []
-        self.text_open = True
-        self.text_started = True
-        return [
-            sse(
-                "content_block_start",
-                {"index": self.index, "content_block": {"type": "text", "text": ""}},
-            )
-        ]
-
-    def delta(self, text: str) -> dict[str, Any]:
-        return sse(
-            "content_block_delta",
-            {"index": self.index, "delta": {"type": "text_delta", "text_delta": text}},
-        )
-
-    def close_text(self) -> list[dict[str, Any]]:
-        if not self.text_open:
-            return []
-        self.text_open = False
-        out = [sse("content_block_stop", {"index": self.index})]
-        self.index += 1
+    def text(self, text: str) -> list[dict[str, Any]]:
+        out = self._switch("text", {"type": "text", "text": ""})
+        out.append(self._delta(self._index, {"type": "text_delta", "text": text}))
         return out
 
-    def whole_block(self, block: dict[str, Any]) -> list[dict[str, Any]]:
-        """A block known only at the end: reasoning, or a tool call."""
-        index = self.index
-        self.index += 1
-        if block.get("type") == "tool_use":
-            return [
-                sse(
-                    "content_block_start",
-                    {"index": index, "content_block": {**block, "input": {}}},
-                ),
-                sse(
-                    "content_block_delta",
-                    {
-                        "index": index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": json.dumps(block.get("input") or {}),
-                        },
-                    },
-                ),
-                sse("content_block_stop", {"index": index}),
-            ]
-        field = "thinking" if block.get("type") == "thinking" else "text"
-        return [
-            sse(
-                "content_block_start",
-                {"index": index, "content_block": {"type": block.get("type"), field: ""}},
-            ),
-            sse(
-                "content_block_delta",
-                {
-                    "index": index,
-                    "delta": {f"{field}_delta": block.get(field, ""), "type": f"{field}_delta"},
-                },
-            ),
-            sse("content_block_stop", {"index": index}),
-        ]
+    def thinking(self, text: str) -> list[dict[str, Any]]:
+        # omp opens with no `signature` and sends a `signature_delta` only when the block
+        # has one. Neither upstream hands the readers an Anthropic signature, so none goes
+        # out rather than an invented one.
+        out = self._switch("thinking", {"type": "thinking", "thinking": ""})
+        out.append(self._delta(self._index, {"type": "thinking_delta", "thinking": text}))
+        return out
 
-    def finish(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        return [
-            sse(
-                "message_delta",
-                {
-                    "delta": {
-                        "stop_reason": payload.get("stop_reason"),
-                        "stop_sequence": payload.get("stop_sequence"),
-                    },
-                    "usage": payload.get("usage") or {},
-                },
-            ),
-            sse("message_stop", {}),
-        ]
+    def tool_call(self, index: int, call_id: str, name: str) -> list[dict[str, Any]]:
+        """Opens a ``tool_use`` block. ``input`` starts empty and arrives as JSON deltas.
 
-
-def stream_events(payload: dict[str, Any], model: str) -> list[dict[str, Any]]:
-    """A finished Messages payload as the event sequence a streaming client expects.
-
-    The turn is produced whole and then replayed as events. Anthropic's sequence is
-    `message_start` → per-block `start`/`delta`/`stop` → `message_delta` → `message_stop`,
-    and a client that tracks block indices needs them contiguous — which is why they are
-    numbered here rather than taken from the provider.
-    """
-    events: list[dict[str, Any]] = [
-        sse(
-            "message_start",
-            {
-                "message": {
-                    **{k: v for k, v in payload.items() if k != "content"},
-                    "content": [],
-                }
-            },
+        The id travels verbatim, as on the non-streamed path: Codex pairs its outputs by
+        the composite id and Vertex requires ``tool_use.id`` on the way back.
+        """
+        out = self._switch(
+            f"tool_use:{index}",
+            {"type": "tool_use", "id": call_id, "name": name, "input": {}},
         )
-    ]
+        self._tool_blocks[index] = self._index
+        return out
 
-    for index, block in enumerate(payload.get("content") or []):
-        kind = block.get("type")
-        if kind == "tool_use":
-            events.append(
-                sse(
-                    "content_block_start",
-                    {
-                        "index": index,
-                        "content_block": {**block, "input": {}},
-                    },
-                )
-            )
-            events.append(
-                sse(
-                    "content_block_delta",
-                    {
-                        "index": index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": json.dumps(block.get("input") or {}),
-                        },
-                    },
-                )
-            )
-        else:
-            field = "thinking" if kind == "thinking" else "text"
-            events.append(
-                sse(
-                    "content_block_start",
-                    {"index": index, "content_block": {"type": kind, field: ""}},
-                )
-            )
-            events.append(
-                sse(
-                    "content_block_delta",
-                    {
-                        "index": index,
-                        "delta": {f"{field}_delta": block.get(field, ""), "type": f"{field}_delta"},
-                    },
-                )
-            )
-        events.append(sse("content_block_stop", {"index": index}))
+    def tool_arguments(self, index: int, partial_json: str) -> list[dict[str, Any]]:
+        # Both readers send a call's arguments only after its opening chunk, so the block
+        # exists; a fragment for a call that never opened is a reader defect and raises
+        # here rather than landing on whatever block happens to be open.
+        block = self._tool_blocks[index]
+        return [self._delta(block, {"type": "input_json_delta", "partial_json": partial_json})]
 
-    events.append(
-        sse(
-            "message_delta",
+    def done(self, reason: object, usage: Any) -> list[dict[str, Any]]:
+        """omp's `done`: close what is open, then `message_delta` and `message_stop`."""
+        return [
+            *self.close_block(),
             {
+                "type": "message_delta",
                 "delta": {
-                    "stop_reason": payload.get("stop_reason"),
-                    "stop_sequence": payload.get("stop_sequence"),
+                    "stop_reason": map_stop_reason_out(reason, bool(self._tool_blocks)),
+                    "stop_sequence": None,
                 },
-                "usage": payload.get("usage") or {},
+                "usage": _usage(usage),
             },
+            {"type": "message_stop"},
+        ]
+
+    def close_block(self) -> list[dict[str, Any]]:
+        if self._open is None:
+            return []
+        self._open = None
+        out = [{"type": "content_block_stop", "index": self._index}]
+        self._index += 1
+        return out
+
+    def _switch(self, key: str, content_block: dict[str, Any]) -> list[dict[str, Any]]:
+        if self._open == key:
+            return []
+        out = self.close_block()
+        self._open = key
+        out.append(
+            {"type": "content_block_start", "index": self._index, "content_block": content_block}
         )
-    )
-    events.append(sse("message_stop", {}))
-    return events
+        return out
 
-
-def request_id() -> str:
-    """Correlation id for a Messages turn, in the upstream's own shape."""
-    return f"req_{int(time.time())}_{uuid.uuid4().hex[:12]}"
+    @staticmethod
+    def _delta(index: int, delta: dict[str, Any]) -> dict[str, Any]:
+        return {"type": "content_block_delta", "index": index, "delta": delta}
