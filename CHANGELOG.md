@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-09-28
+
+### Removed
+
+- **The empty output ceiling stated for Codex models.** 0.1.13 put
+  `max_output_tokens: None` on them so the proxy would stop showing LiteLLM's 128000. It
+  never reached the proxy: the Router stores `model_info` with `exclude_none`, so the key
+  was dropped on injection and `/model/info` went on showing 128000 — measured on the live
+  gateway after deploying 0.1.13. A test that enriched a hand-built dict, skipping the
+  Router, had passed. There is no way to state "none" through the Router, so the code is
+  gone; the contract test now goes through the real Router. Nothing changes on the wire:
+  Codex requests still carry no output cap.
+
 ## [0.1.13] - 2026-09-28
 
 ### Fixed
@@ -793,7 +806,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.10...v0.1.11
