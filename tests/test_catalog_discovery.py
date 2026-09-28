@@ -32,7 +32,6 @@ from litellm_mysubs.catalog.discovery import (
 )
 from litellm_mysubs.credentials.store import Credential
 from litellm_mysubs.transport.hosts import HOSTS, MODELS_PATH
-from litellm_mysubs.wire.anthropic import MAX_OUTPUT_TOKENS
 from litellm_mysubs.wire.antigravity_models import BROKEN_WIRE, ModelCatalog
 from litellm_mysubs.wire.codex import CLIENT_VERSION, resolve_model
 
@@ -791,15 +790,13 @@ class TestProbedProviders:
 
         assert tokens == {"Bearer tok-a"}
 
-    async def test_anthropic_ceiling_comes_from_the_listing_capped_at_the_wire(self) -> None:
-        """`/v1/models` declares 128000 for the 4.6-and-later families and names some models
-        by dated build only. Every request is clamped to the Claude Code ceiling, so a
-        deployment can promise no more than that — and no more than the model either."""
+    async def test_anthropic_ceiling_comes_from_the_listing(self) -> None:
+        """`/v1/models` declares the model's full ceiling and names some models by dated build
+        only; the curated list and the wire use the undated alias."""
         listing = {
             "data": [
                 {"id": "claude-opus-5-5", "max_tokens": 128000},
                 {"id": "claude-haiku-4-5-20251001", "max_tokens": 64000},
-                {"id": "claude-opus-4-5-20251101", "max_tokens": 32000},
             ]
         }
 
@@ -811,9 +808,8 @@ class TestProbedProviders:
         async with client(handler) as http:
             found = by_name(await discover(ANTHROPIC, client=http))
 
-        assert found["claude-opus-5-5"].max_output_tokens == MAX_OUTPUT_TOKENS
+        assert found["claude-opus-5-5"].max_output_tokens == 128000
         assert found["claude-haiku-4-5"].max_output_tokens == 64000
-        assert found["claude-opus-4-5"].max_output_tokens == 32000
         assert found["claude-sonnet-5"].max_output_tokens is None, "not listed, not declared"
 
     async def test_an_unreachable_listing_declares_nothing_and_removes_nothing(self) -> None:

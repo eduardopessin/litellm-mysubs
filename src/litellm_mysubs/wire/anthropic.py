@@ -69,8 +69,11 @@ THINKING_CEILING: Final = 8192
 #: truncated.
 OUTPUT_FALLBACK_BUFFER: Final = 4000
 
-# omp: providers/claude-code-fingerprint.ts :: CLAUDE_CODE_MAX_OUTPUT_TOKENS
-MAX_OUTPUT_TOKENS: Final = 64000
+#: ``max_tokens`` for a model with no known output ceiling. The Messages API requires the
+#: field, so something has to go. It is omp's value for the same case since 18.4.1
+#: (`providers/anthropic.ts`, ``UNKNOWN_MODEL_MAX_OUTPUT_TOKENS``); 18.3.2 applied it to
+#: every OAuth request as the Claude Code cap, which 18.4.1 reverted as a bug.
+UNKNOWN_MODEL_MAX_OUTPUT_TOKENS: Final = 64000
 
 # Measured against upstream (max_tokens=2048, display="summarized", a question that
 # demands reasoning): xhigh and max are accepted and yield more output than high (out=164
@@ -820,11 +823,14 @@ def _forced_tool_choice(choice: object) -> bool:
 # omp: providers/anthropic.ts :: ensureMaxTokensForThinking
 # omp: providers/anthropic.ts :: supportsSamplingParams
 # omp: providers/anthropic.ts :: disableThinkingIfToolChoiceForced
-def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
+def apply_thinking_params(
+    kwargs: dict[str, Any], model: str, *, ceiling: int | None = None
+) -> dict[str, Any]:
     """Normalize thinking, temperature, top_p and token ceilings. Mutates ``kwargs``.
 
     Kept apart from ``build_request`` because it is pure: it touches neither credentials
-    nor messages.
+    nor messages. ``ceiling`` is the model's declared output ceiling — see
+    `fit_output_ceiling`.
     """
     reasoning, _summary = normalize_effort(kwargs.get("reasoning_effort"))
     thinking = kwargs.get("thinking")
@@ -871,7 +877,7 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
             thinking_active = False
 
     if not thinking_active:
-        fit_output_ceiling(kwargs, budget=None)
+        fit_output_ceiling(kwargs, budget=None, ceiling=ceiling)
         return kwargs
 
     # `display: "summarized"` is what makes reasoning come back as readable text: from Opus
@@ -902,35 +908,38 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
     elif isinstance(kwargs.get("thinking"), dict) and supports_display(model):
         kwargs["thinking"]["display"] = show
 
-    fit_output_ceiling(kwargs, budget=budget)
+    fit_output_ceiling(kwargs, budget=budget, ceiling=ceiling)
     return kwargs
 
 
-# omp: providers/anthropic.ts :: ensureMaxTokensForThinking, CLAUDE_CODE_MAX_OUTPUT_TOKENS
-def fit_output_ceiling(kwargs: dict[str, Any], *, budget: int | None) -> None:
+# omp: providers/anthropic.ts :: ensureMaxTokensForThinking
+def fit_output_ceiling(
+    kwargs: dict[str, Any], *, budget: int | None, ceiling: int | None
+) -> None:
     """``max_tokens`` for a subscription request, set the way omp sets it. Mutates ``kwargs``.
 
-    - **Ceiling.** `MAX_OUTPUT_TOKENS`, on every request. omp clamps OAuth requests to it
-      "where the wire fingerprint must match" and leaves API-key callers the full model
-      ceiling; every request here is OAuth. It is not the model's limit — measured on
-      2026-09-28, `claude-opus-5-5` and `claude-sonnet-5` accept 128000 and refuse 128001 —
-      it is the one Claude Code sends. It used to be applied only with thinking on, so a
-      plain turn asking for 100000 went out as 100000.
-    - **Nothing asked.** The ceiling. The Messages API requires ``max_tokens``, and with none
-      in the kwargs LiteLLM fills it from its price map: 128000 for `claude-opus-5-5` on
-      1.101.0, above the fingerprint. The thinking path filled the gap with budget + margin
-      instead, a limit below the model's that nobody asked for.
+    - **Ceiling.** The model's own, as declared by Anthropic's `/v1/models` and carried on
+      the deployment. omp 18.4.1: "OAuth and API-key requests alike get the full model
+      ceiling; Claude Code itself requests 128k on Opus 5.5." Claude Code 2.1.281 agrees
+      (its model table: `claude-opus-5-5` default 128000). Measured on 2026-09-28: the 5.x
+      and 4.6-and-later families accept 128000 and refuse 128001, the 4.5 family refuses
+      64001. Without a declared ceiling, `UNKNOWN_MODEL_MAX_OUTPUT_TOKENS`.
+    - **Nothing asked.** The ceiling. With no ``max_tokens`` in the kwargs LiteLLM fills it
+      from its price map, which is not this model's statement; the thinking path used to
+      fill the gap with budget + margin, a limit below the model's that nobody set.
+    - **Asked for more than the ceiling.** Lowered to it — the upstream refuses the rest.
     - **Thinking.** Raised until there is room beyond the budget, never past the ceiling;
       what the caller asked for is otherwise never lowered.
 
     Only the key the client sent is read — filling both made the rename below override the
     client's value with the default.
     """
+    limit = ceiling if ceiling is not None and ceiling > 0 else UNKNOWN_MODEL_MAX_OUTPUT_TOKENS
     token_key = "max_completion_tokens" if "max_completion_tokens" in kwargs else "max_tokens"
     value = kwargs.pop(token_key, None)
-    current = MAX_OUTPUT_TOKENS if value is None else min(int(value), MAX_OUTPUT_TOKENS)
+    current = limit if value is None else min(int(value), limit)
     if budget is not None:
-        current = min(max(current, budget + OUTPUT_FALLBACK_BUFFER), MAX_OUTPUT_TOKENS)
+        current = min(max(current, budget + OUTPUT_FALLBACK_BUFFER), limit)
     kwargs["max_tokens"] = current
 
 
@@ -1001,6 +1010,7 @@ def build_request(
     access_token: str = "",
     *,
     native_system: bool = False,
+    output_ceiling: int | None = None,
 ) -> dict[str, Any]:
     """Prepare the kwargs of a Claude request. Mutates and returns ``kwargs``.
 
@@ -1016,6 +1026,9 @@ def build_request(
 
     Measured on the live gateway, which is why the placement is a parameter rather than a
     guess from the shape of the kwargs.
+
+    ``output_ceiling`` is the model's declared output ceiling, when the caller knows it —
+    on the proxy it comes from the deployment's ``model_info``.
     """
     if not is_anthropic_model(model):
         return kwargs
@@ -1031,7 +1044,7 @@ def build_request(
         # carry.
         headers["anthropic-beta"] = build_betas(thinking=_wants_thinking(kwargs))
 
-    apply_thinking_params(kwargs, model)
+    apply_thinking_params(kwargs, model, ceiling=output_ceiling)
 
     # Before the `messages` guard: a request whose turns are carried elsewhere still
     # declares tools, and the fingerprint is read off the tool names alone. The map rides

@@ -16,12 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names, `claude-opus-5-5` seven times, every copy carrying `managed_by` and a stale token.
   The token now goes on our deployment's `litellm_params`, and the copies stop. Existing
   copies go away on the next restart or apply.
-- **Claude requests are held to the Claude Code output ceiling on every turn**, as omp does
-  for OAuth. It was only applied with thinking on, so a plain turn asking for 100000 went
-  out as 100000, and a turn asking for nothing got LiteLLM's default from its price map —
-  128000 for `claude-opus-5-5`. With thinking on and nothing asked, the gap was filled
-  with budget + margin, a limit below the model's that nobody set. It is now the ceiling
-  (64000).
+- **Claude requests go out at the model's own output ceiling**, as Claude Code and omp
+  18.4.1 do ("OAuth and API-key requests alike get the full model ceiling; Claude Code
+  itself requests 128k on Opus 5.5"). The ceiling comes from Anthropic's `/v1/models`,
+  carried on the deployment: 128000 for the 5.x and 4.6-and-later families, 64000 for the
+  4.5 ones — measured, the first value the upstream refuses is one above each. A caller
+  asking for more is lowered to it; a caller asking for nothing gets it, where the thinking
+  path used to fill in budget + margin. A model with no declared ceiling gets 64000, omp's
+  value for that case. Existing deployments carry no ceiling until re-applied from
+  `/mysubs`, and run at 64000 until then.
 - **Antigravity no longer invents an output ceiling.** A flat 64000 was sent whenever the
   caller asked for none: below the 65536 the gemini 3.x variants accept, above the 4096 and
   32768 of the `tab_*` models and `gpt-oss-120b-medium`. The caller's value is sent,
@@ -31,8 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`model_info.max_output_tokens` states what the provider declares.** Anthropic from
-  `/v1/models` (which now answers a subscription token), capped at the 64000 the wire
-  sends; Antigravity from `maxOutputTokens` in its catalog; Codex as explicitly empty,
+  `/v1/models` (which now answers a subscription token); Antigravity from `maxOutputTokens`
+  in its catalog; Codex as explicitly empty,
   because its backend refuses `max_output_tokens` and LiteLLM would otherwise fill 128000
   from its price map. Undeclared ceilings are left out. Declared ceilings reach existing
   selections when they are next applied from `/mysubs`; the Codex one is added on read.

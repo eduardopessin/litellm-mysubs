@@ -775,12 +775,12 @@ def _anthropic_headers(credential: Credential) -> dict[str, str]:
 async def _anthropic_output_ceilings(
     credential: Credential, *, client: httpx.AsyncClient
 ) -> dict[str, int]:
-    """Output ceiling per wire name, as a request through this plugin can use it.
+    """Output ceiling per wire name, as Anthropic's listing declares it.
 
-    The value is the listing's ``max_tokens`` capped at `anthropic.MAX_OUTPUT_TOKENS`: every
-    request here is clamped to the Claude Code ceiling (`anthropic.fit_output_ceiling`), so
-    advertising the model's own 128000 would promise an output the wire never asks for.
-    Measured on 2026-09-28: 128000 for the 4.6-and-later families, 64000 for the 4.5 ones.
+    It is the model's full ceiling, and it is what the wire sends when the caller asks for
+    none (`anthropic.fit_output_ceiling`), as omp 18.4.1 and Claude Code do. Measured on
+    2026-09-28: 128000 for the 5.x and 4.6-and-later families, 64000 for the 4.5 ones —
+    each matching the first value the upstream refuses above it.
 
     The listing names some models by dated build only, so each dated id also answers for
     its undated alias — the name the curated list and the wire use.
@@ -810,11 +810,10 @@ async def _anthropic_output_ceilings(
             continue
         if limit <= 0:
             continue
-        ceiling = min(limit, anthropic.MAX_OUTPUT_TOKENS)
-        ceilings[ident] = ceiling
+        ceilings[ident] = limit
         dated = ANTHROPIC_DATED_BUILD.match(ident)
         if dated:
-            ceilings.setdefault(dated.group("alias"), ceiling)
+            ceilings.setdefault(dated.group("alias"), limit)
     return ceilings
 
 

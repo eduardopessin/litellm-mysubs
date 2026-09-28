@@ -374,11 +374,11 @@ class TestCacheRetention:
         assert out["thinking"]["type"] == "adaptive"
         assert out["output_config"]["effort"] == "low"
 
-    def test_max_tokens_preserved_up_to_the_claude_code_ceiling(self) -> None:
+    def test_max_tokens_preserved_up_to_the_models_ceiling(self) -> None:
         out = ant.apply_thinking_params(
-            {"reasoning_effort": "high", "max_tokens": 64000}, "claude-haiku-4-5"
+            {"reasoning_effort": "high", "max_tokens": 64000}, "claude-haiku-4-5", ceiling=64000
         )
-        assert out["max_tokens"] == ant.MAX_OUTPUT_TOKENS
+        assert out["max_tokens"] == 64000
 
     def test_output_gets_room_beyond_the_thinking_budget(self) -> None:
         """Without the margin, the answer comes out truncated after the model thinks."""

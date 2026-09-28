@@ -136,6 +136,25 @@ def wire_model_of_deployment(router: Any, model: str) -> str | None:
     return None
 
 
+def output_ceiling_of_deployment(router: Any, model: str) -> int | None:
+    """``model_info.max_output_tokens`` of our Anthropic deployment for `model`, or `None`.
+
+    Discovery writes it from Anthropic's `/v1/models` (`catalog/discovery.py`); a
+    deployment applied before that, or a name that is not ours, has none, and the wire
+    falls back to `anthropic.UNKNOWN_MODEL_MAX_OUTPUT_TOKENS`.
+    """
+    for deployment in getattr(router, "model_list", None) or []:
+        if not isinstance(deployment, dict) or deployment.get("model_name") != model:
+            continue
+        info = deployment.get("model_info") or {}
+        if info.get(_PROVIDER_KEY) != _PROVIDER_IDS["anthropic"]:
+            continue
+        ceiling = info.get("max_output_tokens")
+        if isinstance(ceiling, int) and not isinstance(ceiling, bool) and ceiling > 0:
+            return ceiling
+    return None
+
+
 
 # -- the three routes: see `routes.py` -----------------------------------------
 
@@ -256,6 +275,7 @@ async def _delegate_kwargs(
     *,
     provider: ProviderId | None = None,
     native_system: bool = False,
+    output_ceiling: int | None = None,
 ) -> dict[str, Any]:
     """Kwargs for the original, with the Claude prompt applied when it is a Claude model.
 
@@ -269,13 +289,18 @@ async def _delegate_kwargs(
     endpoint — one account's credential sent to another.
 
     ``native_system`` is passed through for ``/v1/messages``, where the identity belongs in
-    the top-level ``system`` rather than in ``messages[0]``.
+    the top-level ``system`` rather than in ``messages[0]``. ``output_ceiling`` is the
+    model's, read off the deployment where there is one (`output_ceiling_of_deployment`).
     """
     model = str(kwargs.get("model") or "")
     if provider is not None and provider != "anthropic":
         return kwargs
     return anthropic.build_request(
-        kwargs, model, await _access_token("anthropic"), native_system=native_system
+        kwargs,
+        model,
+        await _access_token("anthropic"),
+        native_system=native_system,
+        output_ceiling=output_ceiling,
     )
 
 
@@ -315,7 +340,9 @@ async def _wrapped_router_acompletion(
     original = _state.original_router_acompletion
     assert original is not None
     delegated = await _delegate_kwargs(
-        {"model": model, "messages": messages, **kwargs}, provider=declared
+        {"model": model, "messages": messages, **kwargs},
+        provider=declared,
+        output_ceiling=output_ceiling_of_deployment(self, model),
     )
     delegated.pop("model", None)
     delegated.pop("messages", None)
@@ -478,7 +505,10 @@ def bind_messages_route(router: Any) -> bool:
             # be injected, exactly as the chat route does before delegating, or the native
             # client answers `Missing Anthropic API Key`.
             delegated = await _delegate_kwargs(
-                kwargs, provider=declared, native_system=True
+                kwargs,
+                provider=declared,
+                native_system=True,
+                output_ceiling=output_ceiling_of_deployment(router, model),
             )
             aliases = _pop_aliases(delegated)
             _credential_onto_deployments(router, model, delegated)

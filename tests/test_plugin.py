@@ -2332,6 +2332,40 @@ class TestEveryDialectReachesEverySubscription:
         ), "no system message may survive in the turn list"
 
     @pytest.mark.asyncio
+    async def test_the_deployments_ceiling_reaches_the_request(self) -> None:
+        """Discovery puts the model's declared ceiling on the deployment; the wire has no
+        other way to learn it, and without it `claude-opus-5-5` went out at 64000 where
+        Claude Code itself asks for 128000."""
+        seen: list[dict[str, Any]] = []
+
+        async def original(**kwargs: Any) -> str:
+            seen.append(kwargs)
+            return "native"
+
+        install_transport(FakeTransport())
+        router = SimpleNamespace(
+            aanthropic_messages=original,
+            anthropic_messages=original,
+            model_list=[
+                {
+                    "model_name": "mysubs/claudecode/claude-opus-5-5",
+                    "litellm_params": {"model": "anthropic/claude-opus-5-5"},
+                    "model_info": {"mysubs_provider": "anthropic", "max_output_tokens": 128000},
+                }
+            ],
+        )
+        plugin.bind_messages_route(router)
+        try:
+            await router.aanthropic_messages(
+                model="mysubs/claudecode/claude-opus-5-5",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        finally:
+            plugin.unbind_messages_route()
+
+        assert seen[0]["max_tokens"] == 128000
+
+    @pytest.mark.asyncio
     async def test_the_system_prompt_is_not_lost(self) -> None:
         """Messages carries `system` at the top level, the canonical form as a message.
 

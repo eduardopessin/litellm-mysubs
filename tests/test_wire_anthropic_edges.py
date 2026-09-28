@@ -218,28 +218,40 @@ class TestThinkingEdges:
         assert out["temperature"] == 0.3
         assert "thinking" not in out
 
-    def test_absent_max_tokens_takes_the_claude_code_ceiling(self) -> None:
-        """Budget + margin used to fill the gap: a limit below the model's that nobody asked
-        for. omp sends the ceiling."""
-        out = ant.apply_thinking_params({"reasoning_effort": "low"}, "claude-haiku-4-5")
-        assert out["max_tokens"] == ant.MAX_OUTPUT_TOKENS
+    def test_nothing_asked_takes_the_models_ceiling(self) -> None:
+        """Claude Code sends 128000 on `claude-opus-5-5`, and omp 18.4.1 the full model
+        ceiling. Budget + margin used to fill the gap on the thinking path: a limit below the
+        model's that nobody asked for."""
+        plain = ant.apply_thinking_params({}, "claude-opus-5-5", ceiling=128000)
+        thinking = ant.apply_thinking_params(
+            {"reasoning_effort": "low"}, "claude-haiku-4-5", ceiling=64000
+        )
+        assert plain["max_tokens"] == 128000
+        assert thinking["max_tokens"] == 64000
 
-    def test_a_plain_turn_is_held_to_the_claude_code_ceiling(self) -> None:
-        """The ceiling was only applied with thinking on, so a plain turn asking for 100000
-        went out as 100000 — off the fingerprint omp keeps for OAuth requests."""
-        out = ant.apply_thinking_params({"max_tokens": 100000}, "claude-opus-5-5")
-        assert out["max_tokens"] == ant.MAX_OUTPUT_TOKENS
+    def test_a_request_above_the_ceiling_is_lowered_to_it(self) -> None:
+        """Measured: the 4.5 family answers `max_tokens: 64001 > 64000` with 400."""
+        out = ant.apply_thinking_params({"max_tokens": 100000}, "claude-opus-4-5", ceiling=64000)
+        assert out["max_tokens"] == 64000
 
-    def test_a_plain_turn_without_max_tokens_gets_the_ceiling_not_litellms(self) -> None:
-        """With no `max_tokens` in the kwargs LiteLLM fills it from its price map — 128000 for
-        `claude-opus-5-5` on 1.101.0, above the fingerprint."""
+    def test_an_unknown_ceiling_falls_back_to_omps_default(self) -> None:
+        """The Messages API requires `max_tokens`; without a declared ceiling it is omp's
+        value for the same case, not LiteLLM's price map."""
         out = ant.apply_thinking_params({}, "claude-opus-5-5")
-        assert out["max_tokens"] == ant.MAX_OUTPUT_TOKENS
+        assert out["max_tokens"] == ant.UNKNOWN_MODEL_MAX_OUTPUT_TOKENS
 
-    def test_a_plain_turn_keeps_a_lower_request(self) -> None:
-        out = ant.apply_thinking_params({"max_completion_tokens": 1000}, "claude-opus-5-5")
+    def test_a_lower_request_is_kept(self) -> None:
+        out = ant.apply_thinking_params(
+            {"max_completion_tokens": 1000}, "claude-opus-5-5", ceiling=128000
+        )
         assert out["max_tokens"] == 1000
         assert "max_completion_tokens" not in out
+
+    def test_thinking_room_never_passes_the_ceiling(self) -> None:
+        out = ant.apply_thinking_params(
+            {"reasoning_effort": "high", "max_tokens": 100}, "claude-haiku-4-5", ceiling=4096
+        )
+        assert out["max_tokens"] == 4096
 
     def test_unknown_effort_uses_medium_default(self) -> None:
         out = ant.apply_thinking_params({"reasoning_effort": "turbo"}, "claude-opus-5")
