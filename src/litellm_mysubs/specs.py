@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import Any, Final
 
 import httpx
+import litellm
 
 from .credentials.store import CredentialStore, ProviderId
 from .transport import hosts
@@ -126,8 +127,14 @@ async def _refresh(provider: str) -> str | None:
         return None
 
     provider_id = _PROVIDER_IDS[provider]
-    store.reload()
-    credential = store.get(provider_id)
+    try:
+        store.reload()
+        credential = store.get(provider_id)
+    except Exception:
+        # The re-read failing — a vault that does not answer, a file caught mid-write —
+        # is a failure like any other here. Raised, it replaced the upstream's 401 with the
+        # store's own error, on a request the upstream had refused for its own reason.
+        return None
     if credential is None:
         return None
     if not credential.is_expired():
@@ -166,18 +173,30 @@ async def _access_token(provider: str) -> str:
 
     `Credential.is_expired` already carries 60 seconds of slack: the token is renewed while
     it still works, so there is no window between the check and the request.
+
+    No token at all is refused before anything is built, as omp refuses a request with no
+    key: a Codex or Antigravity request went out with ``Authorization: Bearer `` — which
+    httpx refuses on a real socket with ``Illegal header value b'Bearer '`` — and the client
+    got a 500 naming neither the provider nor the missing step. Anthropic is the exception,
+    and returns ``""``: `_delegate_kwargs` asks for its token on every call it hands to
+    LiteLLM, Claude or not, and LiteLLM's own Anthropic client already refuses a Claude
+    call without a key.
     """
     store = _state.store
-    if store is None:
-        return ""
-    credential = store.get(_PROVIDER_IDS[provider])
-    if credential is None:
-        return ""
-    if credential.is_expired():
+    credential = store.get(_PROVIDER_IDS[provider]) if store is not None else None
+    if credential is not None and credential.is_expired():
         renewed = await _refresh(provider)
         if renewed:
             return renewed
-    return credential.access_token
+    token = credential.access_token if credential is not None else ""
+    if not token and provider != "anthropic":
+        # omp: error/auth.ts :: MissingApiKeyError
+        raise litellm.exceptions.AuthenticationError(
+            message=f"No API key for provider: {_PROVIDER_IDS[provider]}",
+            llm_provider=_PROVIDER_IDS[provider],
+            model="",
+        )
+    return token
 
 
 def _remember_signature(call_id: str, signature: str) -> None:
