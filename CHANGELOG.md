@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A rotating Claude token no longer clones the deployment.** The router path handed the
+  OAuth token to LiteLLM in the request kwargs, which the Router reads as a client-side
+  credential: `Router._handle_clientside_credential` upserts a copy of the deployment per
+  distinct key. Measured on the live gateway after 21 h: 60 managed deployments for 49
+  names, `claude-opus-5-5` seven times, every copy carrying `managed_by` and a stale token.
+  The token now goes on our deployment's `litellm_params`, and the copies stop. Existing
+  copies go away on the next restart or apply.
+- **Claude requests are held to the Claude Code output ceiling on every turn**, as omp does
+  for OAuth. It was only applied with thinking on, so a plain turn asking for 100000 went
+  out as 100000, and a turn asking for nothing got LiteLLM's default from its price map —
+  128000 for `claude-opus-5-5`. With thinking on and nothing asked, the gap was filled
+  with budget + margin, a limit below the model's that nobody set. It is now the ceiling
+  (64000).
+- **Antigravity no longer invents an output ceiling.** A flat 64000 was sent whenever the
+  caller asked for none: below the 65536 the gemini 3.x variants accept, above the 4096 and
+  32768 of the `tab_*` models and `gpt-oss-120b-medium`. The caller's value is sent,
+  lowered only to what the catalog declares; with neither, the catalog's is sent; with no
+  declaration, the field is omitted, as omp does.
+
+### Added
+
+- **`model_info.max_output_tokens` states what the provider declares.** Anthropic from
+  `/v1/models` (which now answers a subscription token), capped at the 64000 the wire
+  sends; Antigravity from `maxOutputTokens` in its catalog; Codex as explicitly empty,
+  because its backend refuses `max_output_tokens` and LiteLLM would otherwise fill 128000
+  from its price map. Undeclared ceilings are left out. Declared ceilings reach existing
+  selections when they are next applied from `/mysubs`; the Codex one is added on read.
+
 ## [0.1.12] - 2026-09-26
 
 ### Added

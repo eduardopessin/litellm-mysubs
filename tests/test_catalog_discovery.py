@@ -32,6 +32,7 @@ from litellm_mysubs.catalog.discovery import (
 )
 from litellm_mysubs.credentials.store import Credential
 from litellm_mysubs.transport.hosts import HOSTS, MODELS_PATH
+from litellm_mysubs.wire.anthropic import MAX_OUTPUT_TOKENS
 from litellm_mysubs.wire.antigravity_models import BROKEN_WIRE, ModelCatalog
 from litellm_mysubs.wire.codex import CLIENT_VERSION, resolve_model
 
@@ -124,6 +125,29 @@ class TestGoogleCatalog:
                 wire_name="gemini-3.1-pro", suggested_name="gemini-3.1-pro", verified=True
             )
         ]
+
+    async def test_the_declared_ceiling_is_carried_and_absence_stays_absent(self) -> None:
+        """Measured on 2026-09-28: `maxOutputTokens` is per model, and some models (the
+        `chat_*` ones) declare none. Those stay empty — a default here would be a ceiling
+        the account never set."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "models": {
+                        "gemini-3.8-flash-low": {"maxOutputTokens": 65536},
+                        "chat_20706": {"maxTokens": 16384},
+                    },
+                    "deprecatedModelIds": [],
+                },
+            )
+
+        async with client(handler) as http:
+            found = by_name(await discover(GOOGLE, client=http))
+
+        assert found["gemini-3.8-flash-low"].max_output_tokens == 65536
+        assert found["chat_20706"].max_output_tokens is None
 
     async def test_broken_wire_variant_is_listed_unverified(self) -> None:
         """`gemini-3.1-pro-high` is in the catalogue and gives 400 on the wire.
@@ -766,6 +790,45 @@ class TestProbedProviders:
             await discover(ANTHROPIC, client=http)
 
         assert tokens == {"Bearer tok-a"}
+
+    async def test_anthropic_ceiling_comes_from_the_listing_capped_at_the_wire(self) -> None:
+        """`/v1/models` declares 128000 for the 4.6-and-later families and names some models
+        by dated build only. Every request is clamped to the Claude Code ceiling, so a
+        deployment can promise no more than that — and no more than the model either."""
+        listing = {
+            "data": [
+                {"id": "claude-opus-5-5", "max_tokens": 128000},
+                {"id": "claude-haiku-4-5-20251001", "max_tokens": 64000},
+                {"id": "claude-opus-4-5-20251101", "max_tokens": 32000},
+            ]
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/v1/models":
+                return httpx.Response(200, json=listing)
+            return httpx.Response(200, json={})
+
+        async with client(handler) as http:
+            found = by_name(await discover(ANTHROPIC, client=http))
+
+        assert found["claude-opus-5-5"].max_output_tokens == MAX_OUTPUT_TOKENS
+        assert found["claude-haiku-4-5"].max_output_tokens == 64000
+        assert found["claude-opus-4-5"].max_output_tokens == 32000
+        assert found["claude-sonnet-5"].max_output_tokens is None, "not listed, not declared"
+
+    async def test_an_unreachable_listing_declares_nothing_and_removes_nothing(self) -> None:
+        """The listing only annotates: which names are served is still the probe's call."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/v1/models":
+                return httpx.Response(401, json={"error": {"type": "authentication_error"}})
+            return httpx.Response(200, json={})
+
+        async with client(handler) as http:
+            models = await discover(ANTHROPIC, client=http)
+
+        assert len(models) == len(CURATED_ANTHROPIC)
+        assert all(m.max_output_tokens is None for m in models)
 
 
 class TestSuggestedName:

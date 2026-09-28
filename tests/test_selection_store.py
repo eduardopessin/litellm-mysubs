@@ -225,3 +225,39 @@ class TestOnDisk:
         raw = json.loads(store_path.read_text("utf-8"))
         assert raw["version"] == 1
         assert list(raw["providers"]) == ["anthropic"]
+
+
+class TestStoredCeiling:
+    def test_a_stored_codex_deployment_gains_the_empty_ceiling(self, store_path: Path) -> None:
+        """It follows from the provider alone, so installations that applied before the
+        field existed get it without re-applying — and stop showing LiteLLM's 128000."""
+        entry = {
+            "model_name": "mysubs/codex/gpt-5.5",
+            "litellm_params": {"model": "openai/gpt-5.5", "custom_llm_provider": "openai"},
+            "model_info": {"mysubs_provider": "openai-codex", "managed_by": "mysubs"},
+        }
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_text(
+            json.dumps({"version": 1, "providers": {"openai-codex": [entry]}}), "utf-8"
+        )
+
+        info = SelectionStore(store_path).all()[0].deployments[0]["model_info"]
+
+        assert "max_output_tokens" in info
+        assert info["max_output_tokens"] is None
+
+    def test_a_declared_ceiling_is_not_invented_on_read(self, store_path: Path) -> None:
+        """A declared ceiling needs the provider's catalog; reading from disk has none."""
+        entry = {
+            "model_name": "mysubs/claudecode/claude-opus-5",
+            "litellm_params": {"model": "anthropic/claude-opus-5"},
+            "model_info": {"mysubs_provider": "anthropic", "managed_by": "mysubs"},
+        }
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_text(
+            json.dumps({"version": 1, "providers": {"anthropic": [entry]}}), "utf-8"
+        )
+
+        info = SelectionStore(store_path).all()[0].deployments[0]["model_info"]
+
+        assert "max_output_tokens" not in info

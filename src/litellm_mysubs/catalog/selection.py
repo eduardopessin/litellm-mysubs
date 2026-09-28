@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from ..credentials.store import PROVIDER_IDS, ProviderId
+from .deployments import output_ceiling_info
 
 DEFAULT_PATH = Path.home() / ".litellm" / "mysubs" / "models.json"
 
@@ -57,15 +58,30 @@ def _upgraded(entry: dict[str, Any]) -> dict[str, Any]:
     `custom_llm_provider` is derived from the wire prefix already in the entry, which is
     the one with a price table behind it — the same rule `to_deployment` follows, so an
     upgraded entry and a freshly built one agree.
+
+    The output ceiling is only added where it follows from the provider alone — the
+    uncapped one. A declared ceiling needs the provider's catalog, and inventing it here
+    is what the field exists to avoid; those arrive when the selection is next applied.
     """
-    params = entry.get("litellm_params")
-    if not isinstance(params, dict) or params.get("custom_llm_provider"):
-        return entry
-    wire = params.get("model")
-    if not isinstance(wire, str) or "/" not in wire:
-        return entry
     upgraded = dict(entry)
-    upgraded["litellm_params"] = {**params, "custom_llm_provider": wire.split("/", 1)[0]}
+    params = entry.get("litellm_params")
+    if isinstance(params, dict) and not params.get("custom_llm_provider"):
+        wire = params.get("model")
+        if isinstance(wire, str) and "/" in wire:
+            upgraded["litellm_params"] = {
+                **params,
+                "custom_llm_provider": wire.split("/", 1)[0],
+            }
+    info = entry.get("model_info")
+    provider = info.get("mysubs_provider") if isinstance(info, dict) else None
+    if isinstance(info, dict) and provider in PROVIDER_IDS:
+        stated = {
+            key: value
+            for key, value in output_ceiling_info(provider, None).items()
+            if key not in info
+        }
+        if stated:
+            upgraded["model_info"] = {**info, **stated}
     return upgraded
 
 

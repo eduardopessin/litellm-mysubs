@@ -871,6 +871,7 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
             thinking_active = False
 
     if not thinking_active:
+        fit_output_ceiling(kwargs, budget=None)
         return kwargs
 
     # `display: "summarized"` is what makes reasoning come back as readable text: from Opus
@@ -901,19 +902,36 @@ def apply_thinking_params(kwargs: dict[str, Any], model: str) -> dict[str, Any]:
     elif isinstance(kwargs.get("thinking"), dict) and supports_display(model):
         kwargs["thinking"]["display"] = show
 
-    # Only the key the client sent is touched: filling both made the copy below override
-    # the client's value with the default.
-    token_key = "max_completion_tokens" if "max_completion_tokens" in kwargs else "max_tokens"
-    token_value = kwargs.get(token_key)
-    if token_value is None or int(token_value) < budget + OUTPUT_FALLBACK_BUFFER:
-        # Raised until there is output room beyond the reasoning; what the client asked
-        # for is never lowered, except by the Claude Code ceiling.
-        kwargs[token_key] = min(budget + OUTPUT_FALLBACK_BUFFER, MAX_OUTPUT_TOKENS)
-    else:
-        kwargs[token_key] = min(int(token_value), MAX_OUTPUT_TOKENS)
-    if "max_completion_tokens" in kwargs:
-        kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+    fit_output_ceiling(kwargs, budget=budget)
     return kwargs
+
+
+# omp: providers/anthropic.ts :: ensureMaxTokensForThinking, CLAUDE_CODE_MAX_OUTPUT_TOKENS
+def fit_output_ceiling(kwargs: dict[str, Any], *, budget: int | None) -> None:
+    """``max_tokens`` for a subscription request, set the way omp sets it. Mutates ``kwargs``.
+
+    - **Ceiling.** `MAX_OUTPUT_TOKENS`, on every request. omp clamps OAuth requests to it
+      "where the wire fingerprint must match" and leaves API-key callers the full model
+      ceiling; every request here is OAuth. It is not the model's limit — measured on
+      2026-09-28, `claude-opus-5-5` and `claude-sonnet-5` accept 128000 and refuse 128001 —
+      it is the one Claude Code sends. It used to be applied only with thinking on, so a
+      plain turn asking for 100000 went out as 100000.
+    - **Nothing asked.** The ceiling. The Messages API requires ``max_tokens``, and with none
+      in the kwargs LiteLLM fills it from its price map: 128000 for `claude-opus-5-5` on
+      1.101.0, above the fingerprint. The thinking path filled the gap with budget + margin
+      instead, a limit below the model's that nobody asked for.
+    - **Thinking.** Raised until there is room beyond the budget, never past the ceiling;
+      what the caller asked for is otherwise never lowered.
+
+    Only the key the client sent is read — filling both made the rename below override the
+    client's value with the default.
+    """
+    token_key = "max_completion_tokens" if "max_completion_tokens" in kwargs else "max_tokens"
+    value = kwargs.pop(token_key, None)
+    current = MAX_OUTPUT_TOKENS if value is None else min(int(value), MAX_OUTPUT_TOKENS)
+    if budget is not None:
+        current = min(max(current, budget + OUTPUT_FALLBACK_BUFFER), MAX_OUTPUT_TOKENS)
+    kwargs["max_tokens"] = current
 
 
 def split_system_messages(messages: list[Any]) -> tuple[str, list[Any]]:

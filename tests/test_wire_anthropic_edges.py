@@ -218,9 +218,28 @@ class TestThinkingEdges:
         assert out["temperature"] == 0.3
         assert "thinking" not in out
 
-    def test_default_max_tokens_when_absent(self) -> None:
+    def test_absent_max_tokens_takes_the_claude_code_ceiling(self) -> None:
+        """Budget + margin used to fill the gap: a limit below the model's that nobody asked
+        for. omp sends the ceiling."""
         out = ant.apply_thinking_params({"reasoning_effort": "low"}, "claude-haiku-4-5")
-        assert out["max_tokens"] == ant.EFFORT_BUDGET["low"] + ant.OUTPUT_FALLBACK_BUFFER
+        assert out["max_tokens"] == ant.MAX_OUTPUT_TOKENS
+
+    def test_a_plain_turn_is_held_to_the_claude_code_ceiling(self) -> None:
+        """The ceiling was only applied with thinking on, so a plain turn asking for 100000
+        went out as 100000 — off the fingerprint omp keeps for OAuth requests."""
+        out = ant.apply_thinking_params({"max_tokens": 100000}, "claude-opus-5-5")
+        assert out["max_tokens"] == ant.MAX_OUTPUT_TOKENS
+
+    def test_a_plain_turn_without_max_tokens_gets_the_ceiling_not_litellms(self) -> None:
+        """With no `max_tokens` in the kwargs LiteLLM fills it from its price map — 128000 for
+        `claude-opus-5-5` on 1.101.0, above the fingerprint."""
+        out = ant.apply_thinking_params({}, "claude-opus-5-5")
+        assert out["max_tokens"] == ant.MAX_OUTPUT_TOKENS
+
+    def test_a_plain_turn_keeps_a_lower_request(self) -> None:
+        out = ant.apply_thinking_params({"max_completion_tokens": 1000}, "claude-opus-5-5")
+        assert out["max_tokens"] == 1000
+        assert "max_completion_tokens" not in out
 
     def test_unknown_effort_uses_medium_default(self) -> None:
         out = ant.apply_thinking_params({"reasoning_effort": "turbo"}, "claude-opus-5")

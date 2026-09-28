@@ -321,10 +321,44 @@ async def _wrapped_router_acompletion(
     delegated.pop("messages", None)
     delegated.pop(_WIRE_MODEL_KEY, None)
     aliases = _pop_aliases(delegated)
+    _credential_onto_deployments(self, model, delegated)
     served = await original(
         self, model=model, messages=messages, stream=stream, **delegated
     )
     return _adapt_native_response(served, aliases)
+
+
+def _credential_onto_deployments(router: Any, model: str, delegated: dict[str, Any]) -> None:
+    """Hands the injected token to the Router on our deployment, not in the kwargs.
+
+    LiteLLM's Router reads an ``api_key`` in the request kwargs as a *client-side
+    credential*: `Router._handle_clientside_credential` upserts a new deployment whose id
+    hashes the params, key included, and keeps ours in ``model_info.original_model_id``.
+    The OAuth access token rotates, so every token minted a permanent copy carrying our
+    `managed_by` mark and a stale token. Measured on the live gateway on 2026-09-28: 60
+    managed deployments for 49 names after 21 h, `claude-opus-5-5` seven times, every
+    extra one with ``original_model_id`` pointing back at ours.
+
+    Set on the deployment, the token takes the ordinary path: the Router copies the chosen
+    deployment's ``litellm_params`` into the call. Only our Anthropic entries for this name
+    are touched, by the same mark `provider_of_deployment` reads. With none of them in the
+    list the token stays in the kwargs, because a call without it answers 401.
+    """
+    token = delegated.get("api_key")
+    if not token:
+        return
+    placed = False
+    for deployment in getattr(router, "model_list", None) or []:
+        if not isinstance(deployment, dict) or deployment.get("model_name") != model:
+            continue
+        info = deployment.get("model_info") or {}
+        params = deployment.get("litellm_params")
+        if info.get(_PROVIDER_KEY) != _PROVIDER_IDS["anthropic"] or not isinstance(params, dict):
+            continue
+        params["api_key"] = token
+        placed = True
+    if placed:
+        delegated.pop("api_key", None)
 
 
 def bind_responses_route(router: Any) -> bool:
@@ -447,6 +481,7 @@ def bind_messages_route(router: Any) -> bool:
                 kwargs, provider=declared, native_system=True
             )
             aliases = _pop_aliases(delegated)
+            _credential_onto_deployments(router, model, delegated)
             return _adapt_native_response(await original(**delegated), aliases)
 
         return _wrapped
