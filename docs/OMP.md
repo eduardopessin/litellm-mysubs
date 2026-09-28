@@ -54,11 +54,32 @@ The version lives in one place only, `OMP_VERSION` in `tools/check_omp_drift.py`
 python tools/check_omp_drift.py
 ```
 
-Downloads the pinned version, confirms that every annotated symbol still exists, and
-compares against npm's `latest`. It runs in CI: a rename on the OMP side goes red instead
-of drifting silently.
+Downloads the pinned version and checks two things for every anchor:
 
-To update: raise `OMP_VERSION`, run the script, handle whatever it flags.
+- **the name still exists** in the file it points at — a rename goes red;
+- **the declaration has not changed.** Each anchored declaration (function, const, object,
+  array) is extracted from the TypeScript source, normalized (comments and whitespace
+  removed) and hashed; the hash is compared with `tools/omp_anchors.lock`. A different hash
+  is reported as `BODY DRIFT`, with every place in this package that ports it.
+
+The name check alone missed three real changes between 18.3.2 and 18.4.1:
+`VOLATILE_SYSTEM_SEGMENT_MARKERS` gained `<project-context>`, `applyHeadCaching` started
+relocating the system breakpoint, and the 64k OAuth output clamp was removed — each one
+kept its name, and each one mattered on the wire.
+
+It also compares against npm's `latest` and warns when a newer version exists. It runs in
+CI.
+
+### Raising the OMP version
+
+1. Raise `OMP_VERSION` and run the script. `BODY DRIFT` lists what changed upstream in the
+   code we port; a missing symbol lists what moved.
+2. For each item, read the upstream diff and port it (or record a deliberate divergence
+   below). Don't regenerate the lock first: the drift list is the work list.
+3. Only then run `python tools/check_omp_drift.py --update`, which rewrites the lock for the
+   pinned version, and commit it with the ported changes.
+
+Adding an anchor also needs `--update`, so its declaration enters the lock.
 
 ## Deliberate divergences
 
