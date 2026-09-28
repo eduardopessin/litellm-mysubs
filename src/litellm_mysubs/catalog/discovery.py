@@ -739,7 +739,7 @@ async def _probe_anthropic(client: httpx.AsyncClient, credential: Credential, wi
     body: dict[str, Any] = {
         "model": wire,
         "max_tokens": 1,
-        "system": anthropic.build_system_blocks(""),
+        "system": anthropic.build_system_blocks(),
         "messages": [{"role": "user", "content": "."}],
     }
     headers = _anthropic_headers(credential)

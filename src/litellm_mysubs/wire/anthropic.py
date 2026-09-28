@@ -133,11 +133,14 @@ CACHE_BREAKPOINT_MESSAGES: Final = 2
 DECIMATION_INTERVAL: Final = 15
 
 # omp: providers/anthropic.ts :: VOLATILE_SYSTEM_SEGMENT_MARKERS
-#: System segments that change on every turn. The system anchor sits on the last block
-#: *before* them, so that a memory refresh re-bills only the suffix instead of the whole
-#: head. Detection is by our own marking, and only counts at the start of a block: a
-#: `<memories>` quoted in the middle of a stable block does not make it volatile.
-VOLATILE_SYSTEM_MARKERS: Final[tuple[str, ...]] = ("<memories>",)
+#: System segments whose bytes differ between sessions or turns of the same agent:
+#: per-turn memory recall (`<memories>`) and omp's working-directory context
+#: (`<project-context>`: context files with their paths, workspace tree, session append
+#: text). The system anchor sits on the block right *before* the first of them, so the
+#: static head is shared across sessions in different directories (one git worktree per
+#: task) and a recall refresh re-bills only the suffix. Detection is by omp's own markup,
+#: and only at the start of a block: a tag quoted inside a stable block does not count.
+VOLATILE_SYSTEM_MARKERS: Final[tuple[str, ...]] = ("<memories>", "<project-context>")
 
 # A client that does its own caching arrives here with markers already set. Measured with
 # claude-sonnet-4-6: 4 markers -> 200, 5 -> 400 "A maximum of 4 blocks with cache_control
@@ -488,17 +491,19 @@ def mark_breakpoint(message: dict[str, Any], ttl: str | None = LONG_CACHE_TTL) -
     return False
 
 
-# omp: providers/anthropic.ts :: stableSystemSuffixStart
-def stable_system_suffix_start(blocks: list[Any]) -> int:
-    """Index where the volatile system suffix starts; ``len(blocks)`` if there is none."""
-    start = len(blocks)
-    while start > 0:
-        block = blocks[start - 1]
+# omp: providers/anthropic.ts :: volatileSystemSuffixStart
+def volatile_system_suffix_start(blocks: list[Any]) -> int:
+    """Index of the first volatile system block; ``len(blocks)`` if there is none.
+
+    The *first*, not a trailing run: prefix caching is positional, so the bytes after a
+    changing segment can never extend the cached head, even when a stable block (a
+    subagent's role text, an extension's policy) is appended behind it.
+    """
+    for index, block in enumerate(blocks):
         text = str(block.get("text", "")) if isinstance(block, dict) else ""
-        if not any(text.startswith(marker) for marker in VOLATILE_SYSTEM_MARKERS):
-            break
-        start -= 1
-    return start
+        if text.startswith(VOLATILE_SYSTEM_MARKERS):
+            return index
+    return len(blocks)
 
 
 # -- third-party fingerprint ---------------------------------------------------
@@ -682,18 +687,67 @@ def count_head_breakpoints(system_blocks: list[Any] | None, tools: list[Any] | N
 
 # omp: providers/anthropic.ts :: applyHeadCaching
 def apply_head_cache(
-    system_blocks: list[Any] | None, tools: list[Any] | None, ttl: str | None = LONG_CACHE_TTL
+    system_blocks: list[Any] | None,
+    tools: list[Any] | None,
+    ttl: str | None = LONG_CACHE_TTL,
+    *,
+    messages: list[Any] | None = None,
 ) -> int:
-    """Anchor the stable head — last non-deferred tool and last stable system block.
+    """Anchor the stable head — last non-deferred tool and the block before the first
+    volatile system segment.
 
     Returns how many markers ended up in the head. The order on the wire is tools ->
     system -> messages, so a marker on the last stable system block caches the whole
     tools+system prefix; the marker on the tools keeps the definitions cached even when the
     system text changes. Without this the head was only covered by the tail anchor, which
     moves on every turn, and was therefore rewritten at full price on every request.
+
+    A system marker already sitting elsewhere (the client's own, placed with another notion
+    of what is volatile) **moves** to the anchor rather than a second one being added, as
+    in omp 18.4.1: left on `<project-context>` it caches bytes that differ per directory,
+    and kept alongside ours it is one more marker against the ceiling.
+
+    ``messages`` are counted against `CACHE_BREAKPOINT_CEILING` before a marker is
+    *added* — relocating one never raises the total. omp can skip that because it builds
+    every marker itself; here the client arrives with its own. Measured on v0.1.14: a
+    client with 1 tool marker and 3 message markers got a 5th on the system anchor, and
+    Anthropic answers 400 "A maximum of 4 blocks with cache_control may be provided".
+    When only one slot is left it goes to system, whose prefix contains the tools.
     """
-    if tools and not any(
-        isinstance(tool, dict) and tool.get("cache_control") is not None for tool in tools
+    room = (
+        CACHE_BREAKPOINT_CEILING
+        - count_head_breakpoints(system_blocks, tools)
+        - count_breakpoints(messages or [])
+    )
+
+    if system_blocks:
+        suffix_start = volatile_system_suffix_start(system_blocks)
+        # The identity we inject is not part of the client's head. omp adds it only for an
+        # Anthropic OAuth token (`isAnthropicOAuthToken`), so omp talking to us with a
+        # gateway key sees a system that opens with a volatile segment as all-volatile and
+        # marks its tail. Anchoring on our identity instead cached only the tools plus one
+        # line, and moved the marker the client had put on its tail — so that case falls
+        # back to the tail too.
+        if suffix_start == 1 and _is_identity(system_blocks[0]):
+            suffix_start = 0
+        # All-volatile falls back to the tail: there is no stable boundary to anchor on.
+        anchor = system_blocks[len(system_blocks) - 1 if suffix_start == 0 else suffix_start - 1]
+        if isinstance(anchor, dict) and anchor.get("cache_control") is None:
+            relocated = count_head_breakpoints(system_blocks, None) > 0
+            if relocated or room > 0:
+                for block in system_blocks:
+                    if isinstance(block, dict):
+                        block.pop("cache_control", None)
+                anchor["cache_control"] = cache_control(ttl)
+                if not relocated:
+                    room -= 1
+
+    if (
+        tools
+        and room > 0
+        and not any(
+            isinstance(tool, dict) and tool.get("cache_control") is not None for tool in tools
+        )
     ):
         # A deferred tool does not enter the checked prefix until it is referenced, so
         # anchoring on it would leave out everything that comes before.
@@ -702,24 +756,6 @@ def apply_head_cache(
                 continue
             tool["cache_control"] = cache_control(ttl)
             break
-
-    if system_blocks:
-        suffix_start = stable_system_suffix_start(system_blocks)
-        if suffix_start == len(system_blocks):
-            if not any(
-                isinstance(b, dict) and b.get("cache_control") is not None for b in system_blocks
-            ):
-                last = system_blocks[-1]
-                if isinstance(last, dict):
-                    last["cache_control"] = cache_control(ttl)
-        else:
-            # With a volatile suffix the boundary marker goes in even if there is one
-            # further back: otherwise the only system marker sits before the stable prompt
-            # and a memory refresh re-bills it.
-            anchor_index = len(system_blocks) - 1 if suffix_start == 0 else suffix_start - 1
-            anchor = system_blocks[anchor_index]
-            if isinstance(anchor, dict) and anchor.get("cache_control") is None:
-                anchor["cache_control"] = cache_control(ttl)
 
     return count_head_breakpoints(system_blocks, tools)
 
@@ -943,32 +979,53 @@ def fit_output_ceiling(
     kwargs["max_tokens"] = current
 
 
-def split_system_messages(messages: list[Any]) -> tuple[str, list[Any]]:
-    """Split the system instructions from the rest of the conversation."""
-    system_parts: list[str] = []
+#: `developer` is hoisted too: LiteLLM rewrites it to `system` before the Anthropic
+#: transformation (`main.py:5389`, `translate_developer_role_to_system_role`), so it lands
+#: in the wire `system` either way — left in the messages, the head anchor could not see it
+#: and fell on the identity block alone.
+_SYSTEM_ROLES: Final = ("system", "developer")
+
+
+def split_system_messages(messages: list[Any]) -> tuple[list[dict[str, Any]], list[Any]]:
+    """Split the client's system instructions from the rest of the conversation.
+
+    Each system string, or text part of a system list, stays a block of its own with its
+    ``cache_control`` — what omp sends (one message per system prompt) and what LiteLLM
+    itself would put on the wire (`translate_system_message`,
+    ``llms/anthropic/chat/transformation.py:1671``). Joining them into one block defeated
+    the head anchor both ways: `[static, <project-context>]` became one block that did not
+    *start* with a volatile tag, so the anchor cached the per-directory text; a first
+    message opening with `<project-context>` made the whole joined block volatile, and the
+    anchor fell back to the identity line alone.
+
+    An identity the client already sends is removed from its block, so it is not
+    duplicated; a block left empty is dropped (Anthropic rejects empty text blocks).
+    """
+    blocks: list[dict[str, Any]] = []
     rest: list[Any] = []
     for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "system":
+        if not isinstance(message, dict) or message.get("role") not in _SYSTEM_ROLES:
             rest.append(message)
             continue
         content = message.get("content", "")
         if isinstance(content, str):
-            system_parts.append(content)
+            parts: list[Any] = [{"text": content, "cache_control": message.get("cache_control")}]
         elif isinstance(content, list):
-            system_parts.extend(
-                str(item.get("text", ""))
-                for item in content
-                if isinstance(item, dict) and item.get("type") == "text"
-            )
-    client_prompt = "\n\n".join(
-        part.strip().replace(CLAUDE_CODE_PROMPT, "").strip()
-        for part in system_parts
-        if part.strip()
-    )
-    return client_prompt, rest
+            parts = [i for i in content if isinstance(i, dict) and i.get("type") == "text"]
+        else:
+            continue
+        for part in parts:
+            text = str(part.get("text") or "").replace(CLAUDE_CODE_PROMPT, "").strip()
+            if not text:
+                continue
+            block: dict[str, Any] = {"type": "text", "text": text}
+            if isinstance(part.get("cache_control"), dict):
+                block["cache_control"] = part["cache_control"]
+            blocks.append(block)
+    return blocks, rest
 
 
-def build_system_blocks(client_prompt: str) -> list[dict[str, Any]]:
+def build_system_blocks(*client_blocks: dict[str, Any]) -> list[dict[str, Any]]:
     """Agent SDK identity first, client instructions after.
 
     Measured against upstream with an OAuth token (opus-5/sonnet-4-6/opus-4-8/opus-4-6,
@@ -983,10 +1040,11 @@ def build_system_blocks(client_prompt: str) -> list[dict[str, Any]]:
     there being only one block. Stuffing the client prompt into the first user turn stripped
     it of system authority for no reason at all.
     """
-    blocks: list[dict[str, Any]] = [{"type": "text", "text": CLAUDE_CODE_PROMPT}]
-    if client_prompt:
-        blocks.append({"type": "text", "text": client_prompt})
-    return blocks
+    return [{"type": "text", "text": CLAUDE_CODE_PROMPT}, *client_blocks]
+
+
+def _is_identity(block: object) -> bool:
+    return isinstance(block, dict) and block.get("text") == CLAUDE_CODE_PROMPT
 
 
 def _wants_thinking(kwargs: dict[str, Any]) -> bool:
@@ -1058,16 +1116,16 @@ def build_request(
     if not isinstance(messages, list):
         return kwargs
 
-    # LiteLLM pops every system message and joins them at the front
-    # (llms/anthropic/chat/transformation.py:1686), so the
-    # mid-conversation-system-2026-04-07 beta we send cannot be honoured from here.
-    client_prompt, rest = split_system_messages(messages)
+    # LiteLLM pops every system message and hoists it to the front, one block each
+    # (llms/anthropic/chat/transformation.py:1671), so the mid-conversation-system-2026-04-07
+    # beta we send cannot be honoured from here.
+    client_blocks, rest = split_system_messages(messages)
     if native_system:
         # `/v1/messages` carries its own top-level `system`, and the client's own prompt
         # is already there. Prepending ours keeps the identity the subscription validates
         # without displacing what the caller wrote.
         existing = kwargs.get("system")
-        blocks = build_system_blocks(client_prompt)
+        blocks = build_system_blocks(*client_blocks)
         if isinstance(existing, list):
             blocks = [*blocks, *existing]
         elif isinstance(existing, str) and existing.strip():
@@ -1075,19 +1133,23 @@ def build_request(
         kwargs["system"] = blocks
         tools = kwargs.get("tools")
         ttl = None if client_uses_short_ttl(tools, blocks, rest) else LONG_CACHE_TTL
-        head = apply_head_cache(blocks, tools if isinstance(tools, list) else None, ttl)
+        head = apply_head_cache(
+            blocks, tools if isinstance(tools, list) else None, ttl, messages=rest
+        )
         apply_conversation_cache(rest, head, ttl)
         kwargs["messages"] = rest
         return kwargs
 
-    system_blocks = build_system_blocks(client_prompt)
+    system_blocks = build_system_blocks(*client_blocks)
     identity = {"role": "system", "content": system_blocks}
 
     # The head is anchored first so that the messages budget already discounts what it
     # spent: the ceiling of 4 is per request, and a fifth marker gives 400.
     tools = kwargs.get("tools")
     ttl = None if client_uses_short_ttl(tools, system_blocks, rest) else LONG_CACHE_TTL
-    head = apply_head_cache(system_blocks, tools if isinstance(tools, list) else None, ttl)
+    head = apply_head_cache(
+        system_blocks, tools if isinstance(tools, list) else None, ttl, messages=rest
+    )
     apply_conversation_cache(rest, head, ttl)
     kwargs["messages"] = [identity, *rest]
     return kwargs
