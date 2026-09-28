@@ -149,11 +149,3 @@ class TestOutputCeiling:
     def test_an_undeclared_ceiling_is_not_filled_in(self) -> None:
         model = DiscoveredModel(wire_name="chat_20706", suggested_name="c", verified=True)
         assert "max_output_tokens" not in to_deployment(model, "google-antigravity")["model_info"]
-
-    def test_codex_states_that_there_is_none(self) -> None:
-        """The backend refuses `max_output_tokens` (400), so no request can set one. Leaving
-        the key out let LiteLLM's proxy fill 128000 from its price map."""
-        model = DiscoveredModel(wire_name="gpt-5.5", suggested_name="g", verified=True)
-        info = to_deployment(model, "openai-codex")["model_info"]
-        assert "max_output_tokens" in info
-        assert info["max_output_tokens"] is None

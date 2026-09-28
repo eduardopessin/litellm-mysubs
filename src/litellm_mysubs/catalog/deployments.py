@@ -49,27 +49,6 @@ FAMILY_PREFIX: Final[dict[str, str]] = {
     "openai": "openai",
 }
 
-#: Providers whose backend takes no output cap from the caller. Measured on 2026-09-28:
-#: Codex answers ``max_output_tokens`` with 400 "Unsupported parameter", and omp strips
-#: it for that reason (`providers/openai-codex-responses.ts`).
-UNCAPPED_OUTPUT: Final[frozenset[ProviderId]] = frozenset({"openai-codex"})
-
-
-def output_ceiling_info(provider: ProviderId, declared: int | None) -> dict[str, Any]:
-    """The ``model_info`` entries that state a deployment's output ceiling.
-
-    Only what the provider declared is stated. For an uncapped provider the key is stated
-    **empty** rather than left out: LiteLLM's proxy fills every key a deployment lacks from
-    its price map (`_enrich_model_info_with_litellm_data` on 1.101.0), which put 128000 on
-    every Codex model — a ceiling no request can set. Any other undeclared ceiling is left
-    to that map, which is LiteLLM's statement and not this plugin's.
-    """
-    if provider in UNCAPPED_OUTPUT:
-        return {"max_output_tokens": None}
-    if declared is None:
-        return {}
-    return {"max_output_tokens": declared}
-
 
 def wire_prefix(model: DiscoveredModel, provider: ProviderId) -> str:
     """Prefix to put in ``litellm_params.model``. Never empty.
@@ -159,19 +138,23 @@ def to_deployment(model: DiscoveredModel, provider: ProviderId) -> dict[str, Any
     The value is the same family prefix that already goes on the wire, which is the one
     that has a price table behind it — so the icon and the cost agree by construction
     instead of being two independent guesses.
+
+    ``max_output_tokens`` is stated only when the provider declared one. There is no way to
+    state "none": the Router stores ``model_info`` with ``exclude_none``, so an explicit
+    ``None`` is dropped on injection and the proxy fills the key from LiteLLM's price map
+    anyway — measured on 1.101.0, where Codex went on showing 128000.
     """
     family = wire_prefix(model, provider)
+    info: dict[str, Any] = {"mysubs_provider": provider, "mysubs_verified": model.verified}
+    if model.max_output_tokens is not None:
+        info["max_output_tokens"] = model.max_output_tokens
     return {
         "model_name": public_name(model, provider),
         "litellm_params": {
             "model": f"{family}/{model.wire_name}",
             "custom_llm_provider": family,
         },
-        "model_info": {
-            "mysubs_provider": provider,
-            "mysubs_verified": model.verified,
-            **output_ceiling_info(provider, model.max_output_tokens),
-        },
+        "model_info": info,
     }
 
 

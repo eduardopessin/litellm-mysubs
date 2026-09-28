@@ -42,21 +42,29 @@ class TestRouterSurface:
 
 
 class TestProxyModelInfo:
-    """`catalog/deployments.py` states the output ceiling in ``model_info`` and relies on the
-    proxy filling only the keys a deployment lacks. If LiteLLM starts overwriting them,
-    `/model/info` goes back to showing its price map's 128000 for every Claude and Codex
-    model."""
+    """`catalog/deployments.py` states a declared output ceiling in ``model_info`` and relies
+    on it surviving the Router and the proxy filling only the keys a deployment lacks. If
+    either stops holding, `/model/info` goes back to LiteLLM's price map — 128000 on
+    `claude-opus-4-5`, whose ceiling is 64000.
 
-    def test_a_stated_ceiling_survives_enrichment(self) -> None:
+    Through the real Router, not a hand-built dict: the Router stores ``model_info`` with
+    ``exclude_none``, which is what made a stated ``None`` vanish in 0.1.13 while a test that
+    skipped the Router passed."""
+
+    def test_a_declared_ceiling_survives_the_router_and_enrichment(self) -> None:
         proxy_server = pytest.importorskip("litellm.proxy.proxy_server")
-        for stated in (64000, None):
-            model = {
-                "model_name": "m",
-                "litellm_params": {"model": "anthropic/claude-opus-5-5"},
-                "model_info": {"max_output_tokens": stated},
-            }
-            out = proxy_server._enrich_model_info_with_litellm_data(model)
-            assert out["model_info"]["max_output_tokens"] == stated
+        router = litellm.Router(
+            model_list=[
+                {
+                    "model_name": "m",
+                    "litellm_params": {"model": "anthropic/claude-opus-5-5"},
+                    "model_info": {"id": "m", "max_output_tokens": 64000},
+                }
+            ]
+        )
+        stored = dict(router.model_list[0])
+        out = proxy_server._enrich_model_info_with_litellm_data(stored)
+        assert out["model_info"]["max_output_tokens"] == 64000
 
 
 class TestModuleSurface:
