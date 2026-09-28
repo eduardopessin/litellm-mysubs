@@ -31,7 +31,7 @@ def _isolate_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     constants are replaced too, along with the signature defaults that captured them.
     """
     from litellm_mysubs.catalog import selection
-    from litellm_mysubs.credentials import file_store
+    from litellm_mysubs.credentials import file_store, refresher
 
     home = tmp_path / "home"
     (home / ".litellm" / "mysubs").mkdir(parents=True)
@@ -45,3 +45,9 @@ def _isolate_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # what makes a bare `SelectionStore()` point at the throwaway location.
         cls = selection.SelectionStore if module is selection else file_store.FileCredentialStore
         cls.__init__.__defaults__ = (target,)
+    # The refresher imported the constant by value (`from .file_store import DEFAULT_PATH`)
+    # and derives its lock files from it: without this the suite left `credentials.json.*.lock`
+    # files in the real home of whoever ran it.
+    monkeypatch.setattr(
+        refresher, "DEFAULT_PATH", home / ".litellm" / "mysubs" / "credentials.json"
+    )

@@ -531,8 +531,10 @@ class TestTheRequestReachesTheUpstream:
             {key: item.get(key) for key in ("type", "role", "call_id", "name", "arguments")}
             for item in body["input"]
         ]
+        # User items are plain `{role, content}` and tool-call arguments are re-serialized
+        # compactly, as omp's request transformer sends them (see test_codex_wire_omp1841).
         assert items == [
-            {"type": "message", "role": "user", "call_id": None, "name": None, "arguments": None},
+            {"type": None, "role": "user", "call_id": None, "name": None, "arguments": None},
             {
                 "type": "message",
                 "role": "assistant",
@@ -545,7 +547,7 @@ class TestTheRequestReachesTheUpstream:
                 "role": None,
                 "call_id": "call_1",
                 "name": "get_weather",
-                "arguments": TOOL_ARGUMENTS,
+                "arguments": json.dumps(json.loads(TOOL_ARGUMENTS), separators=(",", ":")),
             },
             {
                 "type": "function_call_output",

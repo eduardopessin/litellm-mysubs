@@ -192,11 +192,11 @@ class TestStoreIsWired:
     cause."""
 
     def test_patching_configures_the_plugin_store(self) -> None:
-        """Measured on the real proxy: `install()` without `configure()` leaves
-        `_access_token` returning "", the request goes out with `Authorization: Bearer `
-        and httpx refuses it with `Illegal header value b'Bearer '`. The error comes from
-        the provider's client, not from the plugin, and says nothing about the missing
-        credential.
+        """`install()` without `configure()` leaves the plugin with no store: measured on
+        the real proxy before 0.1.16, the request went out with `Authorization: Bearer ` and
+        httpx refused it with `Illegal header value b'Bearer '`; since then `_access_token`
+        refuses it with `No API key for provider`. Either way the patch is useless without
+        the store, which is what this pins.
         """
         from litellm_mysubs import plugin
 

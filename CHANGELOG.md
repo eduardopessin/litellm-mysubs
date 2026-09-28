@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-09-28
+
+More of the upstream protocol inherited from omp 18.4.1, so that following omp stays a
+mechanical port: 340 anchors (201 in 0.1.15), and the anchor check now also catches a
+changed declaration, not only a renamed one.
+
+### Fixed
+
+- **`/v1/responses` is omp's Responses server** (`providers/openai-responses-server.ts`),
+  for Codex and Antigravity, inbound and outbound. Defects it removes, each measured
+  through the real proxy and the `openai` SDK:
+  - no event carried `sequence_number`;
+  - reasoning summaries and function-call arguments never streamed, and streamed output
+    came in the wrong order;
+  - `call_id` went out as the composite `call|item` id;
+  - a turn cut by the output limit ended `completed` instead of `incomplete`;
+  - a failure mid-stream had no `response.failed`;
+  - `instructions`, `reasoning` and function-call / function-call-output input items were
+    dropped before reaching the upstream, so multi-turn tool exchanges were lost;
+  - the streamed `response.completed` reached the SDK with chat usage names
+    (`input_tokens` was `None`), because LiteLLM's logging rewrote the event in place.
+- **Google error finishes fail the turn, as in omp.** Only `STOP` and `MAX_TOKENS` are
+  outcomes; `SAFETY`, `RECITATION`, `PROHIBITED_CONTENT`, `MALFORMED_FUNCTION_CALL` and any
+  unknown reason now raise 502 `upstream_error`. Chat and Responses non-stream answer 502;
+  streams end with an error (`event: error` on Messages, `response.failed` on Responses)
+  instead of finishing. Before, they finished with `content_filter` / `end_turn` /
+  `completed`.
+- **Cached tokens are billed at the right rate.** `prompt_tokens` now includes cached
+  tokens for every provider, as omp's `buildUsage` and LiteLLM's cost code expect.
+  Antigravity had the cache subtracted twice (a 1000-token prompt with 400 cached priced
+  as 600 minus 400 again), and a streamed `/v1/messages` turn from Codex billed its cache
+  at the full input rate. Google usage is omp's `mapGoogleUsage` (prompt derived from the
+  total when missing; cache clamped to the prompt), and Codex orchestration tokens are
+  counted.
+- **A braked stream closes the upstream.** When the whitespace brake or the reasoning-loop
+  guard refused a turn, the HTTP stream to Codex or Antigravity stayed open and the
+  subscription went on generating the turn it had just refused.
+- **A request with no credential is refused up front** with `No API key for provider`,
+  instead of going out with an empty bearer and failing inside the HTTP client.
+
+### Changed
+
+- **Codex wire follows omp 18.4.1** (`openai-codex-responses.ts`, `request-transformer.ts`,
+  pi-catalog `wire/codex.ts`). Validated against the live Codex backend before release.
+  - Session identity per conversation, derived as omp's gateway derives it (the client's
+    `prompt_cache_key`, then session/conversation ids in metadata or headers, then a stable
+    hash of the conversation): `session_id`, `thread-id` and `x-codex-window-id` are no
+    longer shared by every request of the process, and `client_metadata` /
+    `x-codex-turn-metadata` carry the same identity.
+  - Residency is sent for `no_constraint`, falling back to the compute claim.
+  - No effort sent means no `reasoning` object (it used to default to medium with an
+    `auto` summary); `none` sends `{"effort": "none"}`. The "Juice" developer item is gone:
+    omp only sends it on the plain Responses path, not on Codex.
+  - Input items take omp's shapes (system joined into `instructions`, compact tool-call
+    arguments, tool-result images moved to a user item, malformed tool calls dropped), and
+    `tool_choice` is sent only for a function that is offered.
+  - Hosted tools (`web_search`, `image_generation`, …) are still passed through, although
+    omp drops them: the Codex backend serves them.
+- **Anchor check hashes the anchored declarations** against `tools/omp_anchors.lock`; see
+  `docs/OMP.md` for the version-bump workflow.
+
 ## [0.1.15] - 2026-09-28
 
 ### Fixed
@@ -861,7 +922,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.16...HEAD
+[0.1.16]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.12...v0.1.13

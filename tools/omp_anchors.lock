@@ -7,6 +7,7 @@
     "pi-ai/auth-gateway/http.ts::resolvePromptCacheKey": "8f1e2b898d8cea3a9772a27fc4346f08dfabbd27dd153c73470024a62712abde",
     "pi-ai/auth-gateway/server.ts::buildStreamOptions": "d697eb7a95d7a3cc38a0ce308a2a7a76609aba7b86453d089f3631bcf352e118",
     "pi-ai/auth-gateway/server.ts::deriveSessionId": "65da5cbb7f90ccac863ee97f04950269001cca0b89687a82f999039000f1d6d2",
+    "pi-ai/error/auth.ts::MissingApiKeyError": "12850562ab28659fb2ef3609b0b157cd6eab52ec73b3957972610bd4453e1374",
     "pi-ai/error/gateway.ts::classifyGatewayError": "6097a3337823d3dcf353e558eedf9fd7390c7b5707669052c851912888927de7",
     "pi-ai/providers/anthropic-messages-server.ts::closeBlock": "eb7053c417155c607829c6304e38608c44dc2e9343c34ae0c2ebea504ae4b14f",
     "pi-ai/providers/anthropic-messages-server.ts::encodeContentBlocks": "90500c5c41fce3fb81e4e82e47d5dcd70ef11565d45c97416995e15d343ef628",
