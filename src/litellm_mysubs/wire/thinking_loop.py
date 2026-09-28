@@ -22,35 +22,51 @@ from __future__ import annotations
 import re
 from typing import Final
 
+# omp: utils/thinking-loop.ts :: EXACT_TAIL_WINDOW
 #: Tail retained for exact cycle detection.
 EXACT_TAIL_WINDOW: Final = 4096
+# omp: utils/thinking-loop.ts :: EXACT_MAX_UNIT
 #: Largest cycle considered.
 EXACT_MAX_UNIT: Final = 1024
+# omp: utils/thinking-loop.ts :: EXACT_CHECK_STRIDE
 #: New characters between scans. Avoids quadratic work on every delta.
 EXACT_CHECK_STRIDE: Final = 128
+# omp: utils/thinking-loop.ts :: EXACT_SHORT_MAX_UNIT
 #: Boundary between the short and the long regime.
 EXACT_SHORT_MAX_UNIT: Final = 60
+# omp: utils/thinking-loop.ts :: EXACT_SHORT_MIN_REPEATED_CHARS
 EXACT_SHORT_MIN_REPEATED_CHARS: Final = 180
+# omp: utils/thinking-loop.ts :: EXACT_LONG_MIN_REPEATED_CHARS
 EXACT_LONG_MIN_REPEATED_CHARS: Final = 1024
 
+# omp: utils/thinking-loop.ts :: SEGMENT_CHAR_CAP
 #: Cap on a segment with no terminator; forces a flush so that a wall of text with no blank
 #: lines still gets segmented.
 SEGMENT_CHAR_CAP: Final = 700
+# omp: utils/thinking-loop.ts :: SEGMENT_MIN_NORM_CHARS
 #: Below this normalized length the segment is ignored — too short to be a paragraph with
 #: meaning, and a lone heading must not be able to trigger detection.
 SEGMENT_MIN_NORM_CHARS: Final = 60
+# omp: utils/thinking-loop.ts :: SEGMENT_WINDOW
 SEGMENT_WINDOW: Final = 16
+# omp: utils/thinking-loop.ts :: SEGMENT_SIMILARITY
 SEGMENT_SIMILARITY: Final = 0.8
+# omp: utils/thinking-loop.ts :: SEGMENT_MIN_COUNT
 #: Warm-up: substantial segments required before detection may fire.
 SEGMENT_MIN_COUNT: Final = 8
+# omp: utils/thinking-loop.ts :: SEGMENT_MIN_CLUSTER
 #: Size of the near-duplicate cluster that fires.
 SEGMENT_MIN_CLUSTER: Final = 4
 
+# omp: utils/thinking-loop.ts :: LEX_NOVELTY_WINDOW
 #: Window whose vocabulary is the novelty baseline.
 LEX_NOVELTY_WINDOW: Final = 8
+# omp: utils/thinking-loop.ts :: LEX_STALL_NOVELTY_FLOOR
 LEX_STALL_NOVELTY_FLOOR: Final = 0.2
+# omp: utils/thinking-loop.ts :: LEX_STALL_MIN_RUN
 LEX_STALL_MIN_RUN: Final = 8
 
+# omp: utils/thinking-loop.ts :: CONCRETE_ANCHOR
 # A concrete reference the model is actually reasoning about: a code fragment, a dotted
 # extension or member, a multi-segment path, or a snake/camel/Pascal identifier. Excludes
 # bare digits, abbreviations and decimals ("Step 2", "i.e.", "1.2") so that numbered filler
@@ -85,6 +101,7 @@ class ThinkingLoopError(Exception):
     """
 
 
+# omp: utils/thinking-loop.ts :: normalizeSegment
 def normalize_segment(segment: str) -> str:
     """Lowercase, no punctuation, only words that contain letters."""
     lowered = _BACKTICKED.sub(r" \1 ", segment.lower())
@@ -92,6 +109,7 @@ def normalize_segment(segment: str) -> str:
     return " ".join(token for token in tokens if _HAS_LETTER.search(token))
 
 
+# omp: utils/thinking-loop.ts :: trigramShingles
 def trigram_shingles(normalized: str) -> set[str]:
     """Trigrams of **words** — not of characters.
 
@@ -104,6 +122,7 @@ def trigram_shingles(normalized: str) -> set[str]:
     return {" ".join(words[index : index + 3]) for index in range(len(words) - 2)}
 
 
+# omp: utils/thinking-loop.ts :: jaccard
 def jaccard(left: set[str], right: set[str]) -> float:
     if not left or not right:
         return 0.0
@@ -113,6 +132,7 @@ def jaccard(left: set[str], right: set[str]) -> float:
     return intersection / union if union else 0.0
 
 
+# omp: utils/thinking-loop.ts :: detectExactSuffixCycle
 def detect_exact_suffix_cycle(text: str) -> tuple[str, int] | None:
     """Literal cycle repeated at the end of the text, by Z algorithm over the reverse.
 

@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import Any, Final
 
 import httpx
+import litellm
 
 from .credentials.store import CredentialStore, ProviderId
 from .transport import hosts
@@ -37,9 +38,8 @@ ANTIGRAVITY_USER_AGENT: Final = (
 #: ends.
 _SIGNATURE_LIMIT: Final = 512
 
-#: This instance's transport identity. Per process, as in the real client: a new
-#: `window_id` on every request invalidated the backend's prompt cache.
-_WINDOW_ID: Final = str(uuid.uuid4())
+#: This instance's transport identity (Antigravity's request ids). Codex's thread and
+#: window ids are per conversation, not per process: see `codex.turn_metadata`.
 _AGENT_ID: Final = uuid.uuid4().hex[:16]
 _TRAJECTORY_ID: Final = uuid.uuid4().hex[:16]
 
@@ -127,8 +127,14 @@ async def _refresh(provider: str) -> str | None:
         return None
 
     provider_id = _PROVIDER_IDS[provider]
-    store.reload()
-    credential = store.get(provider_id)
+    try:
+        store.reload()
+        credential = store.get(provider_id)
+    except Exception:
+        # The re-read failing — a vault that does not answer, a file caught mid-write —
+        # is a failure like any other here. Raised, it replaced the upstream's 401 with the
+        # store's own error, on a request the upstream had refused for its own reason.
+        return None
     if credential is None:
         return None
     if not credential.is_expired():
@@ -167,18 +173,30 @@ async def _access_token(provider: str) -> str:
 
     `Credential.is_expired` already carries 60 seconds of slack: the token is renewed while
     it still works, so there is no window between the check and the request.
+
+    No token at all is refused before anything is built, as omp refuses a request with no
+    key: a Codex or Antigravity request went out with ``Authorization: Bearer `` — which
+    httpx refuses on a real socket with ``Illegal header value b'Bearer '`` — and the client
+    got a 500 naming neither the provider nor the missing step. Anthropic is the exception,
+    and returns ``""``: `_delegate_kwargs` asks for its token on every call it hands to
+    LiteLLM, Claude or not, and LiteLLM's own Anthropic client already refuses a Claude
+    call without a key.
     """
     store = _state.store
-    if store is None:
-        return ""
-    credential = store.get(_PROVIDER_IDS[provider])
-    if credential is None:
-        return ""
-    if credential.is_expired():
+    credential = store.get(_PROVIDER_IDS[provider]) if store is not None else None
+    if credential is not None and credential.is_expired():
         renewed = await _refresh(provider)
         if renewed:
             return renewed
-    return credential.access_token
+    token = credential.access_token if credential is not None else ""
+    if not token and provider != "anthropic":
+        # omp: error/auth.ts :: MissingApiKeyError
+        raise litellm.exceptions.AuthenticationError(
+            message=f"No API key for provider: {_PROVIDER_IDS[provider]}",
+            llm_provider=_PROVIDER_IDS[provider],
+            model="",
+        )
+    return token
 
 
 def _remember_signature(call_id: str, signature: str) -> None:
@@ -199,25 +217,31 @@ def _request_id() -> str:
     return f"agent/{_AGENT_ID}/{int(time.time() * 1000)}/{_TRAJECTORY_ID}/{_state.step}"
 
 
+# omp: providers/openai-codex-responses.ts :: createCodexRequestContext
 async def _codex_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> RequestSpec:
     # No output caps to strip: `build_request_body` builds the body from scratch and does
     # not read `max_tokens`/`max_output_tokens`/`max_completion_tokens` from the kwargs. The
     # original had to delete them because it passed the kwargs on; here they never reach
     # the wire.
     token = await _access_token("codex")
+    # One identity per request, shared by the body's `client_metadata` and the headers,
+    # as omp builds it once and hands it to both.
+    session_id = codex.session_key(model, messages, extra.get("tools"), extra)
+    metadata = codex.turn_metadata(session_id, messages)
     body = codex.build_request_body(
         model,
         messages,
         tools=extra.get("tools"),
         extra=extra,
-        session_id=extra.get("litellm_session_id") or extra.get("user"),
+        session_id=session_id,
+        metadata=metadata,
     )
     headers = codex.build_headers(
         token,
-        window_id=_WINDOW_ID,
-        session_id=extra.get("litellm_session_id") or extra.get("user"),
-        model=str(body.get("model") or model),
-        service_tier=extra.get("service_tier"),
+        session_id=session_id,
+        metadata=metadata,
+        model=str(body["model"]),
+        service_tier=body.get("service_tier"),
     )
     return RequestSpec(url=CODEX_URL, headers=headers, body=body, provider="codex", model=model)
 

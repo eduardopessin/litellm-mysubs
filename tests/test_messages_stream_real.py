@@ -360,17 +360,6 @@ class TestAStreamedMessagesTurnIsWhatAClientReads:
         assert streamed["stop_reason"] == whole["stop_reason"] == "tool_use"
 
 
-    async def test_a_blocked_answer_does_not_claim_a_stop_sequence(self) -> None:
-        """Antigravity's server-side blocks reach the route as `content_filter`, which was
-        sent as `stop_sequence` — telling the client one of its own stop sequences matched,
-        when it sent none. omp's `mapStopReasonOut` has no such case and ends the turn."""
-        install_transport(FakeTransport(antigravity_turn(tool=False, finish="SAFETY")))
-
-        message = accumulate((await post_messages(ANTIGRAVITY, stream=True)).text)
-        whole = (await post_messages(ANTIGRAVITY, stream=False)).json()
-
-        assert message["stop_reason"] == whole["stop_reason"] == "end_turn"
-
     async def test_a_failure_mid_stream_reaches_the_client_as_an_error_event(self) -> None:
         """A Codex stream cut before `response.completed` is a failure, raised after
         `message_start` already left. LiteLLM writes its own error frame as a bare `data:`

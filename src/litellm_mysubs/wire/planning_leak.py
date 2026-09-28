@@ -82,6 +82,8 @@ def is_leak_object(parsed: object, tool_names: frozenset[str] = frozenset()) -> 
     return "path" in parsed and "content" in parsed
 
 
+# omp: providers/google-gemini-cli.ts :: splitLeadingJsonObject
+# omp: providers/google-gemini-cli.ts :: splitLeadingJsonObjectIgnoringQuotes
 def _split_leading_object(text: str, *, honour_strings: bool = True) -> tuple[str, str] | None:
     """First brace-balanced JSON object, and whatever is left over.
 

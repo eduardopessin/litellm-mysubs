@@ -317,13 +317,25 @@ class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
             # delivered, on a turn the subscription had already paid for — while
             # `_emitted` was already set, so `aclose()` would not retry and the `except`
             # below never ran. Measured against a raising logging object: 0 of 3 events.
-            if self.completed_response is not None:
-                _stamp_cost(logging_obj, self.completed_response, self._kwargs)
-            _stamp_first_token(logging_obj, self._first_token_at)
+            #
             # The **event**, not the response: the handler's streaming branch keys off
             # `isinstance(result, ResponseCompletedEvent)` and drops anything else.
+            #
+            # A **copy** of it, as LiteLLM's own `ResponsesAPIStreamingIterator` hands its
+            # handlers: `_get_assembled_streaming_response` rewrites `response.usage` in
+            # place into chat counters, and this event is returned to the client after the
+            # handler ran. Measured through the proxy and the OpenAI SDK: the streamed
+            # `response.completed` carried `prompt_tokens`/`completion_tokens`, and
+            # `final.usage.input_tokens` read `None`. The cost is stamped on the copy,
+            # because the handler reads it off the response it is given and a copy does
+            # not carry private attributes over — stamped on the original, the row read 0.
+            event = self._terminal_event
+            logged = None if event is None else type(event).model_validate(event.model_dump())
+            if logged is not None:
+                _stamp_cost(logging_obj, logged.response, self._kwargs)
+            _stamp_first_token(logging_obj, self._first_token_at)
             await handler(
-                result=self._terminal_event,
+                result=logged,
                 start_time=self._started,
                 end_time=datetime.datetime.now(),
             )
@@ -404,17 +416,25 @@ async def _logged_messages(
 
 
 def _messages_response(model: str, final: dict[str, Any], kwargs: dict[str, Any]) -> Any:
-    """The turn as a priceable object: usage under the wire name, nothing invented."""
+    """The turn as a priceable object: usage under the wire name, nothing invented.
+
+    The Messages counts are omp's `encodeUsage`, with the cache reads beside
+    ``input_tokens``; LiteLLM prices from the chat convention, where ``prompt_tokens``
+    includes them and ``cached_tokens`` says how many — the same shape
+    `turns._litellm_usage` gives the other routes' rows.
+    """
     usage = final.get("usage") or {}
-    return litellm.ModelResponse(
-        model=_cost_identity(model, kwargs)[0],
-        usage=litellm.Usage(
-            prompt_tokens=int(usage.get("input_tokens") or 0),
-            completion_tokens=int(usage.get("output_tokens") or 0),
-            total_tokens=int(usage.get("input_tokens") or 0)
-            + int(usage.get("output_tokens") or 0),
-        ),
+    cache_read = int(usage.get("cache_read_input_tokens") or 0)
+    prompt = int(usage.get("input_tokens") or 0) + cache_read
+    completion = int(usage.get("output_tokens") or 0)
+    priced = litellm.Usage(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=prompt + completion,
+        prompt_tokens_details={"cached_tokens": cache_read},
     )
+    priced.cache_read_input_tokens = cache_read
+    return litellm.ModelResponse(model=_cost_identity(model, kwargs)[0], usage=priced)
 
 
 

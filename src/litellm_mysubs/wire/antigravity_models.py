@@ -185,7 +185,6 @@ def _from_static_map(raw: str) -> str | None:
     return None
 
 
-# omp: providers/google-gemini-cli.ts :: lastGoodEndpoint
 def map_model(model: str, effort: str | None = None, catalog: ModelCatalog | None = None) -> str:
     """Name that goes on the wire. Raises ``ModelNotServedError`` if nothing matches."""
     raw = str(model).split("/")[-1].lower()

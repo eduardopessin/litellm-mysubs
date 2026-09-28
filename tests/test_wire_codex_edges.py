@@ -22,10 +22,6 @@ def jwt(payload: dict[str, Any]) -> str:
 
 
 class TestMalformedInput:
-    def test_non_numeric_generation_is_zero(self) -> None:
-        """A name without a version cannot blow up the juice item decision."""
-        assert codex.wire_generation("gpt-terra-x") == 0.0
-
     def test_non_dict_claims_are_empty(self) -> None:
         """A JWT whose body is not an object is not a usable identity."""
         body = base64.urlsafe_b64encode(json.dumps(["list"]).encode()).decode().rstrip("=")
@@ -94,13 +90,13 @@ class TestMalformedInput:
         assert tools is not None
         assert tools[0]["parameters"] == {"type": "object", "properties": {}}
 
-    @pytest.mark.parametrize("choice", [None, "auto", 42, {"type": "auto"}])
-    def test_tool_choice_passthrough(self, choice: object) -> None:
-        assert codex.tool_choice(choice) == choice
+    @pytest.mark.parametrize("choice", [None, "", 42, {"type": "auto"}])
+    def test_unusable_tool_choice_is_omitted(self, choice: object) -> None:
+        assert codex.tool_choice(choice, [{"type": "function", "name": "f"}]) is None
 
-    def test_tool_choice_without_name_passes_through(self) -> None:
+    def test_tool_choice_without_name_is_omitted(self) -> None:
         payload = {"type": "function", "function": {}}
-        assert codex.tool_choice(payload) == payload
+        assert codex.tool_choice(payload, [{"type": "function", "name": "f"}]) is None
 
 
 class TestCacheKeyEdges:

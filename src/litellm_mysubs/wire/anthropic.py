@@ -75,6 +75,7 @@ OUTPUT_FALLBACK_BUFFER: Final = 4000
 #: every OAuth request as the Claude Code cap, which 18.4.1 reverted as a bug.
 UNKNOWN_MODEL_MAX_OUTPUT_TOKENS: Final = 64000
 
+# omp: model-thinking.ts :: mapEffortToAnthropicAdaptiveEffort
 # Measured against upstream (max_tokens=2048, display="summarized", a question that
 # demands reasoning): xhigh and max are accepted and yield more output than high (out=164
 # at high, 273 at xhigh, 275 at max), so collapsing them into "high" hid two real steps.
@@ -156,6 +157,14 @@ UNCACHEABLE_BLOCKS: Final[tuple[str, ...]] = ("thinking", "redacted_thinking", "
 SERVER_TOOL_PREFIX: Final = "srvtoolu_"
 
 # omp: providers/anthropic.ts :: claudeCodeAgentBetaDefaults
+# omp: providers/anthropic.ts :: oauthAuthBeta
+# omp= oauthAuthBeta = "oauth-2025-04-20"
+# omp: providers/anthropic.ts :: thinkingTokenCountBeta
+# omp= thinkingTokenCountBeta = "thinking-token-count-2026-05-13"
+# omp: providers/anthropic.ts :: contextManagementBeta
+# omp= contextManagementBeta = "context-management-2025-06-27"
+# omp: providers/anthropic.ts :: midConversationSystemBeta
+# omp= midConversationSystemBeta = "mid-conversation-system-2026-04-07"
 # Order and content from the source. Notes on what is **not** here:
 #  - `context-1m-2025-08-07`: OAuth credentials have no long-context balance, and Anthropic
 #    returns a hard 429 on any model with the beta, regardless of prompt size. OMP never
@@ -177,10 +186,16 @@ AGENT_BETAS: Final[tuple[str, ...]] = (
     "mid-conversation-system-2026-04-07",
 )
 
+# omp: providers/anthropic.ts :: effortBeta
+# omp= effortBeta = "effort-2025-11-24"
 #: Added only when the request asks for reasoning.
 EFFORT_BETA: Final = "effort-2025-11-24"
+# omp: providers/anthropic.ts :: fallbackCreditBeta
+# omp= fallbackCreditBeta = "fallback-credit-2026-06-01"
 #: Added to every agent request.
 FALLBACK_CREDIT_BETA: Final = "fallback-credit-2026-06-01"
+# omp: providers/anthropic.ts :: extendedCacheTtlBeta
+# omp= extendedCacheTtlBeta = "extended-cache-ttl-2025-04-11"
 #: Added when some anchor carries `ttl: "1h"`.
 EXTENDED_CACHE_TTL_BETA: Final = "extended-cache-ttl-2025-04-11"
 
@@ -857,7 +872,7 @@ def _forced_tool_choice(choice: object) -> bool:
 
 
 # omp: providers/anthropic.ts :: ensureMaxTokensForThinking
-# omp: providers/anthropic.ts :: supportsSamplingParams
+# omp: providers/anthropic.ts :: allowSamplingParams
 # omp: providers/anthropic.ts :: disableThinkingIfToolChoiceForced
 def apply_thinking_params(
     kwargs: dict[str, Any], model: str, *, ceiling: int | None = None

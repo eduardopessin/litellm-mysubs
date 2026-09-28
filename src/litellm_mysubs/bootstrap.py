@@ -121,12 +121,10 @@ class Bootstrap:
             try:
                 from . import plugin
 
-                # Without this the plugin has nowhere to get the credential from:
-                # `_access_token` returns "" and the request goes out with
-                # `Authorization: Bearer `, which httpx refuses with
-                # `Illegal header value b'Bearer '`. `install()` on its own applies the
-                # patch and leaves it useless — and the symptom shows up far from the
-                # cause, in the provider's client.
+                # Without this the plugin has nowhere to get the credential from: every
+                # Codex and Antigravity request is refused with `No API key for provider`,
+                # and Claude calls reach LiteLLM's client with no key. `install()` on its
+                # own applies the patch and leaves it useless.
                 plugin.configure(store=store)
                 plugin.install()
                 self.patched = True

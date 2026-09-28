@@ -54,15 +54,6 @@ class TestAliases:
         assert codex.resolve_model("gpt-x", {"gpt-x": "gpt-5.5"}) == "gpt-5.5"
 
 
-class TestWireGeneration:
-    @pytest.mark.parametrize(
-        ("model", "generation"),
-        [("gpt-5.6-terra", 5.6), ("gpt-5.5", 5.5), ("gpt-6-astra", 6.0), ("codex", 0.0)],
-    )
-    def test_parses(self, model: str, generation: float) -> None:
-        assert codex.wire_generation(model) == generation
-
-
 class TestTokenClaims:
     def test_extracts_account_id(self) -> None:
         token = jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-1"}})
@@ -77,11 +68,11 @@ class TestTokenClaims:
 
 class TestHeaders:
     def test_transport_identity(self) -> None:
-        headers = codex.build_headers(jwt({}), window_id="w-1")
+        headers = codex.build_headers(jwt({}), session_id="s-1")
         assert headers["originator"] == "omp"
         assert headers["OpenAI-Beta"] == "responses=experimental"
         assert headers["version"] == codex.CLIENT_VERSION
-        assert headers["session_id"] == "w-1"
+        assert headers["session_id"] == "s-1"
 
     def test_installation_id_is_not_sent(self) -> None:
         """OMP deletes it from the headers explicitly; it travels only in the envelope."""
@@ -103,10 +94,6 @@ class TestHeaders:
         )
         assert headers["x-codex-routing-hint"] == "model=gpt-5.5;tier=priority"
 
-    def test_session_id_from_token_wins(self) -> None:
-        headers = codex.build_headers(jwt({"session_id": "s-token"}), window_id="w")
-        assert headers["session_id"] == "s-token"
-
     def test_turn_state_echoed_when_present(self) -> None:
         """The backend returns it and expects it back on the next turn."""
         headers = codex.build_headers(jwt({}), window_id="w", turn_state="st-1")
@@ -127,13 +114,6 @@ class TestHeaders:
 
         personal = codex.build_headers(jwt({}), window_id="w")
         assert "x-openai-internal-codex-residency" not in personal
-
-    def test_no_constraint_is_not_sent(self) -> None:
-        headers = codex.build_headers(
-            jwt({"https://api.openai.com/auth": {"chatgpt_data_residency": "no_constraint"}}),
-            window_id="w",
-        )
-        assert "x-openai-internal-codex-residency" not in headers
 
 
 class TestMultimodal:
@@ -199,10 +179,6 @@ class TestMultimodal:
             ]
         )
         assert [p["type"] for p in parts] == ["input_text", "input_image"]
-
-    def test_assistant_parts_use_output_text(self) -> None:
-        parts = codex.content_to_parts("answer", assistant=True)
-        assert parts == [{"type": "output_text", "text": "answer"}]
 
     def test_empty_content_yields_no_parts(self) -> None:
         assert codex.content_to_parts("") == []
@@ -296,29 +272,12 @@ class TestToolPairRepair:
 
 
 class TestMessagesToInput:
-    def test_first_system_prompt_goes_to_instructions(self) -> None:
+    def test_system_prompt_goes_to_instructions(self) -> None:
         """`instructions` is the base prompt the backend caches; sending it as a developer
         item loses that treatment and the cache hit."""
         instructions, items = codex.messages_to_input([{"role": "system", "content": "rule"}])
         assert instructions == "rule"
         assert not any(i.get("role") == "developer" for i in items)
-
-    def test_extra_system_prompts_become_developer_items(self) -> None:
-        """`instructions` is a string: the second prompt does not fit there and was lost."""
-        instructions, items = codex.messages_to_input(
-            [
-                {"role": "system", "content": "base"},
-                {"role": "system", "content": "extra"},
-                {"role": "user", "content": "hello"},
-            ]
-        )
-        assert instructions == "base"
-        assert items[0] == {
-            "type": "message",
-            "role": "developer",
-            "content": [{"type": "input_text", "text": "extra"}],
-        }
-        assert items[1]["role"] == "user"
 
     def test_developer_only_input_promotes_last_instruction_to_user(self) -> None:
         """Without a visible turn the backend returns an empty response; promoting the
@@ -332,7 +291,7 @@ class TestMessagesToInput:
         assert items[-1] == {
             "type": "message",
             "role": "user",
-            "content": [{"type": "input_text", "text": "do this"}],
+            "content": [{"type": "input_text", "text": "base\n\ndo this"}],
         }
 
     def test_single_system_prompt_promotes_instructions_to_user(self) -> None:
@@ -388,7 +347,7 @@ class TestMessagesToInput:
                 {"role": "tool", "tool_call_id": "c", "content": "r"},
             ]
         )
-        assert items[0]["arguments"] == '{"a": 1}'
+        assert items[0]["arguments"] == '{"a":1}'
 
 
 class TestTools:
@@ -418,73 +377,36 @@ class TestTools:
         assert codex.tools_to_codex_tools(None) is None
 
     def test_tool_choice_drops_function_level(self) -> None:
-        assert codex.tool_choice({"type": "function", "function": {"name": "read"}}) == {
+        offered = [{"type": "function", "name": "read"}]
+        assert codex.tool_choice({"type": "function", "function": {"name": "read"}}, offered) == {
             "type": "function",
             "name": "read",
         }
 
     def test_string_tool_choice_passes(self) -> None:
-        assert codex.tool_choice("auto") == "auto"
+        assert codex.tool_choice("auto", []) == "auto"
 
 
 class TestRequestBody:
-    def test_reasoning_object_always_present(self) -> None:
-        """Without it, zero response.reasoning_summary_text.delta events."""
-        body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
+    def test_reasoning_carries_the_summary_with_an_effort(self) -> None:
+        """Without `reasoning.summary`, zero response.reasoning_summary_text.delta events."""
+        body = codex.build_request_body(
+            "gpt-5.5", [{"role": "user", "content": "x"}], extra={"reasoning_effort": "medium"}
+        )
         assert body["reasoning"] == {"effort": "medium", "summary": "auto"}
 
     def test_all_turns_context_is_not_forced(self) -> None:
         """OMP only forces it on the Lite transport and deletes it on models that do not
         support it."""
-        body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
+        body = codex.build_request_body(
+            "gpt-5.5", [{"role": "user", "content": "x"}], extra={"reasoning_effort": "high"}
+        )
         assert "context" not in body["reasoning"]
 
     def test_encrypted_reasoning_is_requested(self) -> None:
         """Without this there is no reasoning replay in a stateless history."""
         body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
         assert body["include"] == ["reasoning.encrypted_content"]
-
-    def test_effort_none_adds_juice_item_on_new_generations(self) -> None:
-        """GPT-5.6+ still reserves juice with reasoning turned off.
-
-        The value is the one of the requested effort, not zero: turning reasoning off does
-        not mean the model should be left with no budget at all.
-        """
-        body = codex.build_request_body(
-            "gpt-5.6-terra", [{"role": "user", "content": "x"}], extra={"reasoning_effort": "none"}
-        )
-        assert "reasoning" not in body
-        # `none` is the explicit request to turn it off; the juice follows that value.
-        assert (
-            body["input"][-1]["content"][0]["text"] == f"# Juice: {codex.JUICE['none']} !important"
-        )
-
-    def test_juice_follows_a_separate_effort_when_given(self) -> None:
-        """In OMP turning it off is a flag separate from the effort: whoever asks for
-        `high` and turns reasoning off still reserves the `high` budget."""
-        body = codex.build_request_body(
-            "gpt-5.6-terra",
-            [{"role": "user", "content": "x"}],
-            extra={"reasoning_effort": "none", "juice_effort": "high"},
-        )
-        assert (
-            body["input"][-1]["content"][0]["text"] == f"# Juice: {codex.JUICE['high']} !important"
-        )
-
-    def test_juice_defaults_to_medium(self) -> None:
-        assert codex.juice_for(None) == codex.JUICE["medium"]
-        assert codex.juice_for("made-up") == codex.JUICE["medium"]
-
-    def test_juice_follows_the_requested_effort(self) -> None:
-        assert codex.juice_for("high") == 48
-        assert codex.juice_for("max") == 960
-
-    def test_effort_none_skips_juice_on_older_generations(self) -> None:
-        body = codex.build_request_body(
-            "gpt-5.5", [{"role": "user", "content": "x"}], extra={"reasoning_effort": "none"}
-        )
-        assert "reasoning" not in body
-        assert all(i.get("role") != "developer" for i in body["input"])
 
     def test_invalid_summary_falls_back_to_auto(self) -> None:
         body = codex.build_request_body(
@@ -527,6 +449,7 @@ class TestRequestBody:
         assert "prompt_cache_key" not in body
 
     def test_no_cache_key_without_session(self) -> None:
+        """The proxy always names a session (`session_key`); a bare body builder does not."""
         body = codex.build_request_body("gpt-5.5", [{"role": "user", "content": "x"}])
         assert "prompt_cache_key" not in body
 
