@@ -22,7 +22,7 @@ import litellm
 from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices
 
 from .wire import antigravity, codex, planning_leak, thinking_loop
-from .wire.usage import Usage
+from .wire.usage import Usage, google_stop_reason
 
 
 def _discard_signature(call_id: str, signature: str) -> None:
@@ -81,6 +81,21 @@ class StreamError(RuntimeError):
     Both Codex (``response.failed``) and the CCA (in-band ``error``) report errors in the
     body of a successful response. Swallowing them delivered an empty turn as success.
     """
+
+
+# omp: error/gateway.ts :: classifyGatewayError
+class GenerationFailedError(StreamError):
+    """The upstream ended the turn with a finish reason omp counts as an error.
+
+    omp's gateway answers it with the classification its message earns — no status
+    inside it, no rate-limit, auth or invalid-request wording — which is 502
+    ``upstream_error``. LiteLLM's proxy reads both off the exception (`status_code`,
+    `type`); without them the same failure went out as 500 ``internal_server_error``,
+    which tells the client the proxy broke rather than the upstream refusing.
+    """
+
+    status_code = 502
+    type = "upstream_error"
 
 
 class _CodexReader:
@@ -292,8 +307,15 @@ class _AntigravityReader:
         self._tool_index += 1
         return [_tool_open_chunk(index, call_id, name), _tool_delta_chunk(index, arguments)]
 
+    # omp: providers/google-gemini-cli.ts :: streamGoogleGeminiCli
     def close(self) -> list[ModelResponseStream]:
-        """Flushes what the leak filter held back and turned out not to be planning."""
+        """Flushes what the leak filter held back, then fails a turn Google stopped.
+
+        A finish outside omp's allow list (SAFETY, RECITATION, MALFORMED_FUNCTION_CALL,
+        ...) is an error, raised once the stream has ended exactly where omp throws it:
+        the usage has arrived by then, and whatever text already left stays with the
+        client, which then reads the failure — not a turn that merely stopped.
+        """
         chunks: list[ModelResponseStream] = []
         if self._leak is not None and (tail := self._leak.flush()):
             self._turn.text.append(tail)
@@ -303,6 +325,11 @@ class _AntigravityReader:
         # final `usageMetadata` has arrived. Fires at most once per response — if `feed`
         # already raised, this line is never reached.
         self._guard_retired()
+        finish = self._turn.finish_raw
+        if finish and google_stop_reason(finish) == "error":
+            raise GenerationFailedError(
+                f"Antigravity: Generation failed with finish reason: {finish}"
+            )
         return chunks
 
 

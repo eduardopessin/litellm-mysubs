@@ -197,9 +197,10 @@ def map_stop_reason_out(reason: object, has_tool_use: bool) -> str:
     plain stop, or the Anthropic loop (run tools while `stop_reason == "tool_use"`) never
     runs the call.
 
-    `content_filter` falls to the default, as every unlisted reason does in omp. It used to
-    map to `stop_sequence`, which tells the client that one of *its* stop sequences
-    matched; none was sent.
+    A turn the upstream stopped for its own reasons (Google's SAFETY, RECITATION, ...) never
+    gets here: as in omp, whose `encodeResponse` throws on an `error` stop, the reader
+    raises it and the client gets the `error` event or an error response instead of a
+    turn that merely ended.
     """
     if reason == "length":
         return "max_tokens"
@@ -208,18 +209,24 @@ def map_stop_reason_out(reason: object, has_tool_use: bool) -> str:
     return "tool_use" if has_tool_use else "end_turn"
 
 
+# omp: providers/anthropic-messages-server.ts :: encodeUsage
 def _usage(usage: Any) -> dict[str, int]:
-    """Canonical usage as Messages counts.
+    """Canonical usage as Messages counts: ``input_tokens`` excludes the cache reads.
 
-    Not omp's `encodeUsage`: that one adds `cache_read_input_tokens` beside an
-    `input_tokens` that excludes them. The canonical `prompt_tokens` has no single cache
-    convention here — Codex includes cached tokens, Antigravity subtracts them
-    (`wire/usage.py`) — so a cache count next to it would double-count Codex for any
-    client that sums the fields, and the spend row is priced from these two alone.
+    Both mappers in `wire/usage.py` put the cached tokens inside ``prompt_tokens`` (omp's
+    chat convention), so omp's ``input`` is the difference. The spend row of a streamed
+    turn is priced from these fields (`observability._messages_response`), which is why
+    the cache has to be stated rather than folded into ``input_tokens`` at the full rate.
+    Neither upstream reports a cache write.
     """
+    prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+    details = getattr(usage, "prompt_tokens_details", None)
+    cache_read = min(int(getattr(details, "cached_tokens", 0) or 0), prompt)
     return {
-        "input_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+        "input_tokens": prompt - cache_read,
         "output_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": 0,
     }
 
 
@@ -326,7 +333,7 @@ class MessagesStreamEncoder:
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": _usage(None),
             },
         }
 

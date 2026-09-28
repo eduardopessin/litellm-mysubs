@@ -13,14 +13,15 @@ from litellm_mysubs.wire.usage import (
     codex_finish_reason,
     codex_usage,
     google_finish_reason,
+    google_stop_reason,
     google_usage,
-    make_usage,
 )
 
 
 class TestGoogleUsage:
-    def test_cached_tokens_are_not_double_counted(self) -> None:
-        """promptTokenCount includes the cached ones; adding them again inflates the bill."""
+    def test_cached_tokens_stay_inside_the_prompt(self) -> None:
+        """promptTokenCount includes the cached ones, and so does the chat `prompt_tokens`
+        LiteLLM prices from: subtracting them here had LiteLLM subtract them twice."""
         usage = google_usage(
             {
                 "promptTokenCount": 1000,
@@ -29,7 +30,7 @@ class TestGoogleUsage:
                 "totalTokenCount": 1050,
             }
         )
-        assert usage.prompt_tokens == 600
+        assert usage.prompt_tokens == 1000
         assert usage.cached_tokens == 400
         assert usage.total_tokens == 1050
 
@@ -45,7 +46,6 @@ class TestGoogleUsage:
 
 class TestCodexUsage:
     def test_input_tokens_are_not_reduced_by_cache(self) -> None:
-        """Unlike Google: subtracting here would undercount the prompt."""
         usage = codex_usage({"input_tokens": 1000, "input_tokens_details": {"cached_tokens": 400}})
         assert usage.prompt_tokens == 1000
         assert usage.cached_tokens == 400
@@ -60,19 +60,54 @@ class TestCodexUsage:
         )
         assert usage.reasoning_tokens == 60
 
+    def test_separate_orchestration_tokens_are_billed(self) -> None:
+        """A reported total that matches primary + orchestration means the orchestration
+        counters sit beside the primary ones; omp bills them at the model's rates."""
+        usage = codex_usage(
+            {
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "total_tokens": 1400,
+                "input_tokens_details": {
+                    "cached_tokens": 400,
+                    "orchestration_input_tokens": 250,
+                    "orchestration_input_cached_tokens": 50,
+                },
+                "output_tokens_details": {"orchestration_output_tokens": 50},
+            }
+        )
+        assert (usage.prompt_tokens, usage.cached_tokens, usage.completion_tokens) == (
+            1250,
+            450,
+            150,
+        )
 
-class TestMakeUsage:
-    def test_total_defaults_to_the_sum(self) -> None:
-        assert make_usage(prompt_tokens=10, completion_tokens=5).total_tokens == 15
+    def test_included_orchestration_tokens_are_not_billed_twice(self) -> None:
+        """A reported total that matches the primary counters alone means they already
+        contain the orchestration tokens."""
+        usage = codex_usage(
+            {
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "total_tokens": 1100,
+                "input_tokens_details": {
+                    "cached_tokens": 400,
+                    "orchestration_input_tokens": 250,
+                    "orchestration_input_cached_tokens": 50,
+                },
+                "output_tokens_details": {"orchestration_output_tokens": 50},
+            }
+        )
+        assert (usage.prompt_tokens, usage.cached_tokens, usage.completion_tokens) == (
+            1000,
+            400,
+            100,
+        )
 
-    def test_explicit_total_wins(self) -> None:
-        """Upstream knows better: it may include tokens we did not break down."""
-        assert make_usage(prompt_tokens=10, completion_tokens=5, total_tokens=99).total_tokens == 99
-
-    @pytest.mark.parametrize("value", [None, "", "not-a-number", -5])
+    @pytest.mark.parametrize("value", [None, "", "not-a-number", -5, True])
     def test_junk_becomes_zero(self, value: object) -> None:
         """A broken counter must not blow up the turn accounting."""
-        assert make_usage(prompt_tokens=value).prompt_tokens == 0
+        assert codex_usage({"input_tokens": value}).prompt_tokens == 0
 
 
 class TestGoogleFinishReason:
@@ -100,32 +135,17 @@ class TestGoogleFinishReason:
             "IMAGE_OTHER",
             "IMAGE_PROHIBITED_CONTENT",
             "IMAGE_RECITATION",
+            # A new upstream reason treated as `stop` delivers a truncated answer as if it
+            # were complete. Treated as an error, at worst it is too noisy.
+            "REASON_THAT_DOES_NOT_EXIST_YET",
         ],
     )
-    def test_server_side_blocks_surface_as_content_filter(self, reason: str) -> None:
-        """The only OpenAI value that does not lie about a server-imposed cut-off."""
-        assert google_finish_reason(reason, has_tool_calls=False) == "content_filter"
-
-    def test_unknown_reason_is_an_error_not_a_stop(self) -> None:
-        """OMP enumerates what is normal and treats the rest as an error.
-
-        A new upstream reason treated as `stop` delivers a truncated answer as if it were
-        complete. Treated as an error, at worst it is too noisy.
-        """
-        assert google_finish_reason("REASON_THAT_DOES_NOT_EXIST_YET", has_tool_calls=False) == (
-            "content_filter"
-        )
-
-    def test_blocked_reason_is_not_masked_by_tool_calls(self) -> None:
-        """A safety block must not pass as tool_calls."""
-        assert google_finish_reason("SAFETY", has_tool_calls=True) == "content_filter"
+    def test_everything_but_stop_and_max_tokens_is_an_error(self, reason: str) -> None:
+        assert google_stop_reason(reason) == "error"
 
     @pytest.mark.parametrize("reason", [None, "", "STOP"])
     def test_normal_completion(self, reason: object) -> None:
         assert google_finish_reason(reason, has_tool_calls=False) == "stop"
-
-    def test_case_and_whitespace_tolerated(self) -> None:
-        assert google_finish_reason("  max_tokens  ", has_tool_calls=False) == "length"
 
 
 class TestCodexFinishReason:

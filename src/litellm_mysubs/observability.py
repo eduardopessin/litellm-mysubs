@@ -404,17 +404,25 @@ async def _logged_messages(
 
 
 def _messages_response(model: str, final: dict[str, Any], kwargs: dict[str, Any]) -> Any:
-    """The turn as a priceable object: usage under the wire name, nothing invented."""
+    """The turn as a priceable object: usage under the wire name, nothing invented.
+
+    The Messages counts are omp's `encodeUsage`, with the cache reads beside
+    ``input_tokens``; LiteLLM prices from the chat convention, where ``prompt_tokens``
+    includes them and ``cached_tokens`` says how many — the same shape
+    `turns._litellm_usage` gives the other routes' rows.
+    """
     usage = final.get("usage") or {}
-    return litellm.ModelResponse(
-        model=_cost_identity(model, kwargs)[0],
-        usage=litellm.Usage(
-            prompt_tokens=int(usage.get("input_tokens") or 0),
-            completion_tokens=int(usage.get("output_tokens") or 0),
-            total_tokens=int(usage.get("input_tokens") or 0)
-            + int(usage.get("output_tokens") or 0),
-        ),
+    cache_read = int(usage.get("cache_read_input_tokens") or 0)
+    prompt = int(usage.get("input_tokens") or 0) + cache_read
+    completion = int(usage.get("output_tokens") or 0)
+    priced = litellm.Usage(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=prompt + completion,
+        prompt_tokens_details={"cached_tokens": cache_read},
     )
+    priced.cache_read_input_tokens = cache_read
+    return litellm.ModelResponse(model=_cost_identity(model, kwargs)[0], usage=priced)
 
 
 
