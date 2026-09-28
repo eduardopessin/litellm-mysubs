@@ -43,6 +43,8 @@ ANTHROPIC_USAGE_URL: Final = "https://api.anthropic.com/api/oauth/usage"
 #: Without the `/codex/` segment: measured, `/backend-api/codex/wham/usage` returns 403.
 CODEX_USAGE_URL: Final = "https://chatgpt.com/backend-api/wham/usage"
 
+# omp: providers/anthropic.ts :: oauthAuthBeta
+# omp= oauthAuthBeta = "oauth-2025-04-20"
 #: The `oauth-2025-04-20` beta is what classifies the request as coming from an OAuth
 #: credential — without it the server treats it as an API key, which this token is not.
 #:

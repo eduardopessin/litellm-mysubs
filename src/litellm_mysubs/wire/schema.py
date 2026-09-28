@@ -218,6 +218,8 @@ SUBSCHEMA_MAP_KEYS: Final[frozenset[str]] = frozenset(
 # Draft-07 -> draft 2020-12 (utils/schema/draft.ts)
 # ---------------------------------------------------------------------------
 
+# omp: utils/schema/draft.ts :: JSON_SCHEMA_DRAFT_2020_12_URI
+# omp= JSON_SCHEMA_DRAFT_2020_12_URI = "https://json-schema.org/draft/2020-12/schema"
 JSON_SCHEMA_DRAFT_2020_12_URI: Final = "https://json-schema.org/draft/2020-12/schema"
 
 #: Both the canonical form with ``#`` and the one without — Zod emits one, MCP servers the other.
@@ -1292,6 +1294,7 @@ def normalize_for_cca(schema: object) -> dict[str, Any]:
 # Meta-validator (utils/schema/meta-validator.ts)
 # ---------------------------------------------------------------------------
 
+# omp: utils/schema/meta-validator.ts :: TYPE_NAMES
 _TYPE_NAMES: Final[frozenset[str]] = frozenset(
     {
         "string",
@@ -1305,6 +1308,7 @@ _TYPE_NAMES: Final[frozenset[str]] = frozenset(
 )
 
 
+# omp: utils/schema/meta-validator.ts :: isNonNegativeInteger
 def _is_non_negative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 

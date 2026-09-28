@@ -83,8 +83,9 @@ ANTHROPIC_MODELS_URL: Final = "https://api.anthropic.com/v1/models"
 #: curated alias ``claude-opus-4-5`` resolves to.
 ANTHROPIC_DATED_BUILD: Final = re.compile(r"^(?P<alias>.+)-\d{8}$")
 
-#: Value of ``anthropic-version``. Fixed in OMP's `providers/anthropic.ts` (it carries no
-#: anchor because the anchor checker only accepts identifier symbols).
+# omp: providers/anthropic.ts :: sharedHeaders
+#: Value of ``anthropic-version``, the one OMP's `sharedHeaders` sends. It sits under a
+#: quoted key there, which no name anchor can pin; the anchor's body hash covers it.
 ANTHROPIC_API_VERSION: Final = "2023-06-01"
 
 #: Responses API served by the ChatGPT subscription. Same reason for the duplication as
@@ -175,6 +176,7 @@ CURATED_CODEX: Final[tuple[str, ...]] = (
     "gpt-daybreak-blue-latest",
 )
 
+# omp: discovery/codex.ts :: DEFAULT_MODEL_LIST_PATHS
 #: Codex catalog endpoint. `client_version` is a **query parameter**, not the `version`
 #: header the inference path sends: without it the endpoint answers 400 `Field required`.
 #: Measured on 2026-09-25 (see `wire/codex.py :: CLIENT_VERSION`) — it returns exactly what

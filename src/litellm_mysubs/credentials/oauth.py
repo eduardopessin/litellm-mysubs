@@ -97,7 +97,10 @@ ANTIGRAVITY_USER_AGENT: Final = (
 # omp: registry/oauth/google-antigravity.ts :: ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA
 _ANTIGRAVITY_METADATA: Final[dict[str, str]] = {"ideType": "ANTIGRAVITY"}
 
+# omp: registry/oauth/google-antigravity.ts :: CLOUD_CODE_ASSIST_ENDPOINT
+# omp= CLOUD_CODE_ASSIST_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com"
 # omp: registry/oauth/google-antigravity.ts :: LOAD_CODE_ASSIST_URL, ONBOARD_USER_URL
+# omp: registry/oauth/google-antigravity.ts :: OPERATIONS_URL
 _CLOUD_CODE_ENDPOINT: Final = "https://daily-cloudcode-pa.googleapis.com"
 _LOAD_CODE_ASSIST_URL: Final = f"{_CLOUD_CODE_ENDPOINT}/v1internal:loadCodeAssist"
 _ONBOARD_USER_URL: Final = f"{_CLOUD_CODE_ENDPOINT}/v1internal:onboardUser"

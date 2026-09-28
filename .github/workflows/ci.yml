@@ -82,6 +82,10 @@ jobs:
   # at nothing, and the `# omp=` ones catch the worse case: the name stays and the **value**
   # changes - an endpoint path, a client id, a pinned client version. Nothing breaks at
   # import time then; it breaks in production, against upstream, with CI green.
+  # Names and values still left the logic unwatched: `applyHeadCaching` and
+  # `fetchClaudeUsage` were rewritten between 18.3.2 and 18.4.1 under the same names. Each
+  # anchored declaration is hashed and compared with the committed `tools/omp_anchors.lock`;
+  # a changed body, an unextractable one, or a lock written for another version fails here.
   omp-anchors:
     runs-on: ubuntu-latest
     steps:
@@ -89,7 +93,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python tools/check_omp_drift.py
+      - name: anchors, values and bodies against tools/omp_anchors.lock
+        run: python tools/check_omp_drift.py --lock tools/omp_anchors.lock
 
   build:
     # A hand-built artifact hides a dead pipeline. What gets published is what CI built.

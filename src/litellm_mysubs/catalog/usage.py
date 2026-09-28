@@ -106,6 +106,7 @@ def _window_label(minutes: float | None, fallback: str) -> str:
     return f"{int(minutes // 1440)}d"
 
 
+# omp: usage/openai-codex.ts :: parseCodexRateLimitHeaders
 def from_codex_headers(headers: Mapping[str, Any], *, now: float | None = None) -> UsageSnapshot:
     """ChatGPT Plus usage from the `x-codex-*` headers.
 
@@ -135,6 +136,8 @@ def from_codex_headers(headers: Mapping[str, Any], *, now: float | None = None) 
     )
 
 
+# omp: usage/claude.ts :: parseClaudeRateLimitHeaders
+# omp: usage/claude.ts :: parseUnifiedWindow
 def from_anthropic_headers(
     headers: Mapping[str, Any], *, now: float | None = None
 ) -> UsageSnapshot:
@@ -339,6 +342,7 @@ def _anthropic_label(key: str) -> str | None:
     return None
 
 
+# omp: usage/claude.ts :: parseClaudeUsagePayload
 #: How the Quota Dashboard labels the unscoped `kind` values of the `limits` array.
 #: `weekly_scoped` is left out because it depends on the model name; a `kind` outside what
 #: was measured gets no label.
@@ -348,6 +352,8 @@ _ANTHROPIC_LIMIT_LABELS: Final[dict[str, str]] = {
 }
 
 
+# omp: usage/claude.ts :: parseApiLimitEntries
+# omp: usage/claude.ts :: getApiLimitDisplayName
 def _anthropic_limit_window(entry: Mapping[str, Any]) -> Window | None:
     """One `limits` entry as a window, or `None` when it is not usable.
 
@@ -380,7 +386,8 @@ def _anthropic_limit_window(entry: Mapping[str, Any]) -> Window | None:
     )
 
 
-# omp: usage/claude.ts :: parseBucket, parseUnifiedWindow
+# omp: usage/claude.ts :: parseBucket
+# omp: usage/claude.ts :: parseClaudeUsagePayload
 def from_anthropic_usage(payload: Mapping[str, Any], *, now: float | None = None) -> UsageSnapshot:
     """Claude Max usage from `GET /api/oauth/usage`.
 
@@ -474,6 +481,7 @@ def from_codex_usage(payload: Mapping[str, Any], *, now: float | None = None) ->
     )
 
 
+# omp: usage/google-antigravity.ts :: formatCounterName
 #: Labels of the Antigravity catalog families. Measured on `:fetchAvailableModels`: every
 #: model carries `modelProvider` as one of these three enums, and that is how the account
 #: groups the limits — `apiProvider` is finer-grained (`API_PROVIDER_GOOGLE_GEMINI`) and

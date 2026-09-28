@@ -37,7 +37,7 @@ FILE_URI_PREFIXES: Final[tuple[str, ...]] = (
     "https://generativelanguage.googleapis.com/",
 )
 
-# omp: stream.ts :: mapEffortToGoogleThinkingLevel
+# omp: model-thinking.ts :: mapEffortToGoogleThinkingLevel
 # Effort -> Gemini 3 thinkingLevel (the 2.x dialect uses thinkingBudget).
 THINKING_LEVEL: Final[dict[str, str]] = {
     "minimal": "MINIMAL",
@@ -59,6 +59,7 @@ SUPPRESSED_THINKING_LEVEL: Final = "MINIMAL"
 #: a signature; later calls in the same turn go bare.
 SIGNATURE_SENTINEL: Final = "skip_thought_signature_validator"
 
+# omp: providers/google-shared.ts :: convertMessages
 #: Text of a tool result that carries nothing but an image.
 IMAGE_ONLY_RESULT: Final = "(see attached image)"
 
@@ -406,6 +407,8 @@ def tools_to_declarations(
     return ([{"functionDeclarations": declarations}] if declarations else None), declarations
 
 
+# omp: providers/google-shared.ts :: mapToolChoice
+# omp: providers/google-gemini-cli.ts :: buildRequest
 def tool_config(choice: object, declarations: list[dict[str, Any]]) -> dict[str, Any]:
     """``VALIDATED`` by default: the backend validates the call against the schema before
     emitting it."""
@@ -478,6 +481,7 @@ def tool_result_value(
 # -- envelope ------------------------------------------------------------------
 
 
+# omp: providers/google-gemini-cli.ts :: buildRequest
 def _thinking_config(
     effort: str, info: Mapping[str, Any], max_output_tokens: int | None = None
 ) -> dict[str, Any]:
