@@ -8,8 +8,8 @@ requests going to the wrong upstream.
 Every assertion here answers "what breaks if this changes".
 
 ``pytest.importorskip`` keeps the file usable in the development environment, where
-LiteLLM is not a mandatory dependency. In CI, the ``litellm-contract`` job installs it
-explicitly, so the skip does not happen there.
+LiteLLM is not a mandatory dependency. In CI, every ``test`` job installs it explicitly
+(1.101.0 and the current release), so the skip does not happen there.
 """
 
 from __future__ import annotations

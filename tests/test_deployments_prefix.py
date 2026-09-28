@@ -245,6 +245,25 @@ class TestPrefixActuallyPrices:
         )
         return float(completion_cost(completion_response=response, model=wire))
 
+    def tariff(self, wire: str) -> float:
+        """`cost`, with "no tariff" read as 0.0 in both shapes LiteLLM gives it.
+
+        Which shape depends on the cost map loaded at import, not on this package.
+        Measured on 1.101.0 for `gemini/mysubs/antigravity/gemini-2.5-pro`: the bundled
+        map (`LITELLM_LOCAL_MODEL_COST_MAP=True`, or no network) has no entry or rule for
+        it and raises "isn't mapped yet"; the map LiteLLM fetches from GitHub by default
+        carries a `fallback_generalizations` rule (`gemini-chat-baseline`) whose regex
+        matches `gemini-2.5-pro` as a substring and resolves the name to capabilities
+        with no price, so the cost comes back 0.0. `/spend/logs` records zero either way.
+        Any other error is not "no tariff" and propagates.
+        """
+        try:
+            return self.cost(wire)
+        except Exception as e:
+            if "isn't mapped yet" not in str(e):
+                raise
+            return 0.0
+
     def test_google_family_prefix_has_a_price_and_the_provider_one_has_none(self) -> None:
         model = discovered("gemini-2.5-pro", "google")
         assert self.cost(wire_of(model, "google-antigravity")) > 0
@@ -265,6 +284,10 @@ class TestPrefixActuallyPrices:
         `completion_cost` reads. Measured: the same name with the public prefix in front
         has no tariff at all."""
         out = to_deployment(discovered("gemini-2.5-pro", "google"), "google-antigravity")
-        assert str(out["model_name"]).startswith("mysubs/antigravity/")
-        assert self.cost(str(out["litellm_params"]["model"])) > 0
-        assert self.cost("gemini/mysubs/antigravity/gemini-2.5-pro") == 0.0
+        public = str(out["model_name"])
+        wire = str(out["litellm_params"]["model"])
+        assert public.startswith(PUBLIC_PREFIX["google-antigravity"])
+        assert PUBLIC_PREFIX["google-antigravity"] not in wire
+        assert self.cost(wire) > 0
+        # The counterfactual: had the public name reached the wire, nothing was billed.
+        assert self.tariff(f"gemini/{public}") == 0.0

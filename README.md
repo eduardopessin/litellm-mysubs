@@ -327,9 +327,9 @@ pytest tests/test_litellm_contract.py
 ```
 
 That file asserts the internal symbols the patch depends on — `Router.acompletion`,
-`route_llm_request.route_request`, `custom_provider_map`. CI runs it against both the pinned
-`litellm[proxy]` 1.101.0 and the current release, which turns an incompatible upstream
-upgrade into a red build instead of a production outage.
+`route_llm_request.route_request`, `custom_provider_map`. CI runs the whole suite, this file
+included, against both the pinned `litellm[proxy]` 1.101.0 and the current release, which
+turns an incompatible upstream upgrade into a red build instead of a production outage.
 
 ## Where the wiring comes from
 
