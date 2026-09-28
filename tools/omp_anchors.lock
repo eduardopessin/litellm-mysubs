@@ -129,6 +129,7 @@
     "pi-ai/providers/openai-shared.ts::convertResponsesInputContent": "ab388a70a6b3e6361defee8d12f0ef0ee21c5645debddfff4b1b17d7aacbc1df",
     "pi-ai/providers/openai-shared.ts::convertResponsesInputImage": "6854cf1104fcbe4e36bf22dcd9b2fefb76f242400f0964f257e339efcb22f9f1",
     "pi-ai/providers/openai-shared.ts::encodeResponsesToolResultOutput": "e49151662bb5c8372afc58cbd13b90f2c28dfad03d8e3a418529b94482693cd6",
+    "pi-ai/providers/openai-shared.ts::getJuiceValue": "2f5a01c4439b1f121124bef1fa34f7c545ff227ca3733f55a031266fbff0047f",
     "pi-ai/providers/openai-shared.ts::getOpenAIPromptCacheKey": "e020a39c9e983e283a1749efec3e6b546316cc51f85fa819e62126f4c36441d0",
     "pi-ai/providers/openai-shared.ts::mapOpenAIResponsesStopReason": "45e8dcd5cd9b774583cb238f9593eef042b4dbc5e15e4bf778f7afe4bacdb40c",
     "pi-ai/providers/openai-shared.ts::normalizeOpenAIPromptCacheKey": "08e85adf302460b7803767edb33411a868d147ddf7ffefb79647d09facf6a58a",

@@ -471,15 +471,30 @@ MODELS = ["gpt-5.5", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
 
 
 class TestReasoning:
-    @pytest.mark.parametrize("model", MODELS)
-    async def test_none_turns_reasoning_off_without_juice(self, model: str) -> None:
+    @pytest.mark.parametrize("model", ["gpt-5.5", "gpt-5.4-mini"])
+    async def test_none_turns_reasoning_off_below_5_6(self, model: str) -> None:
         """openai-chat-server.ts:203-204 maps `none` to `forceReasoningOff`, which the Codex
-        transformer sends as `{effort: "none"}` (request-transformer.ts:489-491). The juice
-        item exists only on the plain Responses path (openai-responses.ts:1368-1376; the
-        compat axis is wired to `openai-responses` alone, pi-catalog compat/axes.ts:139)."""
+        transformer sends as `{effort: "none"}` (request-transformer.ts:489-491)."""
         spec = await spec_for(USER, model=model, reasoning_effort="none")
         assert spec.body["reasoning"] == {"effort": "none"}
         assert not any("Juice" in json.dumps(item) for item in spec.body["input"])
+
+    @pytest.mark.parametrize(
+        "model",
+        ["gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-daybreak-blue-latest"],
+    )
+    async def test_none_turns_reasoning_off_with_juice_from_5_6(self, model: str) -> None:
+        """The live backend answers 400 "'none' is not supported with the 'gpt-6-astra'
+        model", and omp's Codex path has no effort fallback. From the 5.6 generation
+        (pi-catalog requires-reasoning-off-juice-instruction) `none` sends no `reasoning`
+        and ends the input with Juice 0, which measured 0 reasoning tokens live."""
+        spec = await spec_for(USER, model=model, reasoning_effort="none")
+        assert "reasoning" not in spec.body
+        assert spec.body["input"][-1] == {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "# Juice: 0 !important"}],
+        }
 
     @pytest.mark.parametrize("model", MODELS)
     @pytest.mark.parametrize("effort", EFFORTS)

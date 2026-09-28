@@ -46,6 +46,10 @@ changed declaration, not only a renamed one.
   subscription went on generating the turn it had just refused.
 - **A request with no credential is refused up front** with `No API key for provider`,
   instead of going out with an empty bearer and failing inside the HTTP client.
+- **`reasoning_effort: "none"` really turns reasoning off on Codex below GPT-5.6.** It sent
+  no `reasoning` at all, so gpt-5.5 still reasoned (34 reasoning tokens measured live); it
+  now sends `{"effort": "none"}` (0). From 5.6 on it keeps the `# Juice: 0` item: omp's
+  Codex path sends `{"effort": "none"}` there too, which gpt-6-astra refuses with 400.
 
 ### Changed
 
@@ -58,8 +62,7 @@ changed declaration, not only a renamed one.
     `x-codex-turn-metadata` carry the same identity.
   - Residency is sent for `no_constraint`, falling back to the compute claim.
   - No effort sent means no `reasoning` object (it used to default to medium with an
-    `auto` summary); `none` sends `{"effort": "none"}`. The "Juice" developer item is gone:
-    omp only sends it on the plain Responses path, not on Codex.
+    `auto` summary), and the backend applies the model's default.
   - Input items take omp's shapes (system joined into `instructions`, compact tool-call
     arguments, tool-result images moved to a user item, malformed tool calls dropped), and
     `tool_choice` is sent only for a function that is offered.

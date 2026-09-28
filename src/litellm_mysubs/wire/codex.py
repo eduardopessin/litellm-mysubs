@@ -1124,16 +1124,43 @@ def normalize_effort(value: object) -> tuple[str | None, str | None]:
     )
 
 
+#: omp: the `# Juice: N` developer item is what turns reasoning off from this wire
+#: generation on; the rolling Daybreak aliases ride it too.
+JUICE_OFF_MIN_GENERATION: Final = 5.6
+
+
+# omp: pi-catalog compat/rules/classes/openai.kdl — revision ">=5.6" sets
+# requires-reasoning-off-juice-instruction; providers/openai-codex.kdl — "Rolling Daybreak
+# aliases ride the 5.6 wire generation."
+def requires_juice_to_turn_reasoning_off(model: str) -> bool:
+    """Whether ``none`` is sent as the Juice item instead of ``{"effort": "none"}``."""
+    name = resolve_model(model).lower()
+    if "daybreak" in name:
+        return True
+    match = re.match(r"gpt-(\d+(?:\.\d+)?)", name)
+    return match is not None and float(match.group(1)) >= JUICE_OFF_MIN_GENERATION
+
+
+# omp: providers/openai-shared.ts :: getJuiceValue
+def juice_off_item() -> dict[str, Any]:
+    """Developer item that pins the reasoning budget to zero (``JUICE_EFFORT_MAP.none``)."""
+    return {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": "# Juice: 0 !important"}],
+    }
+
+
 # omp: providers/openai-chat-server.ts :: parseRequest
 # omp: providers/openai-codex/request-transformer.ts :: getReasoningConfig
 def reasoning_config(value: object) -> dict[str, str] | None:
     """The body's ``reasoning``, or ``None`` to leave it out.
 
     ``none`` turns reasoning off with ``{"effort": "none"}`` — omp's ``reasoningOff``, with
-    no summary. A known effort carries the summary (``auto`` unless the client picked one):
-    without ``reasoning.summary`` the backend streams no reasoning text at all. No effort,
-    or one outside the vocabulary, sends no ``reasoning`` and the backend applies the
-    model's default.
+    no summary (see `build_request_body` for the 5.6+ exception). A known effort carries the
+    summary (``auto`` unless the client picked one): without ``reasoning.summary`` the
+    backend streams no reasoning text at all. No effort, or one outside the vocabulary,
+    sends no ``reasoning`` and the backend applies the model's default.
     """
     effort, summary = normalize_effort(value)
     if effort == "none":
@@ -1191,7 +1218,16 @@ def build_request_body(
     if instructions is not None:
         body["instructions"] = instructions
     body["store"] = False
-    if reasoning := reasoning_config(extra.get("reasoning_effort")):
+    reasoning = reasoning_config(extra.get("reasoning_effort"))
+    if reasoning == {"effort": "none"} and requires_juice_to_turn_reasoning_off(model):
+        # Diverges from omp's Codex path, which sends `{"effort": "none"}` here and has no
+        # effort-fallback retry: the backend answers 400 "'none' is not supported" for
+        # gpt-6-astra. omp's Responses path adds the Juice item, with the value of the
+        # requested effort (medium, 8, when reasoning is forced off). Measured on the live
+        # backend: without `reasoning` and with Juice 0, gpt-6-astra, gpt-5.6-sol and
+        # gpt-5.5 spent 0 reasoning tokens; with Juice 8, 12-30.
+        body["input"] = [*items, juice_off_item()]
+    elif reasoning:
         body["reasoning"] = reasoning
     # Without this the backend does not return the encrypted reasoning, and on a stateless
     # history (`store: false`) the model starts reasoning over on every turn.
