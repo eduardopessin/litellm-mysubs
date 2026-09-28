@@ -1118,7 +1118,6 @@ def codex_responses_events(
     text: str = "hello",
     status: str = "completed",
     usage: dict[str, Any] | None = None,
-    carry_output: bool = False,
     chunks: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Events as the real endpoint sends them.
@@ -1126,9 +1125,6 @@ def codex_responses_events(
     `response.completed` closes the turn **without** repeating `output`: the items arrived
     in the `response.output_item.done` events during the stream. Measured against the live
     endpoint after a passthrough shipped `output: []` with non-zero `output_tokens`.
-
-    `carry_output=True` covers the opposite case — an upstream that does include it, which
-    must then be preserved rather than rebuilt.
     """
     response: dict[str, Any] = {
         "id": "resp_upstream_1",
@@ -1138,16 +1134,6 @@ def codex_responses_events(
         "model": "gpt-5.5",
         "usage": usage or {},
     }
-    if carry_output:
-        response["output"] = [
-            {
-                "type": "message",
-                "id": "msg_from_upstream",
-                "role": "assistant",
-                "status": "completed",
-                "content": [{"type": "output_text", "text": text, "annotations": []}],
-            }
-        ]
     return [
         *(
             {"type": "response.output_text.delta", "delta": part}
@@ -1196,19 +1182,6 @@ class TestTheResponsesRouteIsServed:
         # The public name wins over the wire name the upstream echoes: it is what the
         # caller asked for and what the spend log records.
         assert out.model == "mysubs/codex/gpt-5.5"
-        assert out.id == "resp_upstream_1"
-
-    @pytest.mark.asyncio
-    async def test_an_upstream_that_sends_output_keeps_it(self) -> None:
-        """Rebuilding is the fallback, not the rule: the upstream's own items win."""
-        install_transport(FakeTransport(codex_responses_events(text="served", carry_output=True)))
-
-        out = await plugin.dispatch_responses(
-            provider="openai-codex", model="mysubs/codex/gpt-5.5", input="hi"
-        )
-
-        assert out is not None
-        assert out.output[0].id == "msg_from_upstream"
 
     @pytest.mark.asyncio
     async def test_tool_calls_become_function_call_items(self) -> None:
@@ -1396,7 +1369,7 @@ class TestTheResponsesRouteIsServed:
 
         Antigravity is **not** in this list any more: delegating it left the turn priced
         by the native path, which costs from the response object — public name, no rate.
-        It is served here now, translated with LiteLLM's own bridge.
+        It is served here now, encoded by the same port of omp's Responses server as Codex.
         """
         install_transport(FakeTransport(codex_responses_events()))
 
@@ -1633,9 +1606,8 @@ class TestTheResponsesRouteIsLogged:
         gateway the provider stuck and the model name did not, and the row stayed at zero
         while the same model on chat and messages logged 0.0005265 for identical usage.
 
-        Serving it through `_logged` is what prices it, and the Responses shape comes
-        from LiteLLM's own `LiteLLMCompletionResponsesConfig` rather than hand-built
-        items.
+        Serving it through `_logged` is what prices it; the Responses shape is omp's
+        encoding (`wire/responses.py`), the same one Codex gets on this route.
         """
         install_transport(
             FakeTransport(
