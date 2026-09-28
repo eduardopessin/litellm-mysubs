@@ -239,6 +239,9 @@ class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
         self._failure_handled = False
         self._yielded_first_chunk = False
         self._generated_content = ""
+        # Added to the base in LiteLLM 1.103.0, which appends tool-call argument deltas to it
+        # and sums it with `_generated_content`; missing, that read raises mid-stream.
+        self._generated_tool_arguments = ""
         self._completed_response_cached = False
         self._completed_response_logged = False
         self._completed_response_cache_hit: bool | None = None
