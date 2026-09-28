@@ -72,14 +72,32 @@ class _ItemEncoder(Protocol):
     def tool_arguments(self, index: int, partial_json: str) -> list[dict[str, Any]]: ...
 
 
+async def _release(events: AsyncIterator[dict[str, Any]]) -> None:
+    """Closes the upstream stream the moment its reader stops consuming it.
+
+    A bare ``async for`` leaves the generator suspended when the reader raises — the
+    whitespace brake, the reasoning-loop guard, an in-band error — and with it the
+    transport's HTTP response. Measured through the proxy: the upstream was still open a
+    second later and after a ``gc.collect()``, so the subscription went on generating (and
+    billing) the turn the brake had just refused. omp aborts the upstream request when its
+    guard trips (``utils/thinking-loop.ts :: guardThinkingLoopStream``).
+    """
+    aclose = getattr(events, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
 async def _drive(events: AsyncIterator[dict[str, Any]], reader: _Reader) -> None:
     """Non-streaming path: consumes everything through the same reader, discarding chunks.
 
     A single interpretation routine, shared with the streaming path — having two is what
     made the original's synchronous and asynchronous versions diverge.
     """
-    async for event in events:
-        reader.feed(event)
+    try:
+        async for event in events:
+            reader.feed(event)
+    finally:
+        await _release(events)
     reader.close()
 
 
@@ -87,9 +105,12 @@ async def _pump(
     events: AsyncIterator[dict[str, Any]], reader: _Reader
 ) -> AsyncIterator[ModelResponseStream]:
     """Streaming path: emits each event's chunks as they arrive."""
-    async for event in events:
-        for chunk in reader.feed(event):
-            yield chunk
+    try:
+        async for event in events:
+            for chunk in reader.feed(event):
+                yield chunk
+    finally:
+        await _release(events)
     for chunk in reader.close():
         yield chunk
 
