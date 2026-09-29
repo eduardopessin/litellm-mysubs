@@ -69,6 +69,7 @@ THINKING_CEILING: Final = 8192
 #: truncated.
 OUTPUT_FALLBACK_BUFFER: Final = 4000
 
+# omp: providers/anthropic.ts :: UNKNOWN_MODEL_MAX_OUTPUT_TOKENS
 #: ``max_tokens`` for a model with no known output ceiling. The Messages API requires the
 #: field, so something has to go. It is omp's value for the same case since 18.4.1
 #: (`providers/anthropic.ts`, ``UNKNOWN_MODEL_MAX_OUTPUT_TOKENS``); 18.3.2 applied it to
@@ -165,6 +166,8 @@ SERVER_TOOL_PREFIX: Final = "srvtoolu_"
 # omp= contextManagementBeta = "context-management-2025-06-27"
 # omp: providers/anthropic.ts :: midConversationSystemBeta
 # omp= midConversationSystemBeta = "mid-conversation-system-2026-04-07"
+# omp: providers/anthropic.ts :: interleavedThinkingBeta
+# omp= interleavedThinkingBeta = "interleaved-thinking-2025-05-14"
 # Order and content from the source. Notes on what is **not** here:
 #  - `context-1m-2025-08-07`: OAuth credentials have no long-context balance, and Anthropic
 #    returns a hard 429 on any model with the beta, regardless of prompt size. OMP never
@@ -188,7 +191,8 @@ AGENT_BETAS: Final[tuple[str, ...]] = (
 
 # omp: providers/anthropic.ts :: effortBeta
 # omp= effortBeta = "effort-2025-11-24"
-#: Added only when the request asks for reasoning.
+#: Added when the request asks for reasoning, and on every request to an adaptive-only model:
+#: omp pins ``output_config.effort`` there when thinking is off (``sendsAdaptiveEffortPin``).
 EFFORT_BETA: Final = "effort-2025-11-24"
 # omp: providers/anthropic.ts :: fallbackCreditBeta
 # omp= fallbackCreditBeta = "fallback-credit-2026-06-01"
@@ -260,8 +264,15 @@ def is_anthropic_model(model: str) -> bool:
     return "claude" in lowered or "anthropic" in lowered
 
 
+# omp: providers/anthropic.ts :: usesBudgetThinking
+# omp: providers/anthropic.ts :: isAdaptiveOnlyThinking
 def is_adaptive(model: str) -> bool:
-    """Whether the model uses ``thinking: adaptive`` instead of ``budget_tokens``."""
+    """Whether the model uses ``thinking: adaptive`` instead of ``budget_tokens``.
+
+    The inverse of omp's `usesBudgetThinking`. These are also omp's adaptive-only models:
+    they reject ``thinking: {type: "disabled"}``, and omitting ``thinking`` leaves adaptive
+    thinking on.
+    """
     lowered = str(model).lower()
     return not any(marker in lowered for marker in BUDGET_ONLY_MODELS)
 
@@ -299,6 +310,52 @@ def supports_display(model: str) -> bool:
         minor = int(match.group(2) or 0)
         return major + minor / 10 >= floor
     return False
+
+
+def _revision(model: str, family: str) -> tuple[int, int] | None:
+    """``(major, minor)`` of `family` in the model id, or ``None`` when it is not that family.
+
+    The minor is one or two digits, so a dated build (`claude-opus-5-20260101`) is (5, 0),
+    not 5 plus a date.
+    """
+    lowered = str(model).lower()
+    match = re.search(rf"{family}[^0-9]*(\d+)(?:[.-](\d{{1,2}})(?!\d))?", lowered)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
+def _is_revision(model: str, family: str, low: tuple[int, int], high: tuple[int, int]) -> bool:
+    """Whether the model is `family` at a revision in ``[low, high)``."""
+    revision = _revision(model, family)
+    return revision is not None and low <= revision < high
+
+
+# omp: compat/resolve.ts :: resolveAnthropicPolicy
+# omp: compat/rules/classes/anthropic.kdl :: family
+def supports_forced_tool_choice(model: str) -> bool:
+    """Whether the model accepts a ``tool_choice`` that forces a tool (`any` / `tool`).
+
+    omp's catalog: never on Fable or Mythos; not on Opus 5.5 nor, since 18.4.4, Sonnet 5.5.
+    They answer 400 `tool_choice: type "tool" and "any" are not supported for this model`.
+    The 5.5 rules stop below 6 on purpose, so that a later generation is verified against
+    the API before it inherits the restriction.
+    """
+    lowered = str(model).lower()
+    if "fable" in lowered or "mythos" in lowered:
+        return False
+    return not any(_is_revision(lowered, family, (5, 5), (6, 0)) for family in ("opus", "sonnet"))
+
+
+# omp: compat/resolve.ts :: resolveAnthropicPolicy
+# omp: compat/rules/classes/anthropic.kdl :: family
+def supports_between_tools_thinking(model: str) -> bool:
+    """Whether the model takes ``thinking: {type: "between_tools"}`` — Sonnet 5.5 (omp 18.4.4).
+
+    It rejects ``disabled`` with 400; `between_tools` is its lowest thinking setting: no
+    up-front thinking, progress updates between tool calls only.
+    """
+    return _is_revision(model, "sonnet", (5, 5), (6, 0))
 
 
 def normalize_effort(value: object) -> tuple[str | None, str | None]:
@@ -860,40 +917,176 @@ def apply_conversation_cache(
 
 # omp: providers/anthropic.ts :: disableThinkingIfToolChoiceForced
 def _forced_tool_choice(choice: object) -> bool:
-    """Whether the tool choice forces the model to call one.
+    """Whether the tool choice forces the model to call a tool.
 
-    Only `any` and `tool` count: they are the two values on the Anthropic wire that force.
-    The OpenAI form ``{"type": "function", ...}`` is a tool *selection*, not an imposition,
-    and treating it as forced disabled reasoning with no wire-level reason.
+    Decided on what reaches the Anthropic wire, where only `any` and `tool` force. LiteLLM
+    maps `required` to `any` and a named function (``{"type": "function", "function":
+    {"name": ...}}``) to ``{"type": "tool", "name": ...}``, so both force. A bare
+    ``{"type": "function"}`` names nothing, and LiteLLM drops it.
     """
     if isinstance(choice, dict):
-        return choice.get("type") in ("any", "tool")
+        kind = choice.get("type")
+        if kind in ("any", "tool", "required"):
+            return True
+        function = choice.get("function")
+        return kind == "function" and isinstance(function, dict) and bool(function.get("name"))
     return isinstance(choice, str) and choice in ("required", "any")
+
+
+# omp: providers/anthropic.ts :: buildParams
+def _unforced_tool_choice(choice: object) -> object:
+    """``auto`` in the caller's shape, for a model that refuses forced tool use.
+
+    omp downgrades `any`/`tool` to `auto` "so the request succeeds; the tool stays
+    available and the caller's prompt steers the model toward it". An Anthropic-shaped
+    choice keeps its ``disable_parallel_tool_use``: that limits the calls, it forces none.
+    """
+    if isinstance(choice, dict) and choice.get("type") != "function":
+        auto: dict[str, Any] = {"type": "auto"}
+        if "disable_parallel_tool_use" in choice:
+            auto["disable_parallel_tool_use"] = choice["disable_parallel_tool_use"]
+        return auto
+    return "auto"
+
+
+# omp: providers/anthropic.ts :: anthropicOutputLimit
+def anthropic_output_limit(ceiling: int | None) -> int:
+    """The most output tokens a request may ask for: the model's declared ceiling, or
+    `UNKNOWN_MODEL_MAX_OUTPUT_TOKENS` when it declares none."""
+    return ceiling if ceiling is not None and ceiling > 0 else UNKNOWN_MODEL_MAX_OUTPUT_TOKENS
+
+
+# omp: providers/anthropic.ts :: budgetThinkingOutput
+def budget_thinking_output(
+    max_tokens: int | None, budget: int, max_allowed: int
+) -> tuple[int, int]:
+    """``(max_tokens, budget_tokens)`` of budget thinking.
+
+    ``max_tokens`` rises to leave `OUTPUT_FALLBACK_BUFFER` visible tokens after the budget,
+    within ``max_allowed``, and the budget shrinks when that ceiling leaves less.
+    """
+    current = min(max_allowed if max_tokens is None else max_tokens, max_allowed)
+    raised = min(max(current, budget + OUTPUT_FALLBACK_BUFFER), max_allowed)
+    return raised, min(budget, raised - OUTPUT_FALLBACK_BUFFER)
+
+
+def _client_effort(kwargs: dict[str, Any]) -> str | None:
+    """``output_config.effort`` as the caller sent it — Messages clients set it themselves."""
+    config = kwargs.get("output_config")
+    effort = config.get("effort") if isinstance(config, dict) else None
+    return effort if isinstance(effort, str) and effort else None
+
+
+def _set_effort(kwargs: dict[str, Any], effort: str) -> None:
+    """Set ``output_config.effort``, keeping whatever else the caller put in ``output_config``."""
+    config = kwargs.get("output_config")
+    kwargs["output_config"] = {**(config if isinstance(config, dict) else {}), "effort": effort}
+
+
+def _thinking_kind(kwargs: dict[str, Any]) -> object:
+    thinking = kwargs.get("thinking")
+    return thinking.get("type") if isinstance(thinking, dict) else None
+
+
+#: Efforts at which Sonnet 5.5 answers `between_tools` with 400 (omp 18.4.4).
+BETWEEN_TOOLS_REFUSED_EFFORTS: Final = ("xhigh", "max")
+
+#: Sent only when ``thinking`` is absent or disabled: omp's ``allowSamplingParams``.
+_SAMPLING_PARAMS: Final = ("temperature", "top_p", "top_k")
+
+
+# omp: providers/anthropic.ts :: buildParams
+# omp: providers/anthropic.ts :: isAdaptiveOnlyThinking
+def _thinking_off(kwargs: dict[str, Any], model: str, effort: str | None) -> None:
+    """omp's ``thinkingEnabled === false`` branch: the lowest thinking the model allows.
+
+    - **Sonnet 5.5**: ``thinking: {type: "between_tools"}`` — it answers ``disabled`` with
+      400. Effort is left alone: pinning `low` would cap the whole turn's quality, not only
+      thinking. At an ``effort`` of `xhigh`/`max`, where `between_tools` is a 400 too,
+      ``thinking`` stays out and the model runs its default adaptive thinking.
+    - **Other adaptive-only models**: omitting ``thinking`` leaves adaptive thinking on, so
+      the lowest effort is pinned — unless the caller set one, which is kept.
+    - **Budget models**: ``thinking: {type: "disabled"}``.
+
+    A ``thinking`` already in the request (the caller's own `between_tools`) is kept.
+    """
+    if kwargs.get("thinking"):
+        return
+    if supports_between_tools_thinking(model):
+        if effort not in BETWEEN_TOOLS_REFUSED_EFFORTS:
+            kwargs["thinking"] = {"type": "between_tools"}
+    elif not is_adaptive(model):
+        kwargs["thinking"] = {"type": "disabled"}
+    elif effort is None:
+        _set_effort(kwargs, "low")
+
+
+def _thinking_budget(thinking: object, reasoning: str | None) -> int:
+    """The budget the request asks for, from its ``thinking`` or its effort, at most
+    `THINKING_CEILING`."""
+    if isinstance(thinking, dict):
+        return min(thinking.get("budget_tokens") or EFFORT_BUDGET["medium"], THINKING_CEILING)
+    return min(EFFORT_BUDGET.get(reasoning or "", EFFORT_BUDGET["medium"]), THINKING_CEILING)
 
 
 # omp: providers/anthropic.ts :: ensureMaxTokensForThinking
 # omp: providers/anthropic.ts :: allowSamplingParams
 # omp: providers/anthropic.ts :: disableThinkingIfToolChoiceForced
+# omp: providers/anthropic.ts :: buildParams
+# omp: stream.ts :: mapOptionsForApi
 def apply_thinking_params(
     kwargs: dict[str, Any], model: str, *, ceiling: int | None = None
 ) -> dict[str, Any]:
-    """Normalize thinking, temperature, top_p and token ceilings. Mutates ``kwargs``.
+    """Normalize thinking, effort, sampling, tool choice and token ceilings. Mutates ``kwargs``.
 
     Kept apart from ``build_request`` because it is pure: it touches neither credentials
     nor messages. ``ceiling`` is the model's declared output ceiling — see
     `fit_output_ceiling`.
+
+    A request that asks for no reasoning is omp's thinking-off request (`_thinking_off`):
+    omp's own servers leave ``reasoning`` unset when the client sends none, and its
+    `mapOptionsForApi` turns that into ``thinkingEnabled: false``. What the caller did ask
+    for — ``reasoning_effort``, a ``thinking`` object, its own ``output_config.effort`` —
+    is not replaced by that branch.
     """
     reasoning, _summary = normalize_effort(kwargs.get("reasoning_effort"))
     thinking = kwargs.get("thinking")
-    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+    kind = thinking.get("type") if isinstance(thinking, dict) else None
+    turned_off = kind == "disabled" or reasoning == "none"
+    if kind == "disabled":
         kwargs.pop("thinking", None)
-        thinking = None
     if reasoning == "none":
         kwargs.pop("reasoning_effort", None)
         kwargs.pop("thinking", None)
-        reasoning = thinking = None
+        reasoning = None
+    if turned_off or kind == "between_tools":
+        # A caller's `between_tools` is Sonnet 5.5's lowest setting, not a request to reason.
+        thinking = None
+    effort = _client_effort(kwargs)
+
+    # Before the forced-tool check below, as in omp: a model that refuses forced tool use
+    # gets `auto` instead of a 400, and then nothing is forced any more.
+    choice = kwargs.get("tool_choice")
+    if _forced_tool_choice(choice) and not supports_forced_tool_choice(model):
+        kwargs["tool_choice"] = _unforced_tool_choice(choice)
 
     thinking_active = bool(thinking or reasoning in EFFORT_BUDGET)
+    budget = 0
+    if thinking_active:
+        budget = _thinking_budget(thinking, reasoning)
+        if not is_adaptive(model):
+            # omp 18.4.4 (`mapOptionsForApi`): the budget shrinks to leave the output buffer
+            # under the model's ceiling, and below Anthropic's minimum (1024 — measured:
+            # "budget_tokens: Input should be greater than or equal to 1024") the request
+            # goes out with thinking off instead of failing.
+            _, fitted = budget_thinking_output(None, budget, anthropic_output_limit(ceiling))
+            if fitted < budget and fitted < EFFORT_BUDGET["minimal"]:
+                kwargs.pop("thinking", None)
+                kwargs.pop("reasoning_effort", None)
+                thinking = None
+                thinking_active = False
+            else:
+                budget = fitted
 
     # Measured: with thinking active Anthropic returns 400 for temperature != 1 ("may only
     # be set to 1 when thinking is enabled") and for top_p < 0.95 ("`top_p` must be greater
@@ -904,8 +1097,8 @@ def apply_thinking_params(
             kwargs["temperature"] = 1.0
         else:
             kwargs.pop("reasoning_effort", None)
-            kwargs.pop("thinking", None)
-            thinking_active = False
+            if kind != "between_tools":
+                kwargs.pop("thinking", None)
     if thinking_active:
         top_p = kwargs.get("top_p")
         if top_p is not None and float(top_p) < 0.95:
@@ -928,6 +1121,16 @@ def apply_thinking_params(
             thinking_active = False
 
     if not thinking_active:
+        # A caller that set its own effort and did not turn reasoning off asked for
+        # reasoning at that effort: omp's Messages server reads it as `reasoning`.
+        if turned_off or effort is None:
+            _thinking_off(kwargs, model, effort)
+        if forced:
+            # omp deletes `thinking` of any type beside a forced tool.
+            kwargs.pop("thinking", None)
+        if _thinking_kind(kwargs) == "between_tools":
+            for key in _SAMPLING_PARAMS:
+                kwargs.pop(key, None)
         fit_output_ceiling(kwargs, budget=None, ceiling=ceiling)
         return kwargs
 
@@ -939,11 +1142,9 @@ def apply_thinking_params(
     show = str(display or "summarized")
 
     if isinstance(thinking, dict):
-        budget = min(thinking.get("budget_tokens") or EFFORT_BUDGET["medium"], THINKING_CEILING)
         if thinking.get("type") != "adaptive":
             thinking["budget_tokens"] = budget
     else:
-        budget = min(EFFORT_BUDGET.get(reasoning or "", EFFORT_BUDGET["medium"]), THINKING_CEILING)
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
     kwargs.pop("reasoning_effort", None)
 
@@ -954,8 +1155,10 @@ def apply_thinking_params(
         if supports_display(model):
             adaptive["display"] = show
         kwargs["thinking"] = adaptive
-        effort = "low" if forced_adaptive else ADAPTIVE_EFFORT.get(reasoning or "", "medium")
-        kwargs["output_config"] = {"effort": effort}
+        if forced_adaptive:
+            _set_effort(kwargs, "low")
+        else:
+            _set_effort(kwargs, effort or ADAPTIVE_EFFORT.get(reasoning or "", "medium"))
     elif isinstance(kwargs.get("thinking"), dict) and supports_display(model):
         kwargs["thinking"]["display"] = show
 
@@ -979,19 +1182,24 @@ def fit_output_ceiling(
       from its price map, which is not this model's statement; the thinking path used to
       fill the gap with budget + margin, a limit below the model's that nobody set.
     - **Asked for more than the ceiling.** Lowered to it — the upstream refuses the rest.
-    - **Thinking.** Raised until there is room beyond the budget, never past the ceiling;
-      what the caller asked for is otherwise never lowered.
+    - **Thinking.** Raised until there is room beyond the budget, never past the ceiling
+      (`budget_thinking_output`); what the caller asked for is otherwise never lowered. The
+      budget itself already fits: `apply_thinking_params` shrinks it first.
 
-    Only the key the client sent is read — filling both made the rename below override the
-    client's value with the default.
+    Only the value the client sent is read — filling both made the rename below override
+    the client's value with the default. A key that is present but ``None`` sent nothing:
+    LiteLLM's inner hop passes ``max_completion_tokens=None`` beside the client's
+    ``max_tokens``, and reading that key raised a chat request's 100 to the ceiling.
     """
-    limit = ceiling if ceiling is not None and ceiling > 0 else UNKNOWN_MODEL_MAX_OUTPUT_TOKENS
-    token_key = "max_completion_tokens" if "max_completion_tokens" in kwargs else "max_tokens"
-    value = kwargs.pop(token_key, None)
-    current = limit if value is None else min(int(value), limit)
-    if budget is not None:
-        current = min(max(current, budget + OUTPUT_FALLBACK_BUFFER), limit)
-    kwargs["max_tokens"] = current
+    limit = anthropic_output_limit(ceiling)
+    completion = kwargs.pop("max_completion_tokens", None)
+    plain = kwargs.pop("max_tokens", None)
+    value = completion if completion is not None else plain
+    requested = None if value is None else int(value)
+    if budget is None:
+        kwargs["max_tokens"] = limit if requested is None else min(requested, limit)
+    else:
+        kwargs["max_tokens"], _ = budget_thinking_output(requested, budget, limit)
 
 
 #: `developer` is hoisted too: LiteLLM rewrites it to `system` before the Anthropic
@@ -1062,12 +1270,18 @@ def _is_identity(block: object) -> bool:
     return isinstance(block, dict) and block.get("text") == CLAUDE_CODE_PROMPT
 
 
-def _wants_thinking(kwargs: dict[str, Any]) -> bool:
-    """Whether the request asks for reasoning, before any normalization.
+# omp: providers/anthropic.ts :: buildParams
+def _wants_effort_beta(kwargs: dict[str, Any], model: str) -> bool:
+    """Whether ``effort-2025-11-24`` travels, read before any normalization.
 
-    The effort beta only travels when there is reasoning — sending it always is fingerprint
-    noise against what the real Claude Code emits.
+    As in omp: with every request that asks for reasoning, with an ``output_config.effort``
+    the caller set, and on every request to an adaptive-only model, where a request that
+    does not reason carries the pinned effort (``sendsAdaptiveEffortPin``). A budget model
+    that is not asked to reason gets none — sending it always is fingerprint noise against
+    what the real Claude Code emits.
     """
+    if is_adaptive(model) or _client_effort(kwargs) is not None:
+        return True
     effort, _ = normalize_effort(kwargs.get("reasoning_effort"))
     if effort == "none":
         return False
@@ -1075,6 +1289,23 @@ def _wants_thinking(kwargs: dict[str, Any]) -> bool:
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
         return False
     return bool(thinking or effort in EFFORT_BUDGET)
+
+
+def _allow_param(kwargs: dict[str, Any], name: str) -> None:
+    """Let ``name`` past LiteLLM's supported-parameter check on the chat route.
+
+    LiteLLM offers ``thinking`` only to models its price map says reason, and the Router
+    registers each deployment's ``model_info`` under the wire name — which, on 1.101.0,
+    shadows LiteLLM's fallback for a Claude model missing from the map (measured:
+    `claude-sonnet-5-5` resolves as reasoning before a Router exists and as not reasoning
+    after). The ``thinking`` this module sets then fails the request with
+    ``UnsupportedParamsError``, or vanishes under ``drop_params``. ``allowed_openai_params``
+    is LiteLLM's own opt-in for exactly that.
+    """
+    allowed = kwargs.get("allowed_openai_params")
+    names = list(allowed) if isinstance(allowed, list) else []
+    if name not in names:
+        kwargs["allowed_openai_params"] = [*names, name]
 
 
 def build_request(
@@ -1112,12 +1343,14 @@ def build_request(
     headers = kwargs.setdefault("extra_headers", {})
     if isinstance(headers, dict):
         headers.update(CLIENT_HEADERS)
-        # The effort beta only travels when the request asks for reasoning, as in OMP; the
+        # The effort beta travels with the effort field (see `_wants_effort_beta`); the
         # extended-TTL one follows the retention that this request's anchors actually
         # carry.
-        headers["anthropic-beta"] = build_betas(thinking=_wants_thinking(kwargs))
+        headers["anthropic-beta"] = build_betas(thinking=_wants_effort_beta(kwargs, model))
 
     apply_thinking_params(kwargs, model, ceiling=output_ceiling)
+    if not native_system and kwargs.get("thinking"):
+        _allow_param(kwargs, "thinking")
 
     # Before the `messages` guard: a request whose turns are carried elsewhere still
     # declares tools, and the fingerprint is read off the tool names alone. The map rides

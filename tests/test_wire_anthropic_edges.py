@@ -178,18 +178,24 @@ class TestToolChoiceShapes:
     def test_free_shapes(self, choice: object) -> None:
         assert ant._forced_tool_choice(choice) is False
 
-    def test_openai_function_selection_is_not_forcing(self) -> None:
-        """`{"type": "function"}` selects a tool; it does not force calling it.
-
-        The Anthropic wire only knows `any`/`tool`/`auto`/`none`. Treating the OpenAI
-        shape as forcing turned reasoning off for no reason at all on the server side.
-        """
-        assert ant._forced_tool_choice({"type": "function", "function": {"name": "f"}}) is False
-        out = ant.apply_thinking_params(
+    def test_openai_function_shapes_follow_the_wire(self) -> None:
+        """What forces is decided on what LiteLLM sends. A bare `{"type": "function"}` names
+        nothing and LiteLLM drops it, so budget thinking stays. A named function becomes
+        `{"type": "tool", "name": ...}` on the wire — forcing — and budget thinking beside it
+        is the 400 "Thinking may not be enabled when tool_choice forces tool use"."""
+        bare = ant.apply_thinking_params(
             {"reasoning_effort": "high", "tool_choice": {"type": "function"}},
             "claude-haiku-4-5",
         )
-        assert out["thinking"]["type"] == "enabled"
+        named = ant.apply_thinking_params(
+            {
+                "reasoning_effort": "high",
+                "tool_choice": {"type": "function", "function": {"name": "f"}},
+            },
+            "claude-haiku-4-5",
+        )
+        assert bare["thinking"]["type"] == "enabled"
+        assert "thinking" not in named
 
 
 class TestThinkingEdges:
@@ -247,11 +253,26 @@ class TestThinkingEdges:
         assert out["max_tokens"] == 1000
         assert "max_completion_tokens" not in out
 
-    def test_thinking_room_never_passes_the_ceiling(self) -> None:
+    def test_a_tight_ceiling_shrinks_the_budget_under_it(self) -> None:
+        """omp 18.4.4: the budget leaves the output buffer under the model's ceiling. The old
+        request (budget 8192, `max_tokens` 8000) is the 400 "`max_tokens` must be greater
+        than `thinking.budget_tokens`"."""
+        out = ant.apply_thinking_params(
+            {"reasoning_effort": "high", "max_tokens": 100}, "claude-haiku-4-5", ceiling=8000
+        )
+        assert out["thinking"]["budget_tokens"] == 8000 - ant.OUTPUT_FALLBACK_BUFFER
+        assert out["max_tokens"] == 8000
+
+    def test_a_ceiling_with_no_room_for_a_budget_turns_thinking_off(self) -> None:
+        """Below Anthropic's 1024 minimum no budget is valid (measured: "budget_tokens: Input
+        should be greater than or equal to 1024"), so omp 18.4.4 sends the turn without
+        thinking; the caller's `max_tokens` stands. This request used to go out with budget
+        8192 and `max_tokens` 4096."""
         out = ant.apply_thinking_params(
             {"reasoning_effort": "high", "max_tokens": 100}, "claude-haiku-4-5", ceiling=4096
         )
-        assert out["max_tokens"] == 4096
+        assert out["thinking"] == {"type": "disabled"}
+        assert out["max_tokens"] == 100
 
     def test_unknown_effort_uses_medium_default(self) -> None:
         out = ant.apply_thinking_params({"reasoning_effort": "turbo"}, "claude-opus-5")
