@@ -1024,6 +1024,7 @@ _SAMPLING_PARAMS: Final = ("temperature", "top_p", "top_k")
 
 # omp: providers/anthropic.ts :: buildParams
 # omp: providers/anthropic.ts :: isAdaptiveOnlyThinking
+# omp: providers/anthropic-wire.ts :: ThinkingConfigBetweenTools
 def _thinking_off(kwargs: dict[str, Any], model: str, effort: str | None) -> None:
     """omp's ``thinkingEnabled === false`` branch: the lowest thinking the model allows.
 
