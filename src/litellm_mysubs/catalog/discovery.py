@@ -352,11 +352,17 @@ async def _discover_codex(
             ),
         )
 
-    slugs = [
-        slug
+    entries = [
+        entry
         for entry in payload.get("models") or ()
-        if isinstance(entry, dict) and (slug := entry.get("slug")) and slug not in CODEX_NON_MODELS
+        if isinstance(entry, dict)
+        and isinstance(slug := entry.get("slug"), str)
+        and slug
+        and slug not in CODEX_NON_MODELS
     ]
+    slugs = [entry["slug"] for entry in entries]
+    for entry in entries:
+        codex.remember_service_tiers(entry["slug"], _codex_service_tiers(entry))
     if not slugs:
         return await _discover_probed(
             credential,
@@ -380,6 +386,23 @@ async def _discover_codex(
         )
         for slug in slugs
     ]
+
+
+# omp: discovery/codex.ts :: parseCodexModelEntry
+def _codex_service_tiers(entry: dict[str, Any]) -> tuple[str, ...] | None:
+    """Tier ids the entry advertises (codex-rs ``ModelServiceTier {id, name, description}``;
+    only the id reaches the wire), or ``None`` when it has no ``service_tiers`` array. An
+    explicit empty array is kept: the model offers no optional tier."""
+    raw = entry.get("service_tiers")
+    if not isinstance(raw, list):
+        return None
+    tiers: list[str] = []
+    for tier in raw:
+        identifier = tier.get("id") if isinstance(tier, dict) else None
+        name = identifier.strip() if isinstance(identifier, str) else ""
+        if name and name not in tiers:
+            tiers.append(name)
+    return tuple(tiers)
 
 
 # -- Google Antigravity: real catalog ------------------------------------------

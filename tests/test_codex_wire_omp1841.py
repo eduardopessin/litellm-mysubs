@@ -130,7 +130,7 @@ class TestPlainTurn:
             "x-codex-routing-hint": "model=gpt-5.5",
             "OpenAI-Beta": "responses=experimental",
             "originator": "omp",
-            "version": "0.155.1",
+            "version": "0.159.0",
             "User-Agent": "omp/18.4.1",
             "conversation_id": "conv-1",
             "session_id": "conv-1",

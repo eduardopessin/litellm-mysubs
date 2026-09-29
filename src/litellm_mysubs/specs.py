@@ -15,7 +15,7 @@ import contextlib
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Final
 
 import httpx
@@ -217,6 +217,22 @@ def _request_id() -> str:
     return f"agent/{_AGENT_ID}/{int(time.time() * 1000)}/{_TRAJECTORY_ID}/{_state.step}"
 
 
+def _observe_codex_usage(headers: Mapping[str, str]) -> None:
+    """Hands the response's `x-codex-*` quota headers to the usage the UI shows.
+
+    omp ingests them on every Codex response (`usage/openai-codex.ts ::
+    parseCodexRateLimitHeaders`); here they used to die in the transport, so the card only
+    moved when the quota endpoint was polled. As in `callback.py`, the UI's state must
+    never cost the client its response: a failure here is swallowed.
+    """
+    with contextlib.suppress(Exception):
+        from .ui.install import shared_service
+
+        service = shared_service()
+        if service is not None:
+            service.observe("openai-codex", headers)
+
+
 # omp: providers/openai-codex-responses.ts :: createCodexRequestContext
 async def _codex_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> RequestSpec:
     # No output caps to strip: `build_request_body` builds the body from scratch and does
@@ -227,23 +243,39 @@ async def _codex_spec(model: str, messages: list[Any], extra: dict[str, Any]) ->
     # One identity per request, shared by the body's `client_metadata` and the headers,
     # as omp builds it once and hands it to both.
     session_id = codex.session_key(model, messages, extra.get("tools"), extra)
-    metadata = codex.turn_metadata(session_id, messages)
+    context = codex.request_context(
+        session_id, messages, model=codex.resolve_model(model), token=token
+    )
     body = codex.build_request_body(
         model,
         messages,
         tools=extra.get("tools"),
         extra=extra,
         session_id=session_id,
-        metadata=metadata,
+        metadata=context.metadata,
     )
     headers = codex.build_headers(
         token,
         session_id=session_id,
-        metadata=metadata,
+        metadata=context.metadata,
+        turn_state=context.turn_state.value,
+        models_etag=context.models_etag,
         model=str(body["model"]),
         service_tier=body.get("service_tier"),
     )
-    return RequestSpec(url=CODEX_URL, headers=headers, body=body, provider="codex", model=model)
+
+    def on_response(status: int, response_headers: Mapping[str, str]) -> None:
+        context.on_response(status, response_headers)
+        _observe_codex_usage(response_headers)
+
+    return RequestSpec(
+        url=CODEX_URL,
+        headers=headers,
+        body=body,
+        provider="codex",
+        model=model,
+        on_response=on_response,
+    )
 
 
 async def _refresh_catalog(token: str, project_id: str) -> antigravity_models.ModelCatalog:
