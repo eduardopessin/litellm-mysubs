@@ -1181,10 +1181,11 @@ def tools_to_codex_tools(tools: list[Any] | None) -> list[dict[str, Any]] | None
 
     ``parameters`` go through omp's normalization (`openai_schema.codex_tool_parameters`):
     the backend rejects ``oneOf`` and an object node without ``properties`` even outside
-    strict mode. A tool with no parameters, or ``{}``, sends the empty object schema. omp's
-    gateway would send ``{}``, which its normalization turns into ``true`` — a value no
-    Responses tool was ever measured to accept here, while omitting ``parameters`` was
-    measured to give 400; the object schema is the form that is known to pass.
+    strict mode. A tool with no parameters, or ``{}``, keeps sending the empty object
+    schema this package has always sent. omp's gateway would send ``{}``, which its
+    normalization turns into ``parameters: true``; nothing here has measured the backend
+    accepting ``true``, and omitting ``parameters`` was measured to give 400 — the
+    divergence stays until a live request settles it.
     """
     if not tools:
         return None

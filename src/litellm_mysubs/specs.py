@@ -39,7 +39,7 @@ ANTIGRAVITY_USER_AGENT: Final = (
 _SIGNATURE_LIMIT: Final = 512
 
 #: This instance's transport identity (Antigravity's request ids). Codex's thread and
-#: window ids are per conversation, not per process: see `codex.turn_metadata`.
+#: window ids are per conversation, not per process: see `codex.request_context`.
 _AGENT_ID: Final = uuid.uuid4().hex[:16]
 _TRAJECTORY_ID: Final = uuid.uuid4().hex[:16]
 
