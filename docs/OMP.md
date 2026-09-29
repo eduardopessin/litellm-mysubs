@@ -90,7 +90,7 @@ Where we do not follow OMP, and why. Each one was measured against the real serv
 | Anthropic betas | includes `redact-thinking-2026-02-12` (`usage/claude.ts`) | omitted | With it, Anthropic returns signed but empty thinking blocks: measured on sonnet-4-6, 74 chars without the beta, 0 with it. |
 | Anthropic betas | includes `context-1m-2025-08-07` | omitted | Returns a credit 429 on subscription tokens. |
 | Thinking budget | up to 32768 | ceiling 8192 | Short TPM window on the Max subscription; 32768 gives a 429. |
-| Reasoning loop | *retryable* error, the retry layer asks again | raises | There is no replay-safe window here: `reasoning_content` has already been flushed to the client before detection, and retrying duplicated it in the same stream. |
+| Codex whitespace loop, streamed | replays the turn (up to 2 times) while nothing visible was delivered | a streamed turn raises 502; a non-streamed one is replayed as in omp | omp drops the half-built call from its own event stream before replaying; a chat, Messages or Responses client has already received the call's opening chunk when the brake trips, and a replay would open a second call it cannot tell from the first. |
 | `-thinking` variants | strippable | only `gemini-2.5-flash-thinking` | `gemini-3.7/3.8-flash-thinking` do not exist upstream; stripping them silently served `-low` for an invented name. |
 | Unserved name | falls back to a nearby model | raises | Answering with a different model makes billing and comparisons lie, and the client never knows. |
 
@@ -101,8 +101,9 @@ copy instead of the source. They are recorded because the failure mode is instru
 
 | Where | Was | Corrected to | How it was noticed |
 |---|---|---|---|
-| `google_finish_reason` | enumerated the **error** reasons | enumerates the **normal** ones (`STOP`, `MAX_TOKENS`) and treats the rest as an error, like `mapStopReasonString` | Five reasons (`FINISH_REASON_UNSPECIFIED`, `LANGUAGE`, `IMAGE_OTHER`, `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION`) passed as `stop`: a server-blocked response reached the client as if it were complete. |
+| `google_finish_reason` (now `_AntigravityReader._finish`) | enumerated the **error** reasons | enumerates the **normal** ones (`STOP`, `MAX_TOKENS`) and treats the rest as an error, like `mapStopReasonString` | Five reasons (`FINISH_REASON_UNSPECIFIED`, `LANGUAGE`, `IMAGE_OTHER`, `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION`) passed as `stop`: a server-blocked response reached the client as if it were complete. |
 | `thinking_loop` | **character** trigrams, cluster of 2, no warm-up | **word** trigrams, `SEGMENT_MIN_CLUSTER=4`, `SEGMENT_MIN_COUNT=8`, two exact-cycle regimes, canonicalized anchors | Character trigrams give high similarity to unrelated texts; firing at 2 segments killed legitimate reasoning that OMP lets through. |
+| Reasoning loop | raised on every path, called a deliberate divergence | re-samples a non-streamed turn up to 3 attempts, fails a streamed one | omp's gateway answers a non-streamed request through `completeSimple`, which re-samples (`resolveWithThinkingLoopRetries`); only its streamed path fails, since the reasoning already left. The divergence was real for the stream only. |
 
 **Method lesson:** port from the source and verify against the intermediate — never the
 reverse. A second-hand copy inherits the first one's errors without flagging them.
