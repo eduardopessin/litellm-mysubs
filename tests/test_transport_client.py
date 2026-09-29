@@ -542,6 +542,45 @@ class TestCodexReplay:
         assert events == [CREATED, delta(" ")]
         assert len(recorder.requests) == 1
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(
+                {"type": "response.output_item.added", "item": {"type": "function_call"}},
+                id="tool-call-announced",
+            ),
+            pytest.param(
+                {
+                    "type": "response.output_item.done",
+                    "item": {"type": "message", "content": [{"text": "whole answer"}]},
+                },
+                id="text-carried-by-the-item",
+            ),
+            pytest.param(
+                {"type": "response.reasoning_summary_text.done", "text": "thought"},
+                id="summary-delivered-whole",
+            ),
+        ],
+    )
+    async def test_content_without_a_delta_still_commits(self, content: dict[str, Any]) -> None:
+        """A tool call is visible the moment it is announced, and an item can carry its
+        text whole: either way the client has it, and a replay would repeat it."""
+        recorder = Recorder(ok(sse(CREATED, content)), codex_ok())
+        async with transport(recorder) as client:
+            events = await drain(client, spec())
+
+        assert events == [CREATED, content]
+        assert len(recorder.requests) == 1
+
+    async def test_an_announced_message_is_not_content_yet(self) -> None:
+        added = {"type": "response.output_item.added", "item": {"type": "message"}}
+        recorder = Recorder(ok(sse(CREATED, added)), codex_ok("answer"))
+        async with transport(recorder) as client:
+            events = await drain(client, spec())
+
+        assert added not in events
+        assert delta("answer") in events
+
     async def test_the_replay_budget_is_five(self) -> None:
         waits = Waits()
         recorder = Recorder(*(ok(sse(CREATED)) for _ in range(6)))
