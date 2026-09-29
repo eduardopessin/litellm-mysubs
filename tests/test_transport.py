@@ -1,4 +1,4 @@
-"""Retry policy and endpoint rotation.
+"""Retry policy, endpoint rotation, retry hints and SSE decoding.
 
 In the original these decisions lived inside the ``httpx`` loops, duplicated between the
 synchronous and the asynchronous version — and the two had drifted into different shapes of
@@ -7,31 +7,29 @@ the same rule. Testing them in isolation is what stops that divergence from comi
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from email.utils import format_datetime
+
 import pytest
 
-from litellm_mysubs.transport.hosts import (
-    HOSTS,
-    MAX_EMPTY_RETRIES,
-    STREAM_PATH,
-    HostRotation,
-    empty_retry_delay,
-)
+from litellm_mysubs.transport import sse
+from litellm_mysubs.transport.hosts import HOSTS, STREAM_PATH, HostRotation
+from litellm_mysubs.transport.replay import is_retryable_codex_failure
 from litellm_mysubs.transport.retry import (
     Action,
     decide_antigravity,
     decide_codex,
     is_unsupported_model,
+    retry_hint,
 )
+
+#: A fixed "now" for the hints that name an absolute time: 2026-09-01T00:00:00Z.
+NOW = datetime(2026, 9, 1, tzinfo=UTC).timestamp()
 
 
 class TestCodexDecisions:
-    def test_success_returns(self) -> None:
-        assert decide_codex(200).action is Action.RETURN
-
     def test_401_refreshes_the_token(self) -> None:
-        decision = decide_codex(401)
-        assert decision.action is Action.REFRESH_TOKEN
-        assert decision.should_retry is True
+        assert decide_codex(401).action is Action.REFRESH_TOKEN
 
     def test_unsupported_alias_is_remapped(self) -> None:
         """Family names only: resolving them to the served version is honest."""
@@ -47,7 +45,6 @@ class TestCodexDecisions:
             400, "The 'gpt-4.1' model is not supported when using Codex", can_remap=False
         )
         assert decision.action is Action.FAIL
-        assert decision.should_retry is False
 
     def test_other_400_is_not_a_model_problem(self) -> None:
         """An invalid payload is not fixed by switching models."""
@@ -72,19 +69,18 @@ class TestCodexDecisions:
 
 
 class TestAntigravityDecisions:
-    def test_success_returns(self) -> None:
-        assert decide_antigravity(200).action is Action.RETURN
-
     def test_401_refreshes(self) -> None:
         assert decide_antigravity(401).action is Action.REFRESH_TOKEN
 
-    @pytest.mark.parametrize("status", [404, 503])
-    def test_no_model_degradation(self, status: int) -> None:
-        """A 404 means "the account does not serve this" and a 503 is capacity; neither
-        authorises answering with a different model."""
-        decision = decide_antigravity(status)
-        assert decision.action is Action.FAIL
-        assert decision.should_retry is False
+    @pytest.mark.parametrize("status", [408, 500, 503])
+    def test_a_transient_status_moves_to_the_other_host(self, status: int) -> None:
+        assert decide_antigravity(status).action is Action.FAIL
+
+    @pytest.mark.parametrize("status", [400, 403, 404, 429])
+    def test_the_rest_propagates_from_the_host_that_answered(self, status: int) -> None:
+        """A 4xx is the request's fault or the account's verdict: the other host answers
+        the same. None of them authorises answering with a different model either."""
+        assert decide_antigravity(status).action is Action.ABORT
 
 
 class TestHostRotation:
@@ -113,19 +109,6 @@ class TestHostRotation:
         rotation.commit("https://example.invalid/x")
         assert rotation.current == HOSTS[0]
 
-    def test_failover_allowed_before_anything_is_emitted(self) -> None:
-        assert HostRotation().can_failover(is_last=False) is True
-
-    def test_no_failover_after_the_first_event(self) -> None:
-        """The client already saw part of the response: restarting on another host
-        duplicated it."""
-        rotation = HostRotation()
-        rotation.mark_started()
-        assert rotation.can_failover(is_last=False) is False
-
-    def test_no_failover_on_the_last_endpoint(self) -> None:
-        assert HostRotation().can_failover(is_last=True) is False
-
     def test_path_is_configurable(self) -> None:
         rotation = HostRotation()
         urls = rotation.urls("/v1internal:fetchAvailableModels")
@@ -138,11 +121,136 @@ class TestHostRotation:
         assert second.current == HOSTS[0]
 
 
-class TestEmptyStreamRetry:
-    def test_backoff_doubles(self) -> None:
-        """500 ms, 1 s — like the OMP."""
-        assert empty_retry_delay(1) == 0.5
-        assert empty_retry_delay(2) == 1.0
+class TestRetryHint:
+    """omp's `extractRetryHint`: the wait the server asked for, in seconds."""
 
-    def test_retry_budget_matches_the_source(self) -> None:
-        assert MAX_EMPTY_RETRIES == 2
+    @pytest.mark.parametrize(
+        ("headers", "expected"),
+        [
+            ({"Retry-After": "7"}, 7.0),
+            ({"retry-after-ms": "250"}, 0.25),
+            ({"retry-after": format_datetime(datetime.fromtimestamp(NOW + 90, UTC))}, 90.0),
+            ({"x-ratelimit-reset-ms": "1500"}, 1.5),
+            ({"x-ratelimit-reset-ms": str(int((NOW + 30) * 1000))}, 30.0),
+            ({"x-ratelimit-reset": str(int(NOW + 12))}, 12.0),
+            ({"x-ratelimit-reset-after": "3"}, 3.0),
+        ],
+    )
+    def test_headers(self, headers: dict[str, str], expected: float) -> None:
+        assert retry_hint(headers, now=NOW) == pytest.approx(expected)
+
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            ("Your quota will reset after 1h2m3s.", 3723.0),
+            ("Please retry in 250ms", 0.25),
+            ('{"retryDelay": "34.074824224s"}', 34.074824224),
+            ("Rate limited, try again in ~158 min.", 158 * 60.0),
+            ("Resets in 2hr 15min", 2 * 3600 + 15 * 60.0),
+            ("retry-after-ms=98497000", 98497.0),
+            ("Your limit will reset at 2026-09-01T00:10:00Z", 600.0),
+        ],
+    )
+    def test_body(self, body: str, expected: float) -> None:
+        assert retry_hint({}, body, now=NOW) == pytest.approx(expected)
+
+    def test_the_longest_signal_in_the_body_wins(self) -> None:
+        """Retrying before every window clears re-hits a credential still blocked."""
+        body = "Please retry in 5s. Your quota will reset after 2m0s."
+        assert retry_hint({}, body, now=NOW) == 120.0
+
+    def test_headers_win_over_the_body(self) -> None:
+        assert retry_hint({"retry-after": "3"}, "reset after 1h0m0s", now=NOW) == 3.0
+
+    def test_an_explicit_zero_means_now_not_absent(self) -> None:
+        """``None`` would make the caller sleep its own backoff on a "retry now"."""
+        assert retry_hint({"retry-after": "0"}, now=NOW) == 0.0
+        assert retry_hint({}, "retry-after-ms: 0", now=NOW) == 0.0
+
+    def test_a_naive_reset_time_only_counts_alone(self) -> None:
+        """A wall clock with no zone is a guess; any unambiguous signal beats it."""
+        naive = "limit will reset at 2026-09-01 01:00:00"
+        assert retry_hint({}, naive, now=NOW) == 3600.0
+        assert retry_hint({}, f"{naive}; try again in 20s", now=NOW) == 20.0
+
+    def test_no_signal_is_none(self) -> None:
+        assert retry_hint({"content-type": "text/plain"}, "quota exhausted", now=NOW) is None
+
+
+class TestCodexFailureClassification:
+    """omp's `isRetryableCodexFailureEvent`: which in-band failures it sends again."""
+
+    @pytest.mark.parametrize(
+        "event",
+        [
+            {"type": "response.failed", "response": {"error": {"code": "server_error"}}},
+            {"type": "error", "code": "Internal_Error"},
+            {"type": "error", "error": {"type": "model_error"}},
+            {"type": "error", "message": "The service is temporarily unavailable"},
+            {
+                "type": "response.failed",
+                "response": {
+                    "error": {"message": "An error occurred while processing your request."}
+                },
+            },
+            {
+                "type": "error",
+                "message": "peer closed connection without sending complete message body "
+                "(incomplete chunked read)",
+            },
+        ],
+    )
+    def test_transient(self, event: dict[str, object]) -> None:
+        assert is_retryable_codex_failure(event) is True
+
+    @pytest.mark.parametrize(
+        "event",
+        [
+            {"type": "response.failed", "response": {"error": {"code": "context_length_exceeded"}}},
+            {"type": "error", "error": {"code": "invalid_prompt", "message": "bad input"}},
+            {"type": "response.failed"},
+        ],
+    )
+    def test_final(self, event: dict[str, object]) -> None:
+        assert is_retryable_codex_failure(event) is False
+
+
+class TestSseDecoder:
+    """omp's `readSseEvents` framing and `readSseFrames` JSON rules."""
+
+    def decode(self, *lines: str) -> list[object]:
+        decoder = sse.SseDecoder()
+        frames = [frame for line in lines for frame in decoder.feed(line)]
+        return frames + decoder.close()
+
+    def test_data_lines_join_into_one_event(self) -> None:
+        assert self.decode('data: {"a":', "data: 1}", "") == [{"a": 1}]
+
+    def test_the_space_after_the_colon_is_optional(self) -> None:
+        assert self.decode('data:{"a":1}', "") == [{"a": 1}]
+
+    def test_comments_and_other_fields_are_ignored(self) -> None:
+        assert self.decode(": ping", "event: delta", "id: 7", 'data: {"a":1}', "") == [{"a": 1}]
+
+    def test_a_leading_bom_is_dropped(self) -> None:
+        assert self.decode('\ufeffdata: {"a":1}', "") == [{"a": 1}]
+
+    def test_done_ends_the_stream(self) -> None:
+        assert self.decode('data: {"a":1}', "", "data: [DONE]", "", 'data: {"b":2}', "") == [
+            {"a": 1}
+        ]
+
+    def test_an_event_without_the_final_blank_line_still_counts(self) -> None:
+        assert self.decode('data: {"a":1}') == [{"a": 1}]
+
+    def test_a_cut_off_object_at_the_end_ends_quietly(self) -> None:
+        assert self.decode('data: {"a":1}', "", 'data: {"b": [1, ') == [{"a": 1}]
+
+    def test_a_malformed_event_is_reported_not_skipped(self) -> None:
+        frames = self.decode("data: <html>", "", 'data: {"a":1}', "")
+        assert isinstance(frames[0], sse.Malformed)
+        assert frames[1:] == [{"a": 1}]
+
+    def test_the_lenient_reader_skips_what_does_not_parse(self) -> None:
+        lines = ["data: oops", "", 'data: {"a":1}', "", "data: [DONE]", "", 'data: {"b":2}']
+        assert list(sse.iter_events(lines)) == [{"a": 1}]
