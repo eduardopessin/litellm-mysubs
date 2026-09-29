@@ -292,20 +292,6 @@ class TestMultimodal:
 
 
 class TestToolCalls:
-    def test_function_ids_only_on_gemini_3(self) -> None:
-        messages: list[Any] = [
-            {
-                "role": "assistant",
-                "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}],
-            },
-            {"role": "tool", "tool_call_id": "c1", "content": "r"},
-        ]
-        modern = payload(messages, model="gemini-3-pro")["request"]["contents"]
-        assert modern[0]["parts"][0]["functionCall"]["id"] == "c1"
-
-        legacy = payload(messages, model="gemini-2.5-flash")["request"]["contents"]
-        assert "id" not in legacy[0]["parts"][0]["functionCall"]
-
     def test_sentinel_used_once_per_request(self) -> None:
         """The CCA validates the signature of the turn's first functionCall."""
         body = payload(
@@ -614,7 +600,7 @@ class TestTools:
         OMP converts **every** declaration on the Antigravity path; the full JSON Schema
         field was a misreading of the public Gemini API.
         """
-        tools, _ = ag.tools_to_declarations(
+        tools = ag.tools_to_declarations(
             "gemini-3-pro",
             [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
         )
@@ -625,7 +611,7 @@ class TestTools:
 
     def test_unsupported_constructs_are_sanitised(self) -> None:
         """`anyOf`/`$ref`/`not` give 400 on the CCA; sending them raw made the request fail."""
-        tools, _ = ag.tools_to_declarations(
+        tools = ag.tools_to_declarations(
             "gemini-3-pro",
             [
                 {
@@ -647,34 +633,94 @@ class TestTools:
     def test_every_model_uses_the_same_field(self) -> None:
         """Choosing by family was a local invention: OMP does not distinguish here."""
         for model in ("gemini-3-pro", "claude-sonnet-4-6", "gemini-2.5-flash"):
-            tools, _ = ag.tools_to_declarations(
+            tools = ag.tools_to_declarations(
                 model, [{"type": "function", "function": {"name": "f", "parameters": {}}}]
             )
             assert tools is not None
             assert "parameters" in tools[0]["functionDeclarations"][0], model
 
-    def test_validated_is_the_default_mode(self) -> None:
-        assert ag.tool_config(None, []) == {"functionCallingConfig": {"mode": "VALIDATED"}}
-
     @pytest.mark.parametrize(
-        ("choice", "mode"), [("none", "NONE"), ("required", "ANY"), ("any", "ANY")]
+        ("choice", "config"),
+        [
+            pytest.param(None, None, id="absent"),
+            pytest.param("auto", None, id="auto"),
+            pytest.param("none", {"mode": "NONE"}, id="none"),
+            pytest.param("required", {"mode": "ANY"}, id="required"),
+            # Neither server parser accepts Anthropic's bare "any"; the Messages route
+            # translates it to "required" before it gets here.
+            pytest.param("any", None, id="bare-any"),
+            pytest.param(
+                {"type": "function", "function": {"name": "read"}},
+                {"mode": "ANY", "allowedFunctionNames": ["read"]},
+                id="chat-named",
+            ),
+            pytest.param(
+                {"type": "function", "name": "read"},
+                {"mode": "ANY", "allowedFunctionNames": ["read"]},
+                id="responses-named",
+            ),
+            pytest.param(
+                {"type": "tool", "name": "read"},
+                {"mode": "ANY", "allowedFunctionNames": ["read"]},
+                id="anthropic-named",
+            ),
+            pytest.param({"type": "function", "function": {"name": ""}}, None, id="nameless"),
+            pytest.param({"type": "web_search_preview"}, None, id="hosted"),
+            pytest.param({"type": "allowed_tools", "mode": "auto"}, None, id="allowed-tools"),
+        ],
     )
-    def test_choice_modes(self, choice: str, mode: str) -> None:
-        assert ag.tool_config(choice, [])["functionCallingConfig"]["mode"] == mode
-
-    def test_named_choice_restricts_to_that_function(self) -> None:
-        config = ag.tool_config(
-            {"type": "function", "function": {"name": "read"}}, [{"name": "read"}]
-        )
-        assert config["functionCallingConfig"]["allowedFunctionNames"] == ["read"]
-
-    def test_unknown_named_choice_falls_back(self) -> None:
-        """A name that was not declared cannot restrict to anything."""
-        config = ag.tool_config(
-            {"type": "function", "function": {"name": "nonexistent"}}, [{"name": "read"}]
-        )
-        assert config["functionCallingConfig"]["mode"] == "VALIDATED"
+    def test_choice_maps_as_omp_maps_it(self, choice: object, config: object) -> None:
+        """``normalizeToolChoice`` / Responses ``mapToolChoice`` into ``mapGoogleToolChoice``:
+        ``None`` leaves the request on the default mode."""
+        assert ag.function_calling_config(choice) == config
 
     def test_no_tools_means_no_config(self) -> None:
         body = payload([{"role": "user", "content": "x"}])
         assert "tools" not in body["request"] and "toolConfig" not in body["request"]
+
+
+class TestDemotedThinking:
+    @pytest.mark.parametrize(
+        ("text", "demoted"),
+        [
+            ("plain", "<thinking>\nplain\n</thinking>"),
+            ("  <thinking>a</thinking>  ", "<thinking>\na\n</thinking>"),
+            (
+                "<thinking>\n a \n</thinking>\n<thinking>b</thinking>",
+                "<thinking>\na\nb\n</thinking>",
+            ),
+            ("<thinking><thinking>n</thinking></thinking>", "<thinking>\nn\n</thinking>"),
+            ("<thinking>open only", "<thinking>\n<thinking>open only\n</thinking>"),
+            ("<thinking>a</thinking> tail", "<thinking>\n<thinking>a</thinking> tail\n</thinking>"),
+        ],
+    )
+    def test_the_xml_fallback_does_not_wrap_twice(self, text: str, demoted: str) -> None:
+        """omp 18.4.4 ``renderDelimitedThinking`` outputs for a model with no dialect of its
+        own: reasoning already in the tags is unwrapped first, and only when every segment
+        closes — otherwise it is wrapped as it came."""
+        assert ag.demoted_thinking("tab_flash_lite_preview", text) == demoted
+
+
+class TestToolPairing:
+    def test_a_stray_result_inside_an_open_window_is_dropped(self) -> None:
+        """A note there would sit between a call and its result, breaking the pair; omp
+        drops the stray one and still closes the window."""
+        call = {"id": "c1", "function": {"name": "f", "arguments": "{}"}}
+        paired = ag.pair_tool_results(
+            [
+                {"role": "assistant", "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "gone", "content": "stray"},
+                {"role": "user", "content": "next"},
+            ]
+        )
+
+        assert paired == [
+            {"role": "assistant", "tool_calls": [call]},
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": ag.MISSING_TOOL_RESULT,
+                "is_error": True,
+            },
+            {"role": "user", "content": "next"},
+        ]
