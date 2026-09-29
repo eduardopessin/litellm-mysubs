@@ -50,6 +50,10 @@ class RequestSpec:
     body: Mapping[str, Any]
     provider: Provider
     model: str
+    #: Called once per request with the final 2xx status and response headers, as soon as
+    #: the successful response is opened — before the first streamed event. Never for a
+    #: failed attempt; what it raises propagates.
+    on_response: Callable[[int, Mapping[str, str]], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +216,12 @@ class Transport:
                     stream=True,
                 )
                 if response.status_code == 200:
+                    if spec.on_response is not None:
+                        try:
+                            spec.on_response(response.status_code, response.headers)
+                        except BaseException:
+                            await response.aclose()
+                            raise
                     return response
 
                 status = response.status_code
