@@ -543,11 +543,11 @@ def function_calling_config(choice: object) -> dict[str, Any] | None:
 
 
 # omp: providers/openai-chat-server.ts :: stringifyContent
-def system_text(content: object) -> str:
-    """A system message's text: its text parts joined with nothing between them.
+def text_of(content: object) -> str:
+    """A system or assistant message's text: its text parts joined with nothing between.
 
-    ``systemInstruction`` is text; omp drops the media a system message carries, and so does
-    this.
+    omp's chat server reads both roles this way — ``systemInstruction`` is text, and an
+    assistant turn replays as one text block — so the media either carries is dropped.
     """
     if content is None:
         return ""
@@ -984,11 +984,17 @@ def build_payload(
             continue
 
         if role == "system":
-            if text := system_text(content):
+            if text := text_of(content):
                 system_texts.append(text)
             continue
 
-        parts = content_parts(content, fetch, supports_images=supports_images)
+        if role == "assistant":
+            # Whitespace-only text is left out: the source says it "can cause issues with
+            # some models (e.g. Claude via Antigravity)".
+            text = well_formed(text_of(content))
+            parts = [{"text": text}] if text.strip() else []
+        else:
+            parts = content_parts(content, fetch, supports_images=supports_images)
 
         if role == "assistant":
             # omp: providers/openai-chat-server.ts :: buildAssistantMessage
@@ -1130,7 +1136,7 @@ __all__ = [
     "output_ceiling",
     "pair_tool_results",
     "raise_if_retired",
-    "system_text",
+    "text_of",
     "tool_result_value",
     "tools_to_declarations",
     "usage_is_zero",

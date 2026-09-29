@@ -632,3 +632,27 @@ class TestToolPairing:
             ("user", '<stale-tool-result tool="" id="gone">\nsunny\n</stale-tool-result>'),
             ("user", "so?"),
         ]
+
+
+class TestAssistantText:
+    async def test_an_assistant_turn_replays_as_one_text(self, client: openai.AsyncOpenAI) -> None:
+        """omp's ``buildAssistantMessage`` reads the content with ``stringifyContent``: the
+        text parts joined as they were streamed, anything else dropped."""
+        request = await chat_request(
+            client,
+            GEMINI,
+            [
+                {"role": "user", "content": "weather?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Sun"},
+                        {"type": "text", "text": "ny."},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+                    ],
+                },
+                {"role": "user", "content": "thanks"},
+            ],
+        )
+
+        assert request["contents"][1] == {"role": "model", "parts": [{"text": "Sunny."}]}
