@@ -106,7 +106,11 @@ curl $PROXY/v1/chat/completions -H "Authorization: Bearer $KEY" \
    `mysubs/<subscription>/` prefix and are immediately callable by any client.
 
 Tokens are then refreshed in the background, with a `flock` held across processes so that
-multiple proxy workers never race on the same rotating refresh token.
+multiple proxy workers never race on the same rotating refresh token. The renewal a request
+triggers, the retry after a `401` and the card's renew button go through the same lock:
+a worker that finds another one renewing waits for it and uses what it wrote. A refresh
+token the provider rejects for good (`invalid_grant`, revoked) removes that subscription's
+credential — the card shows it disconnected, and connecting again is the only fix.
 
 ### Returning the result
 

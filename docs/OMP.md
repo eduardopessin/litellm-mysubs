@@ -99,6 +99,7 @@ Where we do not follow OMP, and why. Each one was measured against the real serv
 | Antigravity tool-result images | a following user turn (chat gateway; Gemini < 3) | inside `functionResponse.parts` for every model | Measured: every generation the account serves (gemini-3.8-flash, 3.1-pro, 3.1-flash-lite, 2.5-flash, 2.5-flash-lite, pro-agent) described a blue screenshot returned that way. |
 | Antigravity media by URL | `[image: <url>]` placeholder text (chat gateway, no fetcher) | fetched and inlined | `fileData` with a web URL answers 404 "Requested entity was not found"; a placeholder means the model never sees the image. |
 | Antigravity envelope | `request.labels`, `request.sessionId` | omitted | The endpoint answered 400 "Unknown name" for them (`test_fixed_envelope_fields`). |
+| Background renewal | one broker refreshes the store; each sweep renewal is forced and waits for the refresh lease (`auth-broker/refresher.ts`) | every worker sweeps; freshness is re-checked inside the lock and a busy lock is skipped | LiteLLM runs `--num_workers` processes, each with its own sweep: forcing would rotate the token once per worker per cycle. Measured with four workers (DECISIONS D8): one lock file, one new token, no `invalid_grant`. |
 
 ## Divergences corrected by comparing against the source
 

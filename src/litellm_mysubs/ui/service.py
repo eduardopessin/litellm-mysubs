@@ -276,12 +276,15 @@ class MySubsService:
         return credential
 
     async def refresh(self, provider: ProviderId) -> Credential:
-        """Step 5: refreshes and stores the rotated credential."""
-        credential = self._require(provider)
-        async with self.client_factory() as client:
-            renewed = await oauth.refresh(credential, client=client, store=self.store)
-        self.store.set(provider, renewed)
-        return renewed
+        """Step 5: refreshes and stores the rotated credential.
+
+        Through the same lock and single-flight as every other renewal: a click racing a
+        worker's sweep would otherwise spend the same single-use refresh token twice.
+        """
+        from ..credentials.refresher import force_refresh
+
+        self._require(provider)
+        return await force_refresh(self.store, provider, client_factory=self.client_factory)
 
     # -- interceptor -----------------------------------------------------------
 

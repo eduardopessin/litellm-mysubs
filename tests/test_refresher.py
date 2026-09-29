@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from litellm_mysubs.credentials import refresher as module
-from litellm_mysubs.credentials.lock import LockBusyError
+from litellm_mysubs.credentials.lock import file_lock
 from litellm_mysubs.credentials.refresher import BackgroundRefresher
 from litellm_mysubs.credentials.store import Credential, CredentialStore, ProviderId
 
@@ -172,14 +172,14 @@ class TestSingleOwner:
         assert all(r.renewed is False for r in reports)
 
     async def test_busy_lock_does_not_count_as_an_error(
-        self, spy: SpyRefresh, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, spy: SpyRefresh, tmp_path: Path
     ) -> None:
-        def busy(path: Path, *, timeout_s: float = 0.0) -> Any:
-            raise LockBusyError(f"busy: {path}")
-
-        monkeypatch.setattr(module, "file_lock", busy)
         store = FakeStore({"anthropic": credential("anthropic", SOON)})
-        report = by_provider(await build(store, tmp_path).sweep(now=NOW))["anthropic"]
+        refresher = build(store, tmp_path)
+        # Another worker holds the provider's lock: `flock` arbitrates per open file, so
+        # holding it here excludes the sweep exactly as another process would.
+        with file_lock(module.lock_target(store, "anthropic")):
+            report = by_provider(await refresher.sweep(now=NOW))["anthropic"]
 
         assert spy.calls == []
         assert report.renewed is False
