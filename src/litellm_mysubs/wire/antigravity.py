@@ -783,6 +783,136 @@ def output_ceiling(requested: Any, entry: Any) -> int | None:
     return asked if declared is None else min(asked, declared)
 
 
+# omp: providers/transform-messages.ts :: transformMessages
+#: Result omp synthesizes for a call the history never answered.
+MISSING_TOOL_RESULT: Final = "No result provided"
+
+
+def _pairing_key(call_id: object) -> str:
+    """The call component of an id: what pairs a call with its result."""
+    return str(call_id or "").split("|", 1)[0]
+
+
+def _stale_tool_result(message: dict[str, Any]) -> dict[str, Any] | None:
+    """A result whose call is gone, kept as a user note so the model still sees it."""
+    content = message.get("content")
+    if isinstance(content, list):
+        texts = [
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in (None, *TEXT_PART_TYPES)
+        ]
+    else:
+        texts = [str(content)] if content else []
+    texts = [text for text in texts if text.strip()]
+    if not texts:
+        return None
+    error = ' is-error="true"' if message.get("is_error") else ""
+    body = "\n".join(texts)
+    return {
+        "role": "user",
+        "content": (
+            f'<stale-tool-result tool="{message.get("name") or ""}" '
+            f'id="{message.get("tool_call_id") or ""}"{error}>\n{body}\n</stale-tool-result>'
+        ),
+    }
+
+
+# omp: providers/transform-messages.ts :: transformMessages
+def pair_tool_results(messages: list[Any]) -> list[Any]:
+    """The history with every assistant tool call followed by exactly one result.
+
+    omp's ``transformMessages`` second pass, which runs before ``convertMessages``: a
+    result that arrives late is pulled up behind its call, a duplicate is dropped, a call
+    left unanswered gets an error result (``No result provided``), and a result whose call
+    is nowhere in the history becomes a ``<stale-tool-result>`` user note — or is dropped
+    while other calls still wait for theirs. Cloud Code refuses a turn whose function
+    responses do not match its function calls, so the whole request used to fail.
+
+    System messages pass through without closing a result window: omp's chat server lifts
+    them out of the history before this pass runs.
+    """
+    results: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    declared: set[str] = set()
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool":
+            key = _pairing_key(message.get("tool_call_id"))
+            results.setdefault(key, []).append((index, message))
+        elif message.get("role") == "assistant":
+            declared.update(
+                _pairing_key(call.get("id"))
+                for call in message.get("tool_calls") or []
+                if isinstance(call, dict)
+            )
+    consumed: set[int] = set()
+
+    def take(key: str, after: int) -> dict[str, Any] | None:
+        for index, message in results.get(key, ()):
+            if index in consumed or index <= after:
+                continue
+            consumed.add(index)
+            return message
+        return None
+
+    paired: list[Any] = []
+    pending: list[dict[str, Any]] = []
+    pending_from = -1
+    resolved: set[str] = set()
+
+    def flush() -> None:
+        nonlocal pending
+        for call in pending:
+            key = _pairing_key(call.get("id"))
+            if key in resolved:
+                continue
+            real = take(key, pending_from)
+            paired.append(
+                real
+                if real is not None
+                else {
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "content": MISSING_TOOL_RESULT,
+                    "is_error": True,
+                }
+            )
+            resolved.add(key)
+        pending = []
+
+    for index, message in enumerate(messages):
+        role = message.get("role") if isinstance(message, dict) else None
+        if role == "system":
+            paired.append(message)
+        elif role == "assistant":
+            flush()
+            calls = [c for c in message.get("tool_calls") or [] if isinstance(c, dict)]
+            if calls:
+                pending, pending_from = calls, index
+            paired.append(message)
+        elif role == "tool":
+            key = _pairing_key(message.get("tool_call_id"))
+            if key in resolved:
+                continue
+            if any(_pairing_key(call.get("id")) == key for call in pending):
+                resolved.add(key)
+                paired.append(message)
+                continue
+            if key in declared:
+                # Its call is elsewhere; `flush` pulls it into that call's window.
+                continue
+            if any(_pairing_key(call.get("id")) not in resolved for call in pending):
+                continue
+            if note := _stale_tool_result(message):
+                paired.append(note)
+        else:
+            flush()
+            paired.append(message)
+    flush()
+    return paired
+
+
 def build_payload(
     model: str,
     messages: list[Any],
@@ -801,6 +931,7 @@ def build_payload(
     and is session state, not something the conversion should invent.
     """
     extra = extra or {}
+    messages = pair_tool_results(messages)
     signatures = thought_signatures or {}
     effort = normalize_effort(extra.get("reasoning_effort"))[0] or ""
     mapped_model = map_model(model, effort or None, catalog)
@@ -974,6 +1105,7 @@ def build_payload(
 __all__ = [
     "FORCED_TOOL_DIRECTIVE",
     "INLINE_MAX_BYTES",
+    "MISSING_TOOL_RESULT",
     "NON_VISION_IMAGE_PLACEHOLDER",
     "RETIREMENT_MARKERS",
     "SAMPLING_FIELDS",
@@ -996,6 +1128,7 @@ __all__ = [
     "media_part",
     "normalize_effort",
     "output_ceiling",
+    "pair_tool_results",
     "raise_if_retired",
     "system_text",
     "tool_result_value",

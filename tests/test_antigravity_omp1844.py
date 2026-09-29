@@ -526,3 +526,109 @@ class TestReplayedReasoning:
         )
 
         assert request["contents"][1] == {"role": "model", "parts": [{"text": "Look outside."}]}
+
+
+CALL: Final[dict[str, Any]] = {
+    "role": "assistant",
+    "content": None,
+    "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+    ],
+}
+
+
+def turns(request: dict[str, Any]) -> list[tuple[str, Any]]:
+    """Each content as ``(role, what it carries)`` — text, call name or response value."""
+    out: list[tuple[str, Any]] = []
+    for content in request["contents"]:
+        for part in content["parts"]:
+            if "functionCall" in part:
+                out.append((content["role"], ("call", part["functionCall"]["name"])))
+            elif "functionResponse" in part:
+                response = part["functionResponse"]
+                out.append((content["role"], (response["name"], response["response"])))
+            else:
+                out.append((content["role"], part["text"]))
+    return out
+
+
+class TestToolPairing:
+    """omp's ``transformMessages`` leaves every call followed by exactly one result before
+    the request is built; Cloud Code refuses a turn whose responses do not match its calls."""
+
+    async def test_an_unanswered_call_gets_an_error_result(
+        self, client: openai.AsyncOpenAI
+    ) -> None:
+        request = await chat_request(
+            client,
+            GEMINI,
+            [{"role": "user", "content": "weather?"}, CALL, {"role": "user", "content": "skip"}],
+            tools=[WEATHER],
+        )
+
+        assert turns(request) == [
+            ("user", "weather?"),
+            ("model", ("call", "get_weather")),
+            ("user", ("get_weather", {"error": "No result provided"})),
+            ("user", "skip"),
+        ]
+
+    async def test_a_late_result_is_pulled_behind_its_call(
+        self, client: openai.AsyncOpenAI
+    ) -> None:
+        request = await chat_request(
+            client,
+            GEMINI,
+            [
+                {"role": "user", "content": "weather?"},
+                CALL,
+                {"role": "user", "content": "wait"},
+                {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+            ],
+            tools=[WEATHER],
+        )
+
+        assert turns(request) == [
+            ("user", "weather?"),
+            ("model", ("call", "get_weather")),
+            ("user", ("get_weather", {"output": "sunny"})),
+            ("user", "wait"),
+        ]
+
+    async def test_a_second_result_for_the_same_call_is_dropped(
+        self, client: openai.AsyncOpenAI
+    ) -> None:
+        request = await chat_request(
+            client,
+            GEMINI,
+            [
+                {"role": "user", "content": "weather?"},
+                CALL,
+                {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+                {"role": "tool", "tool_call_id": "c1", "content": "rainy"},
+            ],
+            tools=[WEATHER],
+        )
+
+        assert turns(request)[2:] == [("user", ("get_weather", {"output": "sunny"}))]
+
+    async def test_a_result_whose_call_is_gone_becomes_a_note(
+        self, client: openai.AsyncOpenAI
+    ) -> None:
+        """After compaction folds the calling turn away, the result survives as context
+        in a ``<stale-tool-result>`` user note instead of a response to nothing."""
+        request = await chat_request(
+            client,
+            GEMINI,
+            [
+                {"role": "user", "content": "weather?"},
+                {"role": "tool", "tool_call_id": "gone", "content": "sunny"},
+                {"role": "user", "content": "so?"},
+            ],
+        )
+
+        assert turns(request) == [
+            ("user", "weather?"),
+            ("user", '<stale-tool-result tool="" id="gone">\nsunny\n</stale-tool-result>'),
+            ("user", "so?"),
+        ]

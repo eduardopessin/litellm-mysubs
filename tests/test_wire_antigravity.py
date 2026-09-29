@@ -699,3 +699,28 @@ class TestDemotedThinking:
         own: reasoning already in the tags is unwrapped first, and only when every segment
         closes — otherwise it is wrapped as it came."""
         assert ag.demoted_thinking("tab_flash_lite_preview", text) == demoted
+
+
+class TestToolPairing:
+    def test_a_stray_result_inside_an_open_window_is_dropped(self) -> None:
+        """A note there would sit between a call and its result, breaking the pair; omp
+        drops the stray one and still closes the window."""
+        call = {"id": "c1", "function": {"name": "f", "arguments": "{}"}}
+        paired = ag.pair_tool_results(
+            [
+                {"role": "assistant", "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "gone", "content": "stray"},
+                {"role": "user", "content": "next"},
+            ]
+        )
+
+        assert paired == [
+            {"role": "assistant", "tool_calls": [call]},
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": ag.MISSING_TOOL_RESULT,
+                "is_error": True,
+            },
+            {"role": "user", "content": "next"},
+        ]
