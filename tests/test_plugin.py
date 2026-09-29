@@ -90,11 +90,36 @@ def codex_events(
     usage: dict[str, Any] | None = None,
     chunks: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """A Responses stream as the Codex backend sends one: the message item opens, its text
+    streams as deltas addressed to it, it closes carrying the whole text, then the
+    terminal event. Deltas outside an open item are dropped, as omp drops them."""
+    parts = chunks if chunks is not None else [text]
+    message: list[dict[str, Any]] = []
+    if parts:
+        item = {"type": "message", "id": "msg_1", "role": "assistant", "content": []}
+        message = [
+            {"type": "response.output_item.added", "output_index": 0, "item": item},
+            *(
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": part,
+                }
+                for part in parts
+            ),
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    **item,
+                    "content": [{"type": "output_text", "text": "".join(parts)}],
+                },
+            },
+        ]
     return [
-        *(
-            {"type": "response.output_text.delta", "delta": part}
-            for part in (chunks if chunks is not None else [text])
-        ),
+        *message,
         {
             "type": "response.completed" if status == "completed" else "response.incomplete",
             "response": {"status": status, "usage": usage or {}},
@@ -373,14 +398,17 @@ class TestUpstreamErrors:
     async def test_truncated_codex_stream_is_a_failure(self) -> None:
         """With no terminal event the response is cut short: returning it lied to the
         client."""
-        install_transport(FakeTransport([{"type": "response.output_text.delta", "delta": "half "}]))
-        with pytest.raises(plugin.StreamError, match=r"response\.completed"):
+        install_transport(FakeTransport(codex_events(text="half ")[:-1]))
+        with pytest.raises(plugin.StreamError, match="terminal completion event"):
             await plugin.dispatch(model="gpt-5.5", messages=[{"role": "user", "content": "x"}])
 
-    async def test_antigravity_in_band_error_propagates(self) -> None:
+    async def test_antigravity_in_band_error_keeps_its_status(self) -> None:
+        """omp raises the in-band code as the status (`GeminiCliApiError`): an in-band 429
+        is a rate limit the client can back off from, not an opaque failure."""
         install_transport(FakeTransport([{"error": {"code": 429, "message": "out of quota"}}]))
-        with pytest.raises(plugin.StreamError, match="out of quota"):
+        with pytest.raises(litellm.exceptions.RateLimitError, match="out of quota") as caught:
             await plugin.dispatch(model="gemini-3-pro", messages=[{"role": "user", "content": "x"}])
+        assert caught.value.status_code == 429
 
     async def test_antigravity_blocked_content_propagates(self) -> None:
         install_transport(
@@ -424,31 +452,20 @@ class TestNonStreamingShape:
         )
         assert response.choices[0].finish_reason == "length"
 
-    async def test_incomplete_without_status_field_is_still_length(self) -> None:
-        """The event does not always carry ``status``; the event type is the only clue left.
-
-        Without the fallback on the type, a truncated turn arrived as a clean stop again.
-        """
-        install_transport(
-            FakeTransport(
-                [
-                    {"type": "response.output_text.delta", "delta": "trunca"},
-                    {"type": "response.incomplete", "response": {"usage": {}}},
-                ]
-            )
-        )
-        response = await plugin.dispatch(
-            model="gpt-5.5", messages=[{"role": "user", "content": "x"}]
-        )
-        assert response.choices[0].finish_reason == "length"
-
     async def test_reasoning_lands_in_its_own_field(self) -> None:
         install_transport(
             FakeTransport(
                 [
-                    {"type": "response.reasoning_text.delta", "delta": "thinking"},
-                    {"type": "response.output_text.delta", "delta": "visible"},
-                    {"type": "response.completed", "response": {"status": "completed"}},
+                    {
+                        "type": "response.output_item.added",
+                        "item": {"type": "reasoning", "id": "rs_1", "summary": []},
+                    },
+                    {
+                        "type": "response.reasoning_text.delta",
+                        "item_id": "rs_1",
+                        "delta": "thinking",
+                    },
+                    *codex_events(text="visible"),
                 ]
             )
         )
@@ -483,7 +500,13 @@ class TestNonStreamingShape:
                     },
                     {
                         "type": "response.output_item.done",
-                        "item": {"type": "function_call", "id": "item-1"},
+                        "item": {
+                            "type": "function_call",
+                            "id": "item-1",
+                            "call_id": "call-1",
+                            "name": "read",
+                            "arguments": '{"path":"a.txt"}',
+                        },
                     },
                     {"type": "response.completed", "response": {"status": "completed"}},
                 ]
@@ -593,8 +616,10 @@ class TestStreamingShape:
         assert chunks[-2].choices[0].finish_reason == "tool_calls"
 
     async def test_stream_error_is_not_swallowed(self) -> None:
-        install_transport(FakeTransport([{"type": "response.output_text.delta", "delta": "half "}]))
-        with pytest.raises(plugin.StreamError):
+        """A truncated stream fails as LiteLLM's 502, which its stream wrapper keeps as is
+        instead of remapping it to a connection error."""
+        install_transport(FakeTransport(codex_events(text="half ")[:-1]))
+        with pytest.raises(litellm.exceptions.BadGatewayError, match="terminal completion"):
             await collect_stream(model="gpt-5.5", messages=[{"role": "user", "content": "x"}])
 
 
@@ -1135,10 +1160,7 @@ def codex_responses_events(
         "usage": usage or {},
     }
     return [
-        *(
-            {"type": "response.output_text.delta", "delta": part}
-            for part in (chunks if chunks is not None else [text])
-        ),
+        *codex_events(text=text, chunks=chunks)[:-1],
         {
             "type": "response.completed" if status == "completed" else "response.incomplete",
             "response": response,

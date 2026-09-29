@@ -63,9 +63,37 @@ TOOL_INPUT = {"city": "Paris", "units": "metric"}
 def codex_turn(*, tool: bool) -> list[dict[str, Any]]:
     """A Responses stream as Codex sends it: reasoning summary, message text, then a
     function call whose arguments arrive in fragments."""
+    reasoning = {"type": "reasoning", "id": "rs_1", "summary": []}
+    message = {"type": "message", "id": "msg_1", "role": "assistant", "content": []}
     events: list[dict[str, Any]] = [
-        {"type": "response.reasoning_summary_text.delta", "delta": THOUGHT},
-        *({"type": "response.output_text.delta", "delta": part} for part in TEXT_PARTS),
+        {"type": "response.output_item.added", "output_index": 0, "item": reasoning},
+        {
+            "type": "response.reasoning_summary_part.added",
+            "item_id": "rs_1",
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": ""},
+        },
+        {
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_1",
+            "summary_index": 0,
+            "delta": THOUGHT,
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {**reasoning, "summary": [{"type": "summary_text", "text": THOUGHT}]},
+        },
+        {"type": "response.output_item.added", "output_index": 1, "item": message},
+        *(
+            {"type": "response.output_text.delta", "item_id": "msg_1", "delta": part}
+            for part in TEXT_PARTS
+        ),
+        {
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {**message, "content": [{"type": "output_text", "text": TEXT}]},
+        },
     ]
     if tool:
         item = {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "get_weather"}
@@ -372,7 +400,7 @@ class TestAStreamedMessagesTurnIsWhatAClientReads:
         assert len(errors) == 1, events
         assert errors[0]["type"] == "error"
         assert errors[0]["error"]["type"] == "api_error"
-        assert "response.completed" in errors[0]["error"]["message"]
+        assert "terminal completion event" in errors[0]["error"]["message"]
         assert events[0][0] == "message_start"
         assert "message_stop" not in [name for name, _ in events], "a failed turn cannot stop"
 
@@ -455,7 +483,7 @@ async def test_the_anthropic_sdk_raises_on_a_failed_stream() -> None:
     anthropic, client = sdk_client()
     install_transport(FakeTransport(codex_turn(tool=False)[:-1]))
 
-    with pytest.raises(anthropic.APIStatusError, match=r"response\.completed"):
+    with pytest.raises(anthropic.APIStatusError, match="terminal completion event"):
         async with client.messages.stream(model=CODEX, **REQUEST) as stream:
             await stream.get_final_message()
     await client.close()

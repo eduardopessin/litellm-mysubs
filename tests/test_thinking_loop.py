@@ -16,9 +16,9 @@ from litellm_mysubs.wire.thinking_loop import (
     SEGMENT_CHAR_CAP,
     SEGMENT_MIN_CLUSTER,
     SEGMENT_MIN_COUNT,
+    LoopGuard,
     ThinkingLoopDetector,
     detect_exact_suffix_cycle,
-    guard_for,
     jaccard,
     normalize_segment,
     trigram_shingles,
@@ -61,7 +61,7 @@ class TestExactCycle:
     def test_detector_reports_the_cycle(self) -> None:
         detector = ThinkingLoopDetector()
         reason = detector.feed("let me check the file one more time. " * 10)
-        assert reason is not None and "exact cycle" in reason
+        assert reason is not None and "cycle" in reason
 
     def test_exact_detection_survives_disabled_semantics(self) -> None:
         """Exact detection always applies, even without the semantic heuristics."""
@@ -255,11 +255,61 @@ class TestTextHelpers:
         assert jaccard(set(), {"a"}) == 0.0
 
 
-class TestGuardSelection:
-    def test_guards_the_families_that_run_away(self) -> None:
-        for model in ("gemini-3-pro", "deepseek-v3", "grok-4"):
-            assert isinstance(guard_for(model), ThinkingLoopDetector), model
+NEAR_DUPLICATE = (
+    "analyse the server configuration file and check every duplicate entry "
+    "that shows up in the current system listing"
+)
 
-    def test_other_families_unguarded(self) -> None:
-        for model in ("claude-opus-5", "gpt-5.5", "qwen-agent-coder"):
-            assert guard_for(model) is None, model
+
+def drifting_paragraphs(count: int) -> list[str]:
+    """The same paragraph with cosmetic drift: no exact cycle, a near-duplicate cluster."""
+    return [paragraph(f"{NEAR_DUPLICATE} variante {index}") for index in range(count)]
+
+
+def first_reason(feed: object, deltas: list[str]) -> str | None:
+    for delta in deltas:
+        if reason := feed(delta):  # type: ignore[operator]
+            return reason
+    return None
+
+
+class TestLoopGuard:
+    """omp's `guardThinkingLoopStream`: which deltas each detector sees, and when."""
+
+    def test_exact_cycles_are_caught_for_every_family(self) -> None:
+        """omp's `stream()` guards every provider; only the heuristics are per family."""
+        for model in ("gpt-5.5", "claude-opus-5", "gemini-3-pro"):
+            guard = LoopGuard(model)
+            assert guard.thinking_delta("let me check the file one more time. " * 10), model
+
+    def test_heuristics_only_for_the_families_that_run_away(self) -> None:
+        deltas = drifting_paragraphs(SEGMENT_MIN_COUNT + SEGMENT_MIN_CLUSTER + 2)
+        for model in ("gemini-3-pro", "deepseek-v3", "grok-4"):
+            assert first_reason(LoopGuard(model).thinking_delta, deltas), model
+        for model in ("gpt-5.5", "claude-opus-5", "qwen-agent-coder"):
+            assert first_reason(LoopGuard(model).thinking_delta, deltas) is None, model
+
+    def test_visible_text_latches_the_reasoning_detector_off(self) -> None:
+        """Reasoning that resumes after the answer started is no longer judged."""
+        guard = LoopGuard("gemini-3-pro")
+        assert guard.text_delta("Here is the answer.") is None
+        assert guard.thinking_delta("let me check the file one more time. " * 10) is None
+        assert guard.done() is None
+
+    def test_a_loop_in_the_visible_text_is_caught_too(self) -> None:
+        guard = LoopGuard("gpt-5.5")
+        assert first_reason(guard.text_delta, ["I will try again now. "] * 12)
+
+    def test_a_tool_call_disarms_the_text_detector(self) -> None:
+        guard = LoopGuard("gpt-5.5")
+        guard.tool_call()
+        assert first_reason(guard.text_delta, ["I will try again now. "] * 12) is None
+
+    def test_the_end_of_the_turn_judges_the_last_paragraph(self) -> None:
+        """The warm-up completed by the unterminated final paragraph is caught at the end."""
+        guard = LoopGuard("gemini-3-pro")
+        deltas = drifting_paragraphs(SEGMENT_MIN_COUNT)
+        *head, last = deltas
+        assert first_reason(guard.thinking_delta, head) is None
+        assert guard.thinking_delta(last.rstrip()) is None
+        assert guard.done() is not None

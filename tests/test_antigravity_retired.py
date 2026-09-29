@@ -212,10 +212,12 @@ class TestNonStreaming:
         response = await complete()
         assert content_of(response) == RETIREMENT_NOTICE
 
-    async def test_an_empty_answer_with_zero_usage_comes_through(self) -> None:
+    async def test_an_empty_answer_with_zero_usage_is_not_a_retirement(self) -> None:
+        """It fails as omp's empty response instead, with no model to point at."""
         install(gemini_events(text="", usage=DEAD_USAGE))
-        response = await complete()
-        assert content_of(response) == ""
+        with pytest.raises(plugin.StreamError, match="empty response") as caught:
+            await complete()
+        assert not isinstance(caught.value, ModelRetiredError)
 
     async def test_a_live_model_answers(self) -> None:
         """`gemini-3.5-flash-lite` lives in the same family as the dead ones: if the guard
@@ -257,10 +259,11 @@ class TestStreaming:
             str(chunk.choices[0].delta.content or "") for chunk in chunks
         )
 
-    async def test_an_empty_answer_with_zero_usage_streams(self) -> None:
+    async def test_an_empty_answer_with_zero_usage_is_not_a_retirement(self) -> None:
         install(gemini_events(text="", usage=DEAD_USAGE))
-        chunks = await stream()
-        assert "".join(str(chunk.choices[0].delta.content or "") for chunk in chunks) == ""
+        with pytest.raises(Exception, match="empty response") as caught:
+            await stream()
+        assert not isinstance(caught.value, ModelRetiredError)
 
 
 class TestSplitNotice:

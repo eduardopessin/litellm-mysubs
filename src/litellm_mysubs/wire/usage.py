@@ -167,37 +167,3 @@ def google_stop_reason(reason: object) -> StopReason:
     if reason == "MAX_TOKENS":
         return "length"
     return "error"
-
-
-# omp: providers/google-gemini-cli.ts :: streamGoogleGeminiCli
-# omp: providers/openai-chat-server.ts :: mapFinishReason
-def google_finish_reason(raw: object, has_tool_calls: bool) -> str:
-    """The chat finish reason for ``candidates[0].finishReason``.
-
-    Only a benign finish is upgraded by a trailing tool call — a blocked turn stays an
-    error even when earlier chunks carried valid calls. An error finish never reaches a
-    client through here: `_AntigravityReader.close` raises it, as omp's provider throws
-    it, and each route answers with its error shape. What falls through for one is omp's
-    `mapFinishReason` default. A turn with no ``finishReason`` at all reads as a stop.
-    """
-    mapped = google_stop_reason(raw) if raw else "stop"
-    if mapped != "error" and has_tool_calls:
-        return "tool_calls"
-    return "length" if mapped == "length" else "stop"
-
-
-# omp: providers/openai-shared.ts :: mapOpenAIResponsesStopReason
-# omp: providers/openai-shared.ts :: promoteResponsesToolUseStopReason
-def codex_finish_reason(status: object, has_tool_calls: bool) -> str:
-    """``incomplete`` is truncation by the output limit; any other status a stop.
-
-    Without this a cut-off response reached the client as a clean ``stop``. ``failed``
-    and ``cancelled`` arrive as ``response.failed``, which `_CodexReader` raises. A turn
-    with tool calls hands them back even when truncated. omp promotes an incomplete turn
-    only when every call's arguments closed and ``incomplete_details.reason`` is
-    ``max_output_tokens``; the first half holds here because `_CodexReader` records a
-    call only on its ``output_item.done``, the reason is not carried to this point.
-    """
-    if has_tool_calls:
-        return "tool_calls"
-    return "length" if status == "incomplete" else "stop"
