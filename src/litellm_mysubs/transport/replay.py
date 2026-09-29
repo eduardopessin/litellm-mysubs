@@ -127,7 +127,8 @@ def is_codex_progress(event: dict[str, Any]) -> bool:
 def is_retryable_codex_failure(event: dict[str, Any]) -> bool:
     """A ``response.failed``/``error`` the backend itself calls transient."""
     response = _dict(event.get("response"))
-    error = _dict(event.get("error")) or _dict(response.get("error"))
+    # `event.error ?? event.response?.error`: an empty object still wins.
+    error = event["error"] if isinstance(event.get("error"), dict) else _dict(response.get("error"))
     code = _first(_str(error.get("code")), _str(error.get("type")), _str(event.get("code")))
     if code and code.lower() in CODEX_RETRYABLE_EVENT_CODES:
         return True
@@ -144,9 +145,9 @@ def is_retryable_codex_failure(event: dict[str, Any]) -> bool:
 def _item_text(item: dict[str, Any]) -> bool:
     """Whether a finished message or reasoning item carries any text of its own."""
     for key in ("content", "summary"):
-        for part in item.get(key) or ():
-            part = _dict(part)
-            if _str(part.get("text")) or _str(part.get("refusal")):
+        parts = item.get(key)
+        for part in parts if isinstance(parts, list) else ():
+            if _str(_dict(part).get("text")) or _str(_dict(part).get("refusal")):
                 return True
     return False
 
@@ -189,16 +190,20 @@ def codex_verdict(event: dict[str, Any]) -> Verdict:
 GOOGLE_OK_FINISHES: Final = ("STOP", "MAX_TOKENS")
 
 
+def _candidate(event: dict[str, Any]) -> dict[str, Any]:
+    """``candidates[0]``, the only one omp reads."""
+    candidates = _dict(event.get("response")).get("candidates")
+    return _dict(candidates[0]) if isinstance(candidates, list) and candidates else {}
+
+
 def _google_parts(event: dict[str, Any]) -> list[dict[str, Any]]:
-    candidates = _dict(event.get("response")).get("candidates") or []
-    candidate = _dict(candidates[0]) if candidates else {}
-    return [_dict(part) for part in _dict(candidate.get("content")).get("parts") or ()]
+    parts = _dict(_candidate(event).get("content")).get("parts")
+    return [_dict(part) for part in parts] if isinstance(parts, list) else []
 
 
 def google_finish(event: dict[str, Any]) -> str | None:
     """The event's ``finishReason``, if it carries one."""
-    candidates = _dict(event.get("response")).get("candidates") or []
-    return _str(_dict(candidates[0]).get("finishReason")) if candidates else None
+    return _str(_candidate(event).get("finishReason"))
 
 
 # omp: providers/google-shared.ts :: isThinkingPart
