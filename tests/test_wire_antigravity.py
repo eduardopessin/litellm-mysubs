@@ -677,3 +677,25 @@ class TestTools:
     def test_no_tools_means_no_config(self) -> None:
         body = payload([{"role": "user", "content": "x"}])
         assert "tools" not in body["request"] and "toolConfig" not in body["request"]
+
+
+class TestDemotedThinking:
+    @pytest.mark.parametrize(
+        ("text", "demoted"),
+        [
+            ("plain", "<thinking>\nplain\n</thinking>"),
+            ("  <thinking>a</thinking>  ", "<thinking>\na\n</thinking>"),
+            (
+                "<thinking>\n a \n</thinking>\n<thinking>b</thinking>",
+                "<thinking>\na\nb\n</thinking>",
+            ),
+            ("<thinking><thinking>n</thinking></thinking>", "<thinking>\nn\n</thinking>"),
+            ("<thinking>open only", "<thinking>\n<thinking>open only\n</thinking>"),
+            ("<thinking>a</thinking> tail", "<thinking>\n<thinking>a</thinking> tail\n</thinking>"),
+        ],
+    )
+    def test_the_xml_fallback_does_not_wrap_twice(self, text: str, demoted: str) -> None:
+        """omp 18.4.4 ``renderDelimitedThinking`` outputs for a model with no dialect of its
+        own: reasoning already in the tags is unwrapped first, and only when every segment
+        closes — otherwise it is wrapped as it came."""
+        assert ag.demoted_thinking("tab_flash_lite_preview", text) == demoted

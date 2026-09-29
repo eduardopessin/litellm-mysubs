@@ -478,3 +478,51 @@ class TestSystemAndSampling:
         generation = transport.specs[0].body["request"]["generationConfig"]
         assert generation["topK"] == 40
         assert generation["temperature"] == 0.2
+
+
+class TestReplayedReasoning:
+    @pytest.mark.parametrize(
+        ("model", "demoted"),
+        [
+            pytest.param(GEMINI, "```thinking\nCheck the sky.\n```", id="gemini"),
+            pytest.param(CLAUDE, "Check the sky.", id="claude"),
+            pytest.param(GPT_OSS, "<think>\nCheck the sky.\n</think>", id="gpt-oss"),
+        ],
+    )
+    async def test_reasoning_sent_back_leads_the_model_turn_as_text(
+        self, client: openai.AsyncOpenAI, model: str, demoted: str
+    ) -> None:
+        """omp's chat server keeps an assistant's ``reasoning_content`` and, toward another
+        API, demotes it to text in the target's own thinking form — a replayed unsigned
+        ``thought`` part is discarded by Gemini. Dropping it lost the reasoning the client
+        chose to send back."""
+        request = await chat_request(
+            client,
+            model,
+            [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": "Sunny.", "reasoning_content": "Check the sky."},
+                {"role": "user", "content": "sure?"},
+            ],
+        )
+
+        assert request["contents"][1] == {
+            "role": "model",
+            "parts": [{"text": demoted}, {"text": "Sunny."}],
+        }
+
+    async def test_reasoning_alone_loses_its_trailing_whitespace(
+        self, client: openai.AsyncOpenAI
+    ) -> None:
+        """Anthropic refuses a final assistant text that ends in whitespace."""
+        request = await chat_request(
+            client,
+            CLAUDE,
+            [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": None, "reasoning_content": "Look outside. \n"},
+                {"role": "user", "content": "and?"},
+            ],
+        )
+
+        assert request["contents"][1] == {"role": "model", "parts": [{"text": "Look outside."}]}

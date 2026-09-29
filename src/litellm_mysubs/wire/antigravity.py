@@ -390,6 +390,77 @@ def content_parts(
     return parts
 
 
+_ASCII_SPACE: Final = " \t\n\v\f\r"
+
+
+# omp: dialect/rendering.ts :: findDelimitedThinkingClose
+def _find_thinking_close(open_: str, close: str, text: str, start: int, end: int) -> int:
+    depth = 1
+    cursor = start
+    while cursor < end:
+        next_close = text.find(close, cursor)
+        if next_close < 0 or next_close >= end:
+            return -1
+        next_open = text.find(open_, cursor)
+        if 0 <= next_open < next_close:
+            depth += 1
+            cursor = next_open + len(open_)
+            continue
+        depth -= 1
+        if depth == 0:
+            return next_close
+        cursor = next_close + len(close)
+    return -1
+
+
+# omp: dialect/rendering.ts :: unwrapDelimitedThinking
+def _unwrap_thinking(open_: str, close: str, text: str) -> str:
+    """Reasoning already wrapped in the target's tags, unwrapped so it is not wrapped twice."""
+    end = len(text.rstrip(_ASCII_SPACE))
+    cursor = len(text) - len(text.lstrip(_ASCII_SPACE))
+    if cursor >= end or not text.startswith(open_, cursor):
+        return text
+    segments: list[str] = []
+    while cursor < end:
+        if not text.startswith(open_, cursor):
+            return text
+        inner_start = cursor + len(open_)
+        inner_end = _find_thinking_close(open_, close, text, inner_start, end)
+        if inner_end < 0:
+            return text
+        inner = text[inner_start:inner_end].strip(_ASCII_SPACE)
+        segments.append(_unwrap_thinking(open_, close, inner))
+        rest = text[inner_end + len(close) : end]
+        cursor = end - len(rest.lstrip(_ASCII_SPACE))
+    return "\n".join(segments)
+
+
+# omp: dialect/demotion.ts :: renderDemotedThinking
+# omp: dialect/gemini.ts :: renderThinking
+# omp: dialect/xml.ts :: renderThinking
+def demoted_thinking(model: str, text: str) -> str:
+    """Prior-turn reasoning as text in the target model's own thinking form.
+
+    omp's reasoning: a replayed unsigned ``thought`` part is accepted and silently discarded
+    — "verified end-to-end against Gemini 3" — so reasoning a client sends back survives
+    only as text, wrapped the way the model writes its own so it reads as reasoning and not
+    as prose to imitate. Claude gets it bare: Anthropic's classifier refuses or leaks
+    reasoning replayed inside thinking tags. ``gpt-oss`` (Harmony) gets a plain ``<think>``
+    block, Gemini its ``thinking`` code fence, anything else omp's XML fallback.
+    """
+    if not text:
+        return ""
+    text = well_formed(text)
+    name = str(model).split("/")[-1].lower()
+    if is_claude(name):
+        return text
+    if name.startswith("gpt-oss"):
+        return f"<think>\n{text}\n</think>"
+    if name.startswith("gemini-"):
+        return f"```thinking\n{text}\n```"
+    return f"<thinking>\n{_unwrap_thinking('<thinking>', '</thinking>', text)}\n</thinking>"
+
+
 # -- tools ---------------------------------------------------------------------
 
 
@@ -789,6 +860,13 @@ def build_payload(
         parts = content_parts(content, fetch, supports_images=supports_images)
 
         if role == "assistant":
+            # omp: providers/openai-chat-server.ts :: buildAssistantMessage
+            # omp: providers/transform-messages.ts :: transformMessages
+            # Reasoning the client sends back leads the turn as text (`demoted_thinking`).
+            reasoning = message.get("reasoning_content")
+            demoted = isinstance(reasoning, str) and bool(reasoning.strip())
+            if demoted:
+                parts.insert(0, {"text": demoted_thinking(model, str(reasoning))})
             # The sentinel is per **turn**, not per request: the CCA requires it whenever the
             # first call of an assistant turn goes without a signature. Marking it only once
             # left later turns with bare calls and a 400 at validation.
@@ -825,6 +903,10 @@ def build_payload(
                     part["thoughtSignature"] = SIGNATURE_SENTINEL
                 first_tool_call = False
                 parts.append(part)
+            if demoted and len(parts) == 1:
+                # As the turn's last block it loses its trailing whitespace: Anthropic
+                # refuses a final assistant text that ends in whitespace.
+                parts[0]["text"] = parts[0]["text"].rstrip()
             if parts:
                 contents.append({"role": "model", "parts": parts})
             continue
@@ -905,6 +987,7 @@ __all__ = [
     "call_arguments",
     "content_parts",
     "declared_output_tokens",
+    "demoted_thinking",
     "function_calling_config",
     "inline_part",
     "is_retired_response",
