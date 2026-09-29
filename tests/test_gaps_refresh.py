@@ -209,7 +209,11 @@ class TestRenewalThatFails:
         """Expired token, and the OAuth endpoint refuses the refresh token. The request
         still goes out once with the token there is — a clock skew is not proof it is dead
         — and the upstream's own refusal is what the client reads. One attempt: retrying a
-        credential the server rejects is a loop of rejections at network speed."""
+        credential the server rejects is a loop of rejections at network speed.
+
+        `invalid_grant` means the grant is dead, so the credential is dropped, as omp
+        disables the row: the refresh token is presented exactly once, not again on the 401
+        and not again by every sweep after it."""
         credential = expired()
         store = OwningStore({"openai-codex": credential})
         hosts = Hosts(rejected)
@@ -219,8 +223,8 @@ class TestRenewalThatFails:
             await ask(CODEX, stream=stream)
 
         assert hosts.bearers == ["Bearer AT-old"]
-        assert hosts.token_calls >= 1
-        assert store.get("openai-codex") == credential
+        assert hosts.token_calls == 1
+        assert store.get("openai-codex") is None
 
     async def test_a_source_that_cannot_be_reread_still_surfaces_the_401(
         self, stream: bool, monkeypatch: pytest.MonkeyPatch

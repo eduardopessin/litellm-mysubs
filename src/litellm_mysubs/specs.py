@@ -21,6 +21,7 @@ from typing import Any, Final
 import httpx
 import litellm
 
+from .credentials import refresher
 from .credentials.store import CredentialStore, ProviderId
 from .transport import hosts
 from .transport.client import RequestSpec, Transport
@@ -107,53 +108,27 @@ def _transport() -> Transport:
 
 
 async def _refresh(provider: str) -> str | None:
-    """Renews the credential after a 401.
+    """The token to retry with after a 401.
 
-    Two steps, in this order:
-
-    1. **Re-read the source.** Another process — another proxy worker, the dashboard — may
-       have rotated the token in the meantime. If the read already brings a token different
-       from the one that failed, it is done, and the refresh token is not spent.
-    2. **Renew**, but only if this store is the owner. Single-use rotating tokens do not
-       tolerate two renewers: the rule is at the top of `credentials/store.py`, and a store
-       with `owns_refresh=False` reads and never exchanges.
+    `refresher.recover` decides, in omp's order: a token another worker already put in the
+    store wins, a token this process minted moments ago is reused, and only otherwise is the
+    refresh token spent — under the cross-process lock, and only by a store that owns it.
 
     A failure here returns `None`, which the transport translates into the upstream's real
     error. It does not raise: the original 401 is more informative than "I failed to
-    renew".
+    renew" — and a store whose source cannot be re-read (a vault that does not answer, a
+    file caught mid-write) must not replace the upstream's refusal with its own error.
     """
     store = _state.store
     if store is None:
         return None
-
-    provider_id = _PROVIDER_IDS[provider]
     try:
-        store.reload()
-        credential = store.get(provider_id)
-    except Exception:
-        # The re-read failing — a vault that does not answer, a file caught mid-write —
-        # is a failure like any other here. Raised, it replaced the upstream's 401 with the
-        # store's own error, on a request the upstream had refused for its own reason.
-        return None
-    if credential is None:
-        return None
-    if not credential.is_expired():
-        # The re-read brought something still usable: another process already renewed.
-        return credential.access_token
-
-    if not getattr(store, "owns_refresh", False) or not credential.refresh_token:
-        return None
-
-    try:
-        from .credentials import oauth
-
-        async with httpx.AsyncClient() as client:
-            renewed = await oauth.refresh(credential, client=client, store=store)
+        credential = await refresher.recover(
+            store, _PROVIDER_IDS[provider], client_factory=httpx.AsyncClient
+        )
     except Exception:
         return None
-
-    store.set(provider_id, renewed)
-    return renewed.access_token
+    return credential.access_token if credential is not None else None
 
 
 _PROVIDER_IDS: Final[dict[str, ProviderId]] = {
@@ -171,8 +146,10 @@ async def _access_token(provider: str) -> str:
     retries what it has not yet delivered, and a 401 after the first event is not
     recoverable.
 
-    `Credential.is_expired` already carries 60 seconds of slack: the token is renewed while
-    it still works, so there is no window between the check and the request.
+    `refresher.fresh` renews a token within a minute of expiry (omp's
+    `OAUTH_REFRESH_SKEW_MS`), while it still works, so there is no window between the check
+    and the request; the renewal is shared with any other request of this worker that needs
+    it, and locked against every other worker.
 
     No token at all is refused before anything is built, as omp refuses a request with no
     key: a Codex or Antigravity request went out with ``Authorization: Bearer `` — which
@@ -183,11 +160,11 @@ async def _access_token(provider: str) -> str:
     call without a key.
     """
     store = _state.store
-    credential = store.get(_PROVIDER_IDS[provider]) if store is not None else None
-    if credential is not None and credential.is_expired():
-        renewed = await _refresh(provider)
-        if renewed:
-            return renewed
+    credential = (
+        await refresher.fresh(store, _PROVIDER_IDS[provider], client_factory=httpx.AsyncClient)
+        if store is not None
+        else None
+    )
     token = credential.access_token if credential is not None else ""
     if not token and provider != "anthropic":
         # omp: error/auth.ts :: MissingApiKeyError

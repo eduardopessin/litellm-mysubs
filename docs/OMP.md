@@ -93,6 +93,7 @@ Where we do not follow OMP, and why. Each one was measured against the real serv
 | Reasoning loop | *retryable* error, the retry layer asks again | raises | There is no replay-safe window here: `reasoning_content` has already been flushed to the client before detection, and retrying duplicated it in the same stream. |
 | `-thinking` variants | strippable | only `gemini-2.5-flash-thinking` | `gemini-3.7/3.8-flash-thinking` do not exist upstream; stripping them silently served `-low` for an invented name. |
 | Unserved name | falls back to a nearby model | raises | Answering with a different model makes billing and comparisons lie, and the client never knows. |
+| Background renewal | one broker refreshes the store; each sweep renewal is forced and waits for the refresh lease (`auth-broker/refresher.ts`) | every worker sweeps; freshness is re-checked inside the lock and a busy lock is skipped | LiteLLM runs `--num_workers` processes, each with its own sweep: forcing would rotate the token once per worker per cycle. Measured with four workers (DECISIONS D8): one lock file, one new token, no `invalid_grant`. |
 
 ## Divergences corrected by comparing against the source
 
