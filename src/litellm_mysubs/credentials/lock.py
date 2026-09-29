@@ -18,11 +18,12 @@ the kernel, which is the only place the N processes share.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import ModuleType
 
@@ -158,3 +159,48 @@ def file_lock(path: Path, *, timeout_s: float = 0.0) -> Iterator[None]:
     else:
         with _flock_guard(path, timeout_s, fcntl_mod):
             yield
+
+
+@asynccontextmanager
+async def async_file_lock(
+    path: Path, *, timeout_s: float, poll_s: float = _MAX_POLL_S
+) -> AsyncIterator[None]:
+    """`file_lock` for coroutines: the same lock file, but the wait yields to the loop.
+
+    The request path has to *wait* for a peer that is renewing, and adopt what it wrote,
+    instead of giving up like the periodic sweep does. Waiting with `time.sleep` would
+    freeze the whole worker — including the coroutine of this very process that holds the
+    lock and needs the loop to finish its exchange and release it.
+
+    Same file and same `flock` as `file_lock`, so the two exclude each other, across
+    processes and across coroutines of one process alike (each acquisition opens its own
+    descriptor, and `flock` arbitrates per open file description).
+    """
+    fcntl_mod = _FCNTL
+    deadline = time.monotonic() + timeout_s
+    if fcntl_mod is None:  # pragma: no cover - Windows only
+        key = os.path.abspath(_lock_path(path))
+        with _THREAD_LOCKS_GUARD:
+            lock = _THREAD_LOCKS.setdefault(key, threading.Lock())
+        while not lock.acquire(blocking=False):
+            if time.monotonic() >= deadline:
+                raise LockBusyError(f"lock held by another task: {_lock_path(path)}")
+            await asyncio.sleep(poll_s)
+        try:
+            yield
+        finally:
+            lock.release()
+        return
+    fd = _open_lock_file(path)
+    try:
+        while not _try_acquire(fd, fcntl_mod):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LockBusyError(f"lock still held after {timeout_s:g}s: {_lock_path(path)}")
+            await asyncio.sleep(min(poll_s, remaining))
+        try:
+            yield
+        finally:
+            fcntl_mod.flock(fd, fcntl_mod.LOCK_UN)
+    finally:
+        os.close(fd)
