@@ -202,15 +202,26 @@ FALLBACK_CREDIT_BETA: Final = "fallback-credit-2026-06-01"
 # omp= extendedCacheTtlBeta = "extended-cache-ttl-2025-04-11"
 #: Added when some anchor carries `ttl: "1h"`.
 EXTENDED_CACHE_TTL_BETA: Final = "extended-cache-ttl-2025-04-11"
+# omp: providers/anthropic-wire.ts :: THINKING_BINDING_CONTROLS_BETA
+# omp= THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08-01"
+#: Added on models that bind signed thinking to its conversation prefix
+#: (`binds_thinking_prefix`), for ``thinking.block_binding``.
+THINKING_BINDING_BETA: Final = "thinking-binding-controls-2026-08-01"
 
 
 # omp: providers/anthropic.ts :: buildClaudeCodeBetas
-def build_betas(*, thinking: bool) -> str:
+# omp: providers/anthropic.ts :: resolveAnthropicControlBetas
+def build_betas(*, thinking: bool, binding: bool = False) -> str:
     """``anthropic-beta`` header for an agent request."""
     betas = [*AGENT_BETAS]
     if thinking:
         betas.append(EFFORT_BETA)
     betas.append(FALLBACK_CREDIT_BETA)
+    # Of omp's per-model control betas only the binding one travels. The other three
+    # (turn-scoped system, mid-conversation tool changes, per-message effort) enable
+    # mid-conversation control messages that LiteLLM's transformation cannot produce.
+    if binding:
+        betas.append(THINKING_BINDING_BETA)
     # The extended-cache-TTL beta does NOT travel on the OAuth path. OMP only adds it when
     # `!isOAuth` (`providers/anthropic.ts`), and `getCacheControl` shows why: for OAuth the
     # default is already `ttl: "1h"` on models that support it, with no beta at all.
@@ -356,6 +367,22 @@ def supports_between_tools_thinking(model: str) -> bool:
     up-front thinking, progress updates between tool calls only.
     """
     return _is_revision(model, "sonnet", (5, 5), (6, 0))
+
+
+# omp: compat/rules/classes/anthropic.kdl :: family
+# omp: compat/resolve.ts :: resolveThinkingPolicy
+def binds_thinking_prefix(model: str) -> bool:
+    """Whether signed thinking is bound to the exact preceding conversation, and the model
+    takes ``thinking.block_binding`` to say what happens when a replay no longer matches.
+
+    omp's catalog: Fable from 5.1 and, since 18.4.4, Sonnet 5.5 (`thinking-prefix-binding`
+    with `supports-thinking-binding-controls` on the Claude API). omp then asks for
+    ``prefix_mismatch_behavior: "drop_block"``: a stale signed block is dropped instead of
+    failing the turn with 400 "Invalid `signature` in `thinking` block".
+    """
+    return _is_revision(model, "fable", (5, 1), (99, 0)) or _is_revision(
+        model, "sonnet", (5, 5), (6, 0)
+    )
 
 
 def normalize_effort(value: object) -> tuple[str | None, str | None]:
@@ -1162,6 +1189,13 @@ def apply_thinking_params(
     elif isinstance(kwargs.get("thinking"), dict) and supports_display(model):
         kwargs["thinking"]["display"] = show
 
+    if binds_thinking_prefix(model) and isinstance(kwargs.get("thinking"), dict):
+        # omp's `prefixMismatchBehavior`: the caller's own binding, else `drop_block`.
+        bound = thinking.get("block_binding") if isinstance(thinking, dict) else None
+        kwargs["thinking"]["block_binding"] = (
+            bound if isinstance(bound, dict) else {"prefix_mismatch_behavior": "drop_block"}
+        )
+
     fit_output_ceiling(kwargs, budget=budget, ceiling=ceiling)
     return kwargs
 
@@ -1346,7 +1380,9 @@ def build_request(
         # The effort beta travels with the effort field (see `_wants_effort_beta`); the
         # extended-TTL one follows the retention that this request's anchors actually
         # carry.
-        headers["anthropic-beta"] = build_betas(thinking=_wants_effort_beta(kwargs, model))
+        headers["anthropic-beta"] = build_betas(
+            thinking=_wants_effort_beta(kwargs, model), binding=binds_thinking_prefix(model)
+        )
 
     apply_thinking_params(kwargs, model, ceiling=output_ceiling)
     if not native_system and kwargs.get("thinking"):

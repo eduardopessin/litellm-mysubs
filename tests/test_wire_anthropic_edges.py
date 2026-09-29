@@ -281,3 +281,51 @@ class TestThinkingEdges:
     def test_no_thinking_returns_early(self) -> None:
         kwargs: dict[str, Any] = {"messages": []}
         assert ant.apply_thinking_params(kwargs, "claude-opus-5") is kwargs
+
+
+class TestThinkingPrefixBinding:
+    """Fable 5.1+ and Sonnet 5.5 bind signed thinking to the exact preceding conversation;
+    omp asks them to drop a stale block (`drop_block`) instead of failing the turn."""
+
+    @pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-fable-5-1"])
+    def test_a_bound_model_drops_a_stale_block_with_its_beta(self, model: str) -> None:
+        out = ant.build_request({"messages": [], "reasoning_effort": "high"}, model, "tok")
+
+        assert out["thinking"]["block_binding"] == {"prefix_mismatch_behavior": "drop_block"}
+        assert ant.THINKING_BINDING_BETA in out["extra_headers"]["anthropic-beta"]
+
+    def test_the_clients_own_binding_is_kept(self) -> None:
+        """A Messages client may ask for `error` instead; rebuilding its adaptive block used
+        to drop the field."""
+        binding = {"prefix_mismatch_behavior": "error"}
+        out = ant.apply_thinking_params(
+            {"thinking": {"type": "adaptive", "block_binding": binding}}, "claude-sonnet-5-5"
+        )
+
+        assert out["thinking"]["block_binding"] == binding
+
+    @pytest.mark.parametrize("model", ["claude-opus-5", "claude-fable-5", "claude-sonnet-5"])
+    def test_an_unbound_model_gets_neither(self, model: str) -> None:
+        out = ant.build_request({"messages": [], "reasoning_effort": "high"}, model, "tok")
+
+        assert "block_binding" not in out["thinking"]
+        assert ant.THINKING_BINDING_BETA not in out["extra_headers"]["anthropic-beta"]
+
+
+class TestModelRevisions:
+    def test_a_dated_build_is_its_family_revision(self) -> None:
+        """`claude-sonnet-5-5-20261001` is Sonnet 5.5, and a dated Opus 5 is not 5.5."""
+        dated = ant.apply_thinking_params({}, "claude-sonnet-5-5-20261001")
+        opus = ant.apply_thinking_params(
+            {"tool_choice": "required"}, "claude-opus-5-20260101"
+        )
+
+        assert dated["thinking"] == {"type": "between_tools"}
+        assert opus["tool_choice"] == "required"
+
+    def test_a_separator_collapsed_id_is_not_read_as_5_5(self) -> None:
+        """omp bounds the 5.5 rules below 6 because `claude-opus-45` (Opus 4.5) parses as
+        revision 45: an open bound would take forced tool use away from it."""
+        out = ant.apply_thinking_params({"tool_choice": "required"}, "claude-opus-45")
+
+        assert out["tool_choice"] == "required"
