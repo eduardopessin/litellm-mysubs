@@ -93,6 +93,11 @@ Where we do not follow OMP, and why. Each one was measured against the real serv
 | Reasoning loop | *retryable* error, the retry layer asks again | raises | There is no replay-safe window here: `reasoning_content` has already been flushed to the client before detection, and retrying duplicated it in the same stream. |
 | `-thinking` variants | strippable | only `gemini-2.5-flash-thinking` | `gemini-3.7/3.8-flash-thinking` do not exist upstream; stripping them silently served `-low` for an invented name. |
 | Unserved name | falls back to a nearby model | raises | Answering with a different model makes billing and comparisons lie, and the client never knows. |
+| Antigravity output ceiling | the wire profile's fixed `maxOutputTokens` overwrites the caller's (`preserves-max-output-tokens #false`) | the caller's `max_tokens`, lowered only to the catalog's declared ceiling | A client's ceiling is part of its request; raising it bills output nobody asked for. The 400s measured with small Claude ceilings named the thinking budget (`max_tokens` must be greater than `thinking.budget_tokens`; `budget_tokens >= 1024`), and fitting the budget under the ceiling answers them. |
+| Antigravity `thinkingConfig` | omitted when no reasoning is asked for (unless `thinking-suppress-when-off`) | always sent | Omitted, the CCA reapplies the per-id server default and bills thinking tokens without returning the text. |
+| Antigravity tool-result images | a following user turn (chat gateway; Gemini < 3) | inside `functionResponse.parts` for every model | Measured: every generation the account serves (gemini-3.8-flash, 3.1-pro, 3.1-flash-lite, 2.5-flash, 2.5-flash-lite, pro-agent) described a blue screenshot returned that way. |
+| Antigravity media by URL | `[image: <url>]` placeholder text (chat gateway, no fetcher) | fetched and inlined | `fileData` with a web URL answers 404 "Requested entity was not found"; a placeholder means the model never sees the image. |
+| Antigravity envelope | `request.labels`, `request.sessionId` | omitted | The endpoint answered 400 "Unknown name" for them (`test_fixed_envelope_fields`). |
 
 ## Divergences corrected by comparing against the source
 
