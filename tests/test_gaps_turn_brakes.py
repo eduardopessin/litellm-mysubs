@@ -12,6 +12,7 @@ of the upstream stream was consumed before the brake let go.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Iterable
 from typing import Any, Final
 
@@ -22,7 +23,7 @@ import litellm.proxy.proxy_server as proxy_server
 import openai
 import pytest
 
-from litellm_mysubs import plugin, specs
+from litellm_mysubs import plugin, routes, specs
 from litellm_mysubs.transport.client import RequestSpec
 from litellm_mysubs.wire import antigravity_models
 from tests.test_plugin import FakeTransport, codex_events, gemini_events, install_transport
@@ -103,6 +104,10 @@ def proxy(monkeypatch: pytest.MonkeyPatch) -> Iterable[None]:
     )
     monkeypatch.setattr(proxy_server, "llm_router", router)
     monkeypatch.setattr(proxy_server, "master_key", None)
+    # omp's back-off between re-samples of a looping non-streamed turn; the count of
+    # attempts is what is judged here, not the wait.
+    monkeypatch.setattr(routes, "THINKING_LOOP_RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr(routes, "WHITESPACE_LOOP_RETRY_DELAY", 0.0)
     catalog = antigravity_models.ModelCatalog()
     catalog.update({"models": {"gemini-3-pro-high": {}, "gemini-3-flash": {}}})
     monkeypatch.setattr(specs._state, "catalog", catalog)
@@ -169,10 +174,13 @@ class TestCodexWhitespaceLoop:
         )
         install_transport(transport)
 
-        with pytest.raises(openai.APIError, match="whitespace loop"):
+        with pytest.raises(openai.APIError, match="whitespace-only tool-call argument"):
             await answer(CODEX, stream=stream)
 
-        assert transport.pulled <= len(tool_call_opening()) + WHITESPACE_EVENT_LIMIT + 1
+        # A whole turn is replayed twice first, as omp does; a streamed one is not.
+        attempts = len(transport.specs)
+        assert attempts == (1 if stream else 1 + routes.WHITESPACE_LOOP_RETRY_LIMIT)
+        assert transport.pulled <= attempts * (len(tool_call_opening()) + WHITESPACE_EVENT_LIMIT)
         assert transport.released
 
     async def test_a_few_huge_whitespace_deltas_are_cut_by_size(self, stream: bool) -> None:
@@ -188,14 +196,16 @@ class TestCodexWhitespaceLoop:
         )
         install_transport(transport)
 
-        with pytest.raises(openai.APIError, match="whitespace loop"):
+        with pytest.raises(openai.APIError, match="whitespace-only tool-call argument"):
             await answer(CODEX, stream=stream)
 
-        assert transport.pulled <= len(tool_call_opening()) + WHITESPACE_CHAR_LIMIT // 4096 + 1
+        per_attempt = len(tool_call_opening()) + WHITESPACE_CHAR_LIMIT // 4096
+        assert transport.pulled <= len(transport.specs) * per_attempt
 
     async def test_pretty_printed_arguments_are_not_a_loop(self, stream: bool) -> None:
         """Whitespace-only deltas are normal in indented JSON; a tool call with a few of
-        them completes and reaches the client whole."""
+        them completes and reaches the client whole. The non-streamed answer carries the
+        arguments as omp re-serializes them (`JSON.stringify` of the parsed object)."""
         events = [
             *tool_call_opening()[:1],
             *(
@@ -236,7 +246,7 @@ class TestCodexWhitespaceLoop:
             arguments = calls[0].function.arguments
         await client.close()
 
-        assert arguments == '{\n  "path": "a.txt"\n}'
+        assert json.loads(arguments) == {"path": "a.txt"}
 
 
 def thought(text: str) -> dict[str, Any]:
@@ -256,10 +266,13 @@ class TestAntigravityReasoningLoop:
         )
         install_transport(transport)
 
-        with pytest.raises(openai.APIError, match="reasoning loop"):
+        with pytest.raises(openai.APIError, match="Thinking loop detected"):
             await answer(GEMINI_PRO, stream=stream)
 
-        assert transport.pulled < 100
+        # A streamed turn is not asked again: its reasoning already went out. A whole one
+        # is, as omp's `completeSimple` re-samples, up to three attempts in all.
+        assert len(transport.specs) == (1 if stream else routes.THINKING_LOOP_MAX_ATTEMPTS)
+        assert transport.pulled < 100 * len(transport.specs)
         assert transport.released
 
     async def test_reasoning_that_moves_on_is_answered(self, stream: bool) -> None:
