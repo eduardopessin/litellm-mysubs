@@ -62,6 +62,14 @@ _LITELLM_ENTRY_POINTS: Final = {
     for name in ("acompletion", "completion")
 }
 
+_CALLBACK_LISTS: Final = (
+    "callbacks",
+    "success_callback",
+    "failure_callback",
+    "_async_success_callback",
+    "_async_failure_callback",
+)
+
 
 class AnthropicHost:
     """A local server standing in for ``api.anthropic.com``: records body and headers."""
@@ -112,6 +120,11 @@ def host(monkeypatch: pytest.MonkeyPatch) -> Iterable[AnthropicHost]:
     monkeypatch.setattr(litellm, "model_cost", dict(litellm.model_cost))
     for (module, name), function in _LITELLM_ENTRY_POINTS.items():
         monkeypatch.setattr(module, name, function)
+    # Every Router appends its usage callbacks to LiteLLM's global lists, which stop taking
+    # new entries at 30 (`LoggingCallbackManager.MAX_CALLBACKS`): measured, one Router per
+    # test here left a later test's spend recorder unregistered. The lists are the test's.
+    for name in _CALLBACK_LISTS:
+        monkeypatch.setattr(litellm, name, list(getattr(litellm, name)))
     router = litellm.Router(
         model_list=[
             {
