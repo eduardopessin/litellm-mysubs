@@ -27,6 +27,13 @@ PROVIDER_IDS: Final[tuple[ProviderId, ...]] = (
     "google-antigravity",
 )
 
+# omp: auth/refresh.ts :: OAUTH_REFRESH_SKEW_MS
+#: How long before its stated expiry a token counts as due on the request path. It absorbs
+#: the request round trip and a clock skew without renewing on every request: against the
+#: providers' 1-8 h lifetimes, renewing a minute early changes the rotation cadence by a
+#: few percent.
+OAUTH_REFRESH_SKEW_S: Final = 60.0
+
 
 @dataclass(frozen=True, slots=True)
 class Credential:
@@ -43,7 +50,9 @@ class Credential:
     project_id: str = ""
     """Only Google Antigravity uses it; it is discovered at the end of the OAuth flow."""
 
-    def is_expired(self, *, now: float | None = None, leeway_s: float = 60.0) -> bool:
+    def is_expired(
+        self, *, now: float | None = None, leeway_s: float = OAUTH_REFRESH_SKEW_S
+    ) -> bool:
         """Whether the access token is no longer usable.
 
         ``expires_at`` at zero means "unknown", not "expired": a token pasted by hand
