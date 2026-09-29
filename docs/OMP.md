@@ -93,6 +93,7 @@ Where we do not follow OMP, and why. Each one was measured against the real serv
 | Reasoning loop | *retryable* error, the retry layer asks again | raises | There is no replay-safe window here: `reasoning_content` has already been flushed to the client before detection, and retrying duplicated it in the same stream. |
 | `-thinking` variants | strippable | only `gemini-2.5-flash-thinking` | `gemini-3.7/3.8-flash-thinking` do not exist upstream; stripping them silently served `-low` for an invented name. |
 | Unserved name | falls back to a nearby model | raises | Answering with a different model makes billing and comparisons lie, and the client never knows. |
+| Antigravity 429 | transient: moves to the other host, which retries it (`streamGoogleGeminiCli`) | stays on the host that answered, which gets the last host's in-place retries | Both hosts front the same account and quota: measured, the rotation turned an ~11 s failure into ~22 s with the same verdict. |
 
 ## Divergences corrected by comparing against the source
 

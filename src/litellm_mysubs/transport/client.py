@@ -415,7 +415,8 @@ class Transport:
             except StopAsyncIteration:
                 break
             except TimeoutError:
-                raise StreamTimeout(self._timeout_message(spec, first=awaiting_first)) from None
+                message = self._timeout_message(spec, first=awaiting_first)
+                raise StreamTimeout(message, request=response.request) from None
             for frame in decoder.feed(line):
                 if isinstance(frame, sse.Malformed):
                     raise frame.error
@@ -457,14 +458,12 @@ class Transport:
         attempt = 0
         while True:
             deadline = host_deadline or (loop.time() + first if first else None)
+            request = self._client.build_request(
+                "POST", url, json=dict(spec.body), headers=call.headers
+            )
             try:
                 async with asyncio.timeout_at(deadline):
-                    response = await self._client.send(
-                        self._client.build_request(
-                            "POST", url, json=dict(spec.body), headers=call.headers
-                        ),
-                        stream=True,
-                    )
+                    response = await self._client.send(request, stream=True)
                     if response.is_success:
                         return response
                     try:
@@ -473,7 +472,7 @@ class Transport:
                         await response.aclose()
             except (TimeoutError, httpx.TransportError) as error:
                 failure = (
-                    StreamTimeout(self._timeout_message(spec, first=True))
+                    StreamTimeout(self._timeout_message(spec, first=True), request=request)
                     if isinstance(error, TimeoutError)
                     else error
                 )
