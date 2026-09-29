@@ -29,6 +29,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, NamedTuple
 
+from .openai_schema import codex_tool_parameters
+
 # The ChatGPT account rejects the 5.4 family with "The 'gpt-5.4' model is not supported
 # when using Codex with a ChatGPT account".
 #
@@ -146,8 +148,12 @@ ORIGINATOR: Final = "omp"
 #:
 #: The gate is on the catalog, not only on inference: at 0.153.0 the two names are absent
 #: from the listing, so no amount of probing finds them. Reported in #2.
-# omp= wire/codex.ts :: CODEX_CLIENT_VERSION = "0.155.1"
-CLIENT_VERSION: Final = "0.155.1"
+#:
+#: omp 18.4.4 raised it to 0.159.0: the gate ignores a model's own
+#: `minimal_client_version` — GPT-6.1 Sol declares 0.153.0, yet `/models` omits it at
+#: 0.155.1 and lists it at 0.159.0 (pi-catalog `wire/codex.ts`).
+# omp= wire/codex.ts :: CODEX_CLIENT_VERSION = "0.159.0"
+CLIENT_VERSION: Final = "0.159.0"
 
 # omp: wire/codex.ts :: OPENAI_HEADER_VALUES
 BETA_RESPONSES: Final = "responses=experimental"
@@ -331,6 +337,18 @@ HEADER_INSTALLATION_ID: Final = "x-codex-installation-id"
 HEADER_WINDOW_ID: Final = "x-codex-window-id"
 HEADER_TURN_METADATA: Final = "x-codex-turn-metadata"
 
+# omp: providers/openai-codex-responses.ts :: X_CODEX_TURN_STATE_HEADER
+# omp= X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state"
+HEADER_TURN_STATE: Final = "x-codex-turn-state"
+
+# omp: providers/openai-codex-responses.ts :: X_MODELS_ETAG_HEADER
+# omp= X_MODELS_ETAG_HEADER = "x-models-etag"
+HEADER_MODELS_ETAG: Final = "x-models-etag"
+
+# omp: wire/codex.ts :: CODEX_BASE_URL
+# omp= CODEX_BASE_URL = "https://chatgpt.com/backend-api"
+BASE_URL: Final = "https://chatgpt.com/backend-api"
+
 #: omp keeps one identity per agent session and drops it with the session. A proxy never
 #: sees a session end, so the table is bounded: the least recently used conversation loses
 #: its thread and window ids — the cost is one cache miss for a conversation idle long
@@ -338,16 +356,37 @@ HEADER_TURN_METADATA: Final = "x-codex-turn-metadata"
 METADATA_SESSION_LIMIT: Final = 4096
 
 
+# omp: providers/openai-codex-responses.ts :: CodexTurnStateCell
+@dataclass(slots=True)
+class TurnState:
+    """The backend's sticky-routing token for the turn in progress.
+
+    The backend answers a turn with ``x-codex-turn-state`` and expects it back on every
+    request that continues the same turn — the tool-result follow-ups. The first value a
+    turn receives is the one kept.
+    """
+
+    value: str | None = None
+
+
 # omp: providers/openai-codex-responses.ts :: CodexMetadataSessionState
 @dataclass(slots=True)
 class MetadataSession:
-    """Thread and window ids of one session, and the turn it is on."""
+    """Thread and window ids of one session, the turn it is on, and what the backend
+    handed back for it.
+
+    ``turn_states`` and ``models_etags`` are keyed by `compatibility_key`. omp holds the
+    etag on its per-key transport session, which is scoped by the same session id, so
+    keeping it here scopes it identically.
+    """
 
     session_id: str
     thread_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     window_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     turn_id: str | None = None
     turn_started_at_unix_ms: int | None = None
+    turn_states: dict[str, TurnState] = field(default_factory=dict)
+    models_etags: dict[str, str] = field(default_factory=dict)
 
 
 _metadata_sessions: OrderedDict[str, MetadataSession] = OrderedDict()
@@ -364,6 +403,56 @@ def metadata_session(session_id: str) -> MetadataSession:
     else:
         _metadata_sessions.move_to_end(session_id)
     return session
+
+
+# omp: providers/openai-codex-responses.ts :: getCodexWebSocketSessionKey
+def compatibility_key(
+    session_id: str | None, model: str, token: str, base_url: str = BASE_URL
+) -> str | None:
+    """The credential + backend + model + session a turn-state token belongs to.
+
+    A token minted for one account or model must not ride another's request. Without a
+    session there is nothing to continue, and no key. Responses Lite is never requested
+    here, so the key carries no ``:lite`` suffix.
+    """
+    if not session_id:
+        return None
+    account = account_id(token)
+    credential = f"account:{account}" if account else f"token:{_stable_hash(token)}"
+    return f"{credential}:{base_url}:{model}:{session_id}"
+
+
+# omp: providers/openai-codex-responses.ts :: getOrCreateCodexTurnState
+def turn_state(session: MetadataSession, key: str | None) -> TurnState:
+    """The session's cell for ``key``; a throwaway one when there is no key."""
+    if not key:
+        return TurnState()
+    cell = session.turn_states.get(key)
+    if cell is None:
+        cell = session.turn_states[key] = TurnState()
+    return cell
+
+
+# omp: providers/openai-codex-responses.ts :: clearCodexTurnStatesForNewTurn
+def clear_turn_states_for_new_turn(session: MetadataSession, start_new_turn: bool) -> None:
+    """A fresh logical turn drops every sticky-routing token, as codex-rs's per-turn
+    ``OnceLock`` does."""
+    if start_new_turn:
+        session.turn_states.clear()
+
+
+# omp: providers/openai-codex-responses.ts :: updateCodexSessionMetadataFromHeaders
+def update_session_from_headers(
+    session: MetadataSession, key: str | None, cell: TurnState, headers: Mapping[str, str]
+) -> None:
+    """Keep what a successful response handed back: the turn's first ``x-codex-turn-state``
+    and the latest ``x-models-etag``. ``headers`` must be case-insensitive (httpx's are)."""
+    turn = headers.get(HEADER_TURN_STATE)
+    if cell.value is None and turn:
+        cell.value = turn
+    etag = headers.get(HEADER_MODELS_ETAG)
+    if key and etag:
+        session.models_etags[key] = etag
 
 
 class RequestMetadata(NamedTuple):
@@ -454,14 +543,35 @@ def is_within_turn_continuation(messages: list[Any]) -> bool:
     return False
 
 
+class RequestContext(NamedTuple):
+    """What one request carries of its session, and where the response's state goes."""
+
+    metadata: RequestMetadata
+    session: MetadataSession
+    #: `compatibility_key` of this request; ``None`` without a session.
+    key: str | None
+    turn_state: TurnState
+
+    @property
+    def models_etag(self) -> str | None:
+        return self.session.models_etags.get(self.key) if self.key else None
+
+    def on_response(self, _status: int, headers: Mapping[str, str]) -> None:
+        """`RequestSpec.on_response`: keep what the successful response handed back."""
+        update_session_from_headers(self.session, self.key, self.turn_state, headers)
+
+
 # omp: providers/openai-codex-responses.ts :: createCodexRequestContext
 # omp: providers/openai-codex-responses.ts :: resolveCodexStartNewTurn, getCodexTurnStartedAtUnixMs
-def turn_metadata(session_id: str | None, messages: list[Any]) -> RequestMetadata:
-    """Identity of a ``turn`` request in ``session_id``.
+def request_context(
+    session_id: str | None, messages: list[Any], *, model: str, token: str
+) -> RequestContext:
+    """Identity and turn state of a ``turn`` request in ``session_id``, for wire ``model``.
 
     A request without a session gets a throwaway identity, as omp does when it has no
-    session id (``crypto.randomUUID()``). Chat completions messages carry no timestamp, so
-    the turn starts now — omp's own fallback when the last user message has none.
+    session id (``crypto.randomUUID()``), and a throwaway turn-state cell. Chat completions
+    messages carry no timestamp, so the turn starts now — omp's own fallback when the last
+    user message has none. A new turn drops the tokens the previous one collected.
     """
     transport_session = normalize_session_id(session_id)
     session = (
@@ -469,11 +579,16 @@ def turn_metadata(session_id: str | None, messages: list[Any]) -> RequestMetadat
         if transport_session
         else MetadataSession(str(uuid.uuid4()))
     )
-    return request_metadata(
+    start_new_turn = not is_within_turn_continuation(messages)
+    clear_turn_states_for_new_turn(session, start_new_turn)
+    key = compatibility_key(transport_session, model, token)
+    cell = turn_state(session, key)
+    metadata = request_metadata(
         session,
-        start_new_turn=not is_within_turn_continuation(messages),
+        start_new_turn=start_new_turn,
         turn_started_at_unix_ms=int(time.time() * 1000),
     )
+    return RequestContext(metadata=metadata, session=session, key=key, turn_state=cell)
 
 
 # omp: wire/codex.ts :: codexRoutingHint
@@ -501,15 +616,18 @@ def build_headers(
     metadata: RequestMetadata | None = None,
     window_id: str | None = None,
     turn_state: str | None = None,
+    models_etag: str | None = None,
     model: str | None = None,
     service_tier: str | None = None,
 ) -> dict[str, str]:
     """Headers of a request to the Codex backend.
 
-    ``metadata`` is the request's identity (see ``turn_metadata``); the body carries the
+    ``metadata`` is the request's identity (see ``request_context``); the body carries the
     same one in ``client_metadata``. Without it — the discovery probes — a throwaway
     identity is built, on ``window_id`` when the caller pins one. ``model`` and
     ``service_tier`` are the body's, so the routing hint names what is actually requested.
+    ``turn_state`` and ``models_etag`` are what the session's last successful response
+    handed back (`RequestContext`).
     """
     transport_session = normalize_session_id(session_id)
     if metadata is None:
@@ -544,10 +662,12 @@ def build_headers(
     headers["thread-id"] = metadata.thread_id
     headers[HEADER_WINDOW_ID] = metadata.window_id
     headers[HEADER_TURN_METADATA] = metadata.turn_metadata_json
-    # The backend returns x-codex-turn-state and expects it back on the next turn: it is
-    # the session's transport state.
+    # The backend returns x-codex-turn-state and expects it back on every request that
+    # continues the turn; x-models-etag names the catalog the session last saw.
     if turn_state:
-        headers["x-codex-turn-state"] = turn_state
+        headers[HEADER_TURN_STATE] = turn_state
+    if models_etag:
+        headers[HEADER_MODELS_ETAG] = models_etag
     headers["accept"] = "text/event-stream"
     headers["Content-Type"] = "application/json"
     return headers
@@ -1057,6 +1177,16 @@ def messages_to_input(messages: list[Any], *, supports_detail_original: bool = T
 # omp: providers/openai-chat-server.ts :: buildTools
 # omp: providers/openai-codex-responses.ts :: convertOpenAICodexResponsesTools
 def tools_to_codex_tools(tools: list[Any] | None) -> list[dict[str, Any]] | None:
+    """Function tools as the Codex backend takes them; hosted tools with their own spec.
+
+    ``parameters`` go through omp's normalization (`openai_schema.codex_tool_parameters`):
+    the backend rejects ``oneOf`` and an object node without ``properties`` even outside
+    strict mode. A tool with no parameters, or ``{}``, keeps sending the empty object
+    schema this package has always sent. omp's gateway would send ``{}``, which its
+    normalization turns into ``parameters: true``; nothing here has measured the backend
+    accepting ``true``, and omitting ``parameters`` was measured to give 400 — the
+    divergence stays until a live request settles it.
+    """
     if not tools:
         return None
     converted: list[dict[str, Any]] = []
@@ -1070,12 +1200,13 @@ def tools_to_codex_tools(tools: list[Any] | None) -> list[dict[str, Any]] | None
         function: dict[str, Any] = nested if isinstance(nested, dict) else tool
         if not function.get("name"):
             continue
+        parameters = function.get("parameters") or {"type": "object", "properties": {}}
         converted.append(
             {
                 "type": "function",
                 "name": function["name"],
                 "description": function.get("description") or "",
-                "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+                "parameters": codex_tool_parameters(parameters),
             }
         )
     return converted or None
@@ -1170,13 +1301,40 @@ def reasoning_config(value: object) -> dict[str, str] | None:
     return {"effort": effort, "summary": summary if summary in REASONING_SUMMARIES else "auto"}
 
 
+#: Tier ids each model's `/models` entry advertises (`service_tiers`), by wire slug, as the
+#: last Codex discovery read them. A slug that is absent was not reported: omp's model
+#: carries no list then, and the provider-level answer stands.
+_advertised_service_tiers: dict[str, tuple[str, ...]] = {}
+
+
+def remember_service_tiers(slug: str, tiers: tuple[str, ...] | None) -> None:
+    """Record what discovery read for ``slug``; ``None`` forgets it (no list reported)."""
+    if tiers is None:
+        _advertised_service_tiers.pop(slug.lower(), None)
+    else:
+        _advertised_service_tiers[slug.lower()] = tiers
+
+
+def advertised_service_tiers(model: str) -> tuple[str, ...] | None:
+    return _advertised_service_tiers.get(model.lower())
+
+
 # omp: types.ts :: shouldSendServiceTier
-def service_tier(value: object) -> str | None:
-    """The tier to send. ``auto`` is never sent: omitting it means the same, and the Codex
-    endpoint rejects it outright."""
-    if value in SERVICE_TIERS and value != "auto":
-        return str(value)
-    return None
+def service_tier(value: object, advertised: tuple[str, ...] | None = None) -> str | None:
+    """The tier to send for a model whose discovery advertised ``advertised``.
+
+    ``auto`` is never sent: omitting it means the same, and the Codex endpoint rejects it
+    outright. ``priority``/``scale`` are dropped only when the model reports a non-empty
+    list that omits them (codex-rs ``service_tier_for_request``); an empty or missing list
+    counts as "not reported". ``flex`` and ``default`` are never gated. ``ultrafast``, which
+    omp sends only when advertised, never gets here: omp's chat server does not parse it
+    (``isServiceTier``), and neither does ``SERVICE_TIERS``.
+    """
+    if value not in SERVICE_TIERS or value == "auto":
+        return None
+    if value not in ("flex", "default") and advertised and value not in advertised:
+        return None
+    return str(value)
 
 
 # omp: providers/openai-codex-responses.ts :: buildTransformedCodexRequestBody
@@ -1208,7 +1366,7 @@ def build_request_body(
     cache_key = prompt_cache_key(session_id, cache_retention=extra.get("cache_retention"))
     if cache_key:
         body["prompt_cache_key"] = cache_key
-    if tier := service_tier(extra.get("service_tier")):
+    if tier := service_tier(extra.get("service_tier"), advertised_service_tiers(body["model"])):
         body["service_tier"] = tier
     if codex_tools := tools_to_codex_tools(tools):
         body["tools"] = codex_tools
