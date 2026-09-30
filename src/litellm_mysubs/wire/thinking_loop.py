@@ -16,8 +16,9 @@ Three forms of runaway, with distinct purposes:
    concrete reference.
 
 The last two are semantic heuristics, armed only for the families that run away
-(`is_loop_guarded_model`). `LoopGuard` is omp's `guardThinkingLoopStream`: which deltas
-each detector sees, when it is flushed, and when visible text latches it off.
+(`is_loop_guarded_model`). `LoopGuard` is omp's `guardThinkingLoopStream` on the reasoning
+channel: which deltas the detector sees, when it is flushed, and when visible text latches
+it off. omp also judges the visible text; that half is a measured divergence.
 """
 
 from __future__ import annotations
@@ -341,30 +342,35 @@ def is_loop_guarded_model(model: str) -> bool:
 
 # omp: utils/thinking-loop.ts :: guardThinkingLoopStream
 class LoopGuard:
-    """omp's guard around a provider stream, as a set of event hooks.
+    """omp's guard around a provider stream, on the reasoning channel only.
 
     Each hook returns the loop's reason, or ``None``; the reader stops at the first
-    reason, before the delta that tripped it goes out. What omp's guard does per event:
+    reason, before the delta that tripped it goes out. What omp's guard does per event,
+    as far as it is kept here:
 
-    - reasoning deltas feed the thinking detector until visible text has started;
+    - reasoning deltas feed the detector until visible text has started;
     - the end of a reasoning block flushes it while it is armed;
-    - visible text latches the thinking detector off and feeds the text detector,
-      which a tool call disarms (a model can loop in prose as well as in thought);
-    - a turn that ends normally flushes whichever detector is still armed. A turn that
-      fails is not flushed: the failure is already the answer.
+    - visible text latches it off;
+    - a turn that ends normally flushes it if still armed. A turn that fails is not
+      flushed: the failure is already the answer.
 
     Exact cycles are checked for every model; the semantic heuristics only where
     `is_loop_guarded_model` says the family runs away.
+
+    Deliberate divergence: omp also feeds the visible text to a second detector
+    (``checkAssistantContent``, on by default, and its gateway never turns it off).
+    Measured live on 0.1.17's candidate against the real backends, prompt "Write the line
+    'hello world' 60 times, one per line, nothing else.", non-streamed chat: gpt-5.5 and
+    gemini-3-flash both failed with 502 "repeated an exact 12-character cycle 21x/32x
+    back-to-back", after three billed attempts, where 0.1.16 answered 200 with the 60
+    lines. Lists, tables, CSV and code repeat by design; only reasoning is judged here.
     """
 
-    __slots__ = ("_text", "_text_armed", "_text_started", "_thinking", "_thinking_armed")
+    __slots__ = ("_text_started", "_thinking", "_thinking_armed")
 
     def __init__(self, model: str) -> None:
-        semantic = is_loop_guarded_model(model)
-        self._thinking = ThinkingLoopDetector(semantic_heuristics=semantic)
-        self._text = ThinkingLoopDetector(semantic_heuristics=semantic)
+        self._thinking = ThinkingLoopDetector(semantic_heuristics=is_loop_guarded_model(model))
         self._thinking_armed = True
-        self._text_armed = True
         self._text_started = False
 
     def thinking_delta(self, delta: str) -> str | None:
@@ -376,17 +382,11 @@ class LoopGuard:
     def thinking_end(self) -> str | None:
         return self._thinking.flush() if self._thinking_armed else None
 
-    def text_delta(self, delta: str) -> str | None:
+    def text_delta(self, delta: str) -> None:
+        """Visible text latches the reasoning detector off; the text itself is not judged."""
         if delta:
             self._thinking_armed = False
             self._text_started = True
-        return self._text.feed(delta) if self._text_armed else None
-
-    def tool_call(self) -> None:
-        self._text_armed = False
 
     def done(self) -> str | None:
-        detail = self._thinking.flush() if self._thinking_armed else None
-        if self._text_armed:
-            detail = detail or self._text.flush()
-        return detail
+        return self._thinking.flush() if self._thinking_armed else None

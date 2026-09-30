@@ -317,7 +317,29 @@ def codex_looping_reasoning() -> list[dict[str, Any]]:
     ]
 
 
+HELLO_60 = ["hello world\n"] * 60
+
+
 class TestLoopGuard:
+    @pytest.mark.parametrize("stream", STREAMING)
+    @pytest.mark.parametrize("model", [CODEX, GEMINI_FLASH])
+    async def test_repetitive_visible_text_is_an_answer(self, model: str, stream: bool) -> None:
+        """Measured live on the candidate: "write 'hello world' 60 times" failed 502 as an
+        exact cycle on gpt-5.5 and gemini-3-flash, after three billed attempts, because
+        the guard judged the visible text as omp does. Only reasoning is judged now."""
+        events = (
+            codex_events(chunks=HELLO_60)
+            if model == CODEX
+            else gemini_events(chunks=HELLO_60, usage={"totalTokenCount": 9})
+        )
+        transport = install_transport(FakeTransport(events))
+
+        turn = await answer(model, stream=stream)
+
+        assert turn.content == "".join(HELLO_60)
+        assert turn.finish == "stop"
+        assert len(transport.specs) == 1
+
     @pytest.mark.parametrize("stream", STREAMING)
     async def test_codex_reasoning_is_guarded_too(self, stream: bool) -> None:
         """omp guards every model's stream against exact cycles, not only Gemini's.
@@ -412,6 +434,17 @@ class TestAntigravity:
 
         with pytest.raises(openai.APIError, match="thought-only response without final output"):
             await answer(GEMINI_PRO, stream=stream)
+
+    async def test_reasoning_cut_by_the_output_limit_is_a_length_stop(self, stream: bool) -> None:
+        """Measured live: gemini-3-flash with max_tokens=64 spent it all on reasoning; the
+        candidate answered 502 thought-only (omp's rule), 0.1.16 answered ``length``. The
+        client asked for the cut, so the cut is the answer."""
+        install_transport(FakeTransport([thought("Planning the essay.", finish="MAX_TOKENS")]))
+
+        turn = await answer(GEMINI_FLASH, stream=stream)
+
+        assert (turn.content, turn.finish) == ("", "length")
+        assert turn.reasoning == "Planning the essay."
 
     async def test_repeated_and_missing_call_ids_are_made_distinct(self, stream: bool) -> None:
         """omp mints a fresh id for a call without one or with one already used. Before,

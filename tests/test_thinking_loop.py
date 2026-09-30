@@ -296,14 +296,14 @@ class TestLoopGuard:
         assert guard.thinking_delta("let me check the file one more time. " * 10) is None
         assert guard.done() is None
 
-    def test_a_loop_in_the_visible_text_is_caught_too(self) -> None:
-        guard = LoopGuard("gpt-5.5")
-        assert first_reason(guard.text_delta, ["I will try again now. "] * 12)
-
-    def test_a_tool_call_disarms_the_text_detector(self) -> None:
-        guard = LoopGuard("gpt-5.5")
-        guard.tool_call()
-        assert first_reason(guard.text_delta, ["I will try again now. "] * 12) is None
+    def test_repetitive_visible_text_is_never_judged(self) -> None:
+        """Lists, tables and code repeat by design: live, "write 'hello world' 60 times"
+        failed as a loop on gpt-5.5 and gemini-3-flash while omp judged visible text."""
+        for model in ("gpt-5.5", "gemini-3-flash"):
+            guard = LoopGuard(model)
+            for _ in range(60):
+                assert guard.text_delta("hello world\n") is None
+            assert guard.done() is None, model
 
     def test_the_end_of_the_turn_judges_the_last_paragraph(self) -> None:
         """The warm-up completed by the unterminated final paragraph is caught at the end."""

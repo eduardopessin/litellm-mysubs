@@ -361,16 +361,25 @@ class TestUpstreamErrors:
     @pytest.mark.parametrize(
         "error",
         [
-            UpstreamError(500, "boom"),
             RemapRequired(400, "is not supported when using Codex"),
             RedeemRequired(429, "quota"),
         ],
     )
-    async def test_transport_errors_propagate(self, error: UpstreamError) -> None:
+    async def test_plugin_signals_propagate_as_themselves(self, error: UpstreamError) -> None:
         install_transport(FakeTransport(error=error))
         with pytest.raises(UpstreamError) as caught:
             await plugin.dispatch(model="gpt-5.5", messages=[{"role": "user", "content": "x"}])
         assert caught.value is error
+
+    async def test_an_upstream_error_keeps_its_status_and_its_cause(self) -> None:
+        """The proxy answers the status off LiteLLM's exception; the upstream's own error
+        stays attached for whoever logs the chain."""
+        error = UpstreamError(500, "boom")
+        install_transport(FakeTransport(error=error))
+        with pytest.raises(litellm.exceptions.InternalServerError) as caught:
+            await plugin.dispatch(model="gpt-5.5", messages=[{"role": "user", "content": "x"}])
+        assert caught.value.status_code == 500
+        assert caught.value.__cause__ is error
 
     async def test_a_429_reaches_the_client_as_a_rate_limit(self) -> None:
         """A quota refusal has to keep its status across the LiteLLM boundary.

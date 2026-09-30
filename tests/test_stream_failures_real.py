@@ -319,3 +319,36 @@ async def test_an_in_band_401_is_an_authentication_error_too() -> None:
     response = await call("chat", ANTIGRAVITY, stream=False)
 
     assert response.status_code == 401
+
+
+class TestAnUpstreamStatusReachesTheClient:
+    """omp's gateway answers an upstream HTTP error with the upstream's own status."""
+
+    @pytest.mark.parametrize(
+        ("status", "body"),
+        [
+            (503, '{"error": {"code": 503, "message": "No capacity available for model"}}'),
+            (400, '{"error": {"message": "Invalid value for tool_choice"}}'),
+            (403, '{"error": {"message": "The caller does not have permission"}}'),
+            (504, "upstream timeout"),
+        ],
+    )
+    @pytest.mark.parametrize("route", ROUTES)
+    async def test_whole(self, route: str, status: int, body: str) -> None:
+        """Measured live, 0.1.16 and the candidate: Cloud Code's 503 went out as 500
+        ``internal_server_error``."""
+        install_transport(FakeTransport(error=UpstreamError(status, body)))
+
+        response = await call(route, ANTIGRAVITY, stream=False)
+
+        assert response.status_code == status
+        assert "HTTP " + str(status) in response.text
+
+    async def test_the_chat_stream(self) -> None:
+        install_transport(FakeTransport(error=UpstreamError(503, "No capacity available")))
+
+        response = await call("chat", ANTIGRAVITY, stream=True)
+
+        # Refused before the first event, so the proxy still answers with a status.
+        assert response.status_code == 503
+        assert "No capacity available" in response.json()["error"]["message"]
