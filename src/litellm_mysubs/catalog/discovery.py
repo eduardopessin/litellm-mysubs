@@ -49,7 +49,7 @@ from ..credentials.store import Credential
 from ..transport import hosts, sse
 from ..transport.retry import is_unsupported_model
 from ..wire import anthropic, codex
-from ..wire.antigravity import declared_output_tokens, is_retired_response
+from ..wire.antigravity import declared_output_tokens, is_retired_response, usage_is_zero
 from ..wire.antigravity_models import BROKEN_WIRE, ModelCatalog
 
 #: Probes in flight at once. The limit exists because a curated list fires one request per
@@ -57,11 +57,11 @@ from ..wire.antigravity_models import BROKEN_WIRE, ModelCatalog
 #: dozen simultaneous connections to the upstream just to draw a selection screen.
 PROBE_CONCURRENCY: Final = 4
 
-#: Wait ceiling per Antigravity probe. Short on purpose: what the probe produces is a mark
-#: on a selection screen, not a response for the user to read. Anything exceeding this is a
-#: fact about this machine's network, and the verdict for those is always "could not
-#: probe" — never "not served".
-PROBE_TIMEOUT_S: Final = 10.0
+#: Wait ceiling per Antigravity probe. What the probe produces is a mark on a selection
+#: screen, and anything exceeding this is "could not probe" — never "not served". Measured
+#: on 2026-09-30 (4 probes in flight): thinking flash models took 9-25 s to finish a probe,
+#: and at 10 s most of the selection came back unprobed.
+PROBE_TIMEOUT_S: Final = 30.0
 
 #: Output ceiling for Antigravity probes. Each probe is a billed turn; the verdict comes
 #: from the status and the in-band warning, not from the generated text, so there is no
@@ -681,8 +681,12 @@ def _antigravity_stream(lines: list[str]) -> _Probe:
         return _Probe(False, "model retired by upstream")
     if joined.strip():
         return _Probe(True)
-    # A 200 with no text at all. Measured: `gemini-pro-agent` answers empty to "hi" and is
-    # still served, so this is not a refusal — it is a probe that measured nothing.
+    # A 200 with no text. If tokens were billed, the model ran: measured on 2026-09-30,
+    # gemini-3-flash, 3.6/3.8-flash and gemini-pro-agent spend the probe's 8-token budget
+    # thinking (`thoughtsTokenCount` 4-5) and answer nothing, while a retired model bills
+    # zero. With nothing billed either, the probe measured nothing — not a refusal.
+    if usage is not None and not usage_is_zero(usage):
+        return _Probe(True)
     return _Probe(None, "could not probe: the stream closed with no content")
 
 

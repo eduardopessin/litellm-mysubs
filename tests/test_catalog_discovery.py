@@ -902,3 +902,52 @@ class TestGoogleProbeTargets:
             (model,) = await discover(GOOGLE, client=http, probe={"gemini-3.1-pro"})
 
         assert (model.verified, model.refused) == (False, False)
+
+
+class TestGoogleProbeReasoningOnly:
+    """The probe's 8-token budget goes to thinking on thinking models: no text, tokens
+    billed. Measured on 2026-09-30 on gemini-3-flash, 3.6/3.8-flash and gemini-pro-agent
+    (`thoughtsTokenCount` 4-5); at the time they all came back "could not probe"."""
+
+    @staticmethod
+    def thinking_only(usage: dict[str, object]) -> str:
+        event = {
+            "response": {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "", "thought": True}]},
+                        "finishReason": "MAX_TOKENS",
+                    }
+                ],
+                "usageMetadata": usage,
+            }
+        }
+        return f"data: {json.dumps(event)}\n\n"
+
+    async def test_billed_reasoning_with_no_text_is_served(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(200, json=catalog_payload("gemini-3-flash"))
+            return httpx.Response(
+                200,
+                text=self.thinking_only(
+                    {"promptTokenCount": 5, "thoughtsTokenCount": 5, "totalTokenCount": 10}
+                ),
+            )
+
+        async with client(handler) as http:
+            (model,) = await discover(GOOGLE, client=http, probe=True)
+
+        assert (model.verified, model.refused) == (True, False)
+
+    async def test_nothing_billed_and_no_text_is_still_unprobed(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(200, json=catalog_payload("gemini-pro-agent"))
+            return httpx.Response(200, text=self.thinking_only({"totalTokenCount": 0}))
+
+        async with client(handler) as http:
+            (model,) = await discover(GOOGLE, client=http, probe=True)
+
+        assert (model.verified, model.refused) == (False, False)
+        assert "no content" in model.note

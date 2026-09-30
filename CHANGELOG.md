@@ -45,7 +45,10 @@ measurement, recorded in `docs/OMP.md`.
   models stayed selected. Discovery now probes the models already selected (all of them
   when nothing is selected yet; one short billed turn each), lists the rest as unverified
   with the reason, and a selected model the upstream refuses or retired starts unticked,
-  marked "not served".
+  marked "not served". A probe that billed tokens counts as served even with no text (the
+  8-token budget goes to thinking on thinking models), and a probe gets 30 s instead of 10:
+  measured, thinking flash models take 9-25 s, and at 10 s most of the selection came back
+  unprobed.
 - **Failed turns are billed what the upstream reported**, at the wire rate, and a failed
   Messages or Responses stream no longer also logs a zero-token success.
 - **Antigravity sampling reaches the backend.** `temperature`, `top_p` and `top_k` were
