@@ -11,8 +11,9 @@ its transport recovery, which lives in `transport/`), `_AntigravityReader` of
 ``providers/google-gemini-cli.ts :: streamGoogleGeminiCli``. Both accumulate what omp's
 ``AssistantMessage`` holds — ordered content blocks, a stop reason, usage — and emit, as
 they go, the chat-completions deltas omp's ``openai-chat-server.ts :: encodeStream``
-writes for the same provider events. Both run every delta through omp's thinking-loop
-guard (`thinking_loop.LoopGuard`), which omp's ``stream()`` wraps around every provider.
+writes for the same provider events. Both run every reasoning delta through omp's
+thinking-loop guard (`thinking_loop.LoopGuard`), which omp's ``stream()`` wraps around
+every provider; the visible text is not judged (see `LoopGuard` for why).
 
 `remember_signature` is injected rather than imported: the signature cache lives in
 `plugin.py`'s process state, and importing it back would close a cycle.
@@ -512,7 +513,6 @@ class _CodexReader:
             return []
         entry.tool_index = self._tool_count
         self._tool_count += 1
-        self._guard.tool_call()
         return [_tool_open_chunk(entry.tool_index, block["id"], block["name"])]
 
     # omp: providers/openai-shared.ts :: appendReasoningSummaryTextDelta
@@ -559,8 +559,7 @@ class _CodexReader:
         delta = str(event.get("delta") or "")
         if not delta:
             return []
-        if detail := self._guard.text_delta(delta):
-            raise ThinkingLoopError(thinking_loop.loop_error_message(detail))
+        self._guard.text_delta(delta)
         content = entry.item.setdefault("content", [])
         field = "text" if part_type == "output_text" else "refusal"
         if not content or not isinstance(content[-1], dict) or content[-1].get("type") != part_type:
@@ -921,7 +920,8 @@ class _AntigravityReader:
         """Releases what the filters held back, then fails the turn where omp throws.
 
         In omp's order: an error finish (SAFETY, RECITATION, MALFORMED_FUNCTION_CALL, ...),
-        then a turn with nothing to deliver (no text, no tool call), then a stream that
+        then a turn with nothing to deliver (no text, no tool call) unless the output
+        limit cut it, then a stream that
         ended without any finish at all — a connection dropped mid-answer is not an
         answer. The usage has arrived by then, and whatever text already left stays with
         the client, which then reads the failure — not a turn that merely stopped.
@@ -944,7 +944,12 @@ class _AntigravityReader:
         turn = self._turn
         if turn.stop_reason == "error":
             raise GenerationFailedError(self._error_message)
-        if not _has_meaningful_content(turn):
+        # Deliberate divergence: omp fails any turn without content, a MAX_TOKENS one
+        # included. A client that set the output ceiling asked for the cut; measured live
+        # on gemini-3-flash, "Write a 600-word essay about bridges." with max_tokens=64
+        # spent the budget on reasoning, and 0.1.16 answered 200 with `length` where the
+        # port answered 502. A cut turn stays a `length` stop, empty or not.
+        if turn.stop_reason != "length" and not _has_meaningful_content(turn):
             thought_only = any(
                 block["type"] == "thinking" and block["thinking"].strip() for block in turn.content
             )
@@ -1057,8 +1062,7 @@ class _AntigravityReader:
         if not delta:
             return []
         block = self._start_block("text")
-        if detail := self._guard.text_delta(delta):
-            raise ThinkingLoopError(thinking_loop.loop_error_message(detail))
+        self._guard.text_delta(delta)
         block["text"] += delta
         return [_delta_chunk(Delta(content=delta))]
 
@@ -1077,7 +1081,6 @@ class _AntigravityReader:
         )
         if signature := part.get("thoughtSignature"):
             remember_signature(call_id, str(signature))
-        self._guard.tool_call()
         index = self._tool_count
         self._tool_count += 1
         return [_tool_open_chunk(index, call_id, name), _tool_delta_chunk(index, arguments)]
