@@ -7,6 +7,7 @@ field is a behaviour that disappears silently.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -19,21 +20,48 @@ PNG = (
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
     "AAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
-REQUEST_ID = "agent/abc/1000/def/1"
 
 
 def payload(messages: list[Any], model: str = "gemini-3-pro", **kwargs: Any) -> dict[str, Any]:
-    return ag.build_payload(model, messages, "proj-1", REQUEST_ID, **kwargs)
+    return ag.build_payload(model, messages, "proj-1", **kwargs)
 
 
 class TestEnvelope:
-    def test_fixed_envelope_fields(self) -> None:
-        """`labels` and `sessionId` do not go in: the endpoint returns 400 Unknown name."""
+    def test_session_fields_ride_inside_the_request(self) -> None:
+        """``labels`` and ``sessionId`` go inside ``request``, where omp's
+        ``buildAntigravityRequestEnvelope`` puts them; the top level keeps its six fields.
+
+        Measured on the live backend on 2026-09-30: ``request.sessionId`` and
+        ``request.labels`` answered HTTP 200 on gemini-3-flash and on claude-sonnet-4-6.
+        The 400 "Unknown name" once recorded here was for the top-level placement.
+        """
         body = payload([{"role": "user", "content": "x"}])
         assert body["userAgent"] == "antigravity"
         assert body["requestType"] == "agent"
         assert body["project"] == "proj-1"
         assert set(body) == {"project", "requestId", "model", "userAgent", "requestType", "request"}
+        assert list(body["request"]) == [
+            "contents",
+            "labels",
+            "generationConfig",
+            "sessionId",
+        ]
+
+    def test_without_state_the_session_id_comes_from_the_first_user_text(self) -> None:
+        """omp's ``deriveAntigravitySessionId``: the first 8 bytes of the text's SHA-256,
+        masked to 63 bits, as a negative decimal; the step is 2."""
+        body = payload([{"role": "system", "content": "s"}, {"role": "user", "content": "x"}])
+        digest = hashlib.sha256(b"x").digest()
+        expected = -(int.from_bytes(digest[:8], "big") & ((1 << 63) - 1))
+        assert body["request"]["sessionId"] == str(expected)
+        assert body["requestId"].startswith("agent/") and body["requestId"].endswith("/2")
+        assert body["request"]["labels"]["last_step_index"] == "1"
+
+    def test_without_user_text_the_session_id_is_random(self) -> None:
+        first = payload([{"role": "assistant", "content": "x"}])["request"]["sessionId"]
+        second = payload([{"role": "assistant", "content": "x"}])["request"]["sessionId"]
+        assert first != second
+        assert first.startswith("-") and 0 <= int(first[1:]) < 9_000_000_000_000_000_000
 
     def test_system_becomes_native_instruction(self) -> None:
         """The native field is accepted with role "user"; splicing into the first turn is
@@ -286,7 +314,6 @@ class TestMultimodal:
             "gemini-3-pro",
             [{"role": "user", "content": "a\ud800b \ud83d\ude00 c"}],
             "proj",
-            REQUEST_ID,
         )
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -434,11 +461,14 @@ class TestToolCalls:
         assert call["id"] == "c1", "Vertex refuses a tool_use without an id"
         assert result["id"] == "c1", "the result has to name the call it answers"
 
-    def _claude_config(self, ceiling: int | None) -> dict[str, Any]:
+    def _claude_config(
+        self, ceiling: int | None, declared: int | None = None
+    ) -> dict[str, Any]:
+        entry: dict[str, Any] = {"thinkingBudget": 4000}
+        if declared is not None:
+            entry["maxOutputTokens"] = declared
         catalog = ModelCatalog(
-            ids=("claude-sonnet-4-6",),
-            info={"claude-sonnet-4-6": {"thinkingBudget": 4000}},
-            fetched_at=1.0,
+            ids=("claude-sonnet-4-6",), info={"claude-sonnet-4-6": entry}, fetched_at=1.0
         )
         body = payload(
             [{"role": "user", "content": "x"}],
@@ -448,40 +478,36 @@ class TestToolCalls:
         )
         return body["request"]["generationConfig"]
 
-    def test_a_roomy_ceiling_keeps_the_catalog_budget(self) -> None:
-        config = self._claude_config(64000)
+    @pytest.mark.parametrize("ceiling", [64, 512, 1024, 2048])
+    def test_the_budget_rides_on_top_of_the_callers_ceiling(self, ceiling: int) -> None:
+        """omp's ``maxTokensWithThinkingBudget``: ``max_tokens`` is the visible answer and the
+        budget goes on top, so both of Anthropic's bounds — ``max_tokens >
+        budget_tokens`` and ``budget_tokens >= 1024`` — hold for any ceiling. Fitting the
+        budget under the caller's ceiling instead drove it to 0 for small ones, which a
+        thinking-only model refuses (measured: gemini-3.1-pro-low, ``max_tokens: 64`` —
+        "Budget 0 is invalid. This model only works in thinking mode.")."""
+        config = self._claude_config(ceiling)
+        assert config["maxOutputTokens"] == ceiling + 4000
+        assert config["thinkingConfig"] == {"includeThoughts": True, "thinkingBudget": 4000}
+
+    def test_the_declared_ceiling_still_caps_the_sum(self) -> None:
+        config = self._claude_config(64000, declared=64000)
         assert config["maxOutputTokens"] == 64000
         assert config["thinkingConfig"]["thinkingBudget"] == 4000
 
-    def test_a_tight_ceiling_shrinks_the_budget_under_it(self) -> None:
-        """`max_tokens` must be strictly greater than `budget_tokens`.
+    def test_a_declared_ceiling_under_the_budget_shrinks_it(self) -> None:
+        """Where the model's own ceiling cuts the sum to the budget or below, omp keeps
+        ``MIN_OUTPUT_TOKENS`` for the answer and gives the rest to thinking."""
+        config = self._claude_config(100, declared=3000)
+        assert config["maxOutputTokens"] == 3000
+        assert config["thinkingConfig"]["thinkingBudget"] == 3000 - ag.MIN_OUTPUT_TOKENS
 
-        Measured on the live gateway: a ceiling at or below the catalog budget was refused
-        on the first turn, while the same call with no ceiling succeeded.
-        """
-        config = self._claude_config(2048)
-        assert config["maxOutputTokens"] == 2048, "the caller's ceiling is not raised"
-        assert config["thinkingConfig"]["thinkingBudget"] < 2048
-        assert config["thinkingConfig"]["thinkingBudget"] >= ag.MIN_THINKING_BUDGET
-
-    def test_a_ceiling_too_small_for_any_budget_drops_thinking(self) -> None:
-        """Two bounds close on each other and leave nothing valid.
-
-        `max_tokens > budget_tokens` and Anthropic's own `budget_tokens >= 1024` mean a
-        ceiling of 1024 admits no budget at all. Shrinking to three quarters — the first
-        attempt — merely swapped one rejection for the other::
-
-            HTTP 400 thinking.enabled.budget_tokens: Input should be greater than or
-                     equal to 1024
-
-        Serving the turn without reasoning is the honest answer: the caller asked for a
-        ceiling, not for thinking.
-        """
-        for ceiling in (512, 1024):
-            config = self._claude_config(ceiling)
-            thinking = config["thinkingConfig"]
-            assert thinking["includeThoughts"] is False, ceiling
-            assert thinking["thinkingBudget"] == 0, ceiling
+    def test_a_declared_ceiling_too_small_for_any_budget_drops_thinking(self) -> None:
+        """Anthropic's own minimum of 1024 leaves Claude no budget under this ceiling:
+        the turn goes out without thinking, omp's thinking-off path."""
+        config = self._claude_config(100, declared=1500)
+        assert config["maxOutputTokens"] == 1500
+        assert config["thinkingConfig"] == {"includeThoughts": False, "thinkingBudget": 0}
 
     def test_sentinel_is_per_turn_not_per_request(self) -> None:
         """The CCA requires the sentinel on the first call of **every** assistant turn.

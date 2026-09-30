@@ -847,7 +847,9 @@ class _AntigravityReader:
         "_guard",
         "_healing",
         "_leak_model",
+        "_response_id",
         "_saw_finish",
+        "_session",
         "_text_buffer",
         "_tool_count",
         "_tool_names",
@@ -857,11 +859,19 @@ class _AntigravityReader:
     )
 
     def __init__(
-        self, turn: _Turn, *, wire_model: str, tool_names: frozenset[str] = frozenset()
+        self,
+        turn: _Turn,
+        *,
+        wire_model: str,
+        tool_names: frozenset[str] = frozenset(),
+        session: antigravity.AntigravitySession | None = None,
     ) -> None:
         self._turn = turn
         self._wire_model = wire_model
         self._tool_names = tool_names
+        self._session = session
+        #: The last ``responseId`` the stream carried, as omp's ``lastResponseId``.
+        self._response_id: str | None = None
         self._guard = thinking_loop.LoopGuard(wire_model)
         self._healing = thinking_markup.StreamMarkupHealing()
         self._leak_model = planning_leak.is_flash_leak_model(wire_model)
@@ -878,6 +888,8 @@ class _AntigravityReader:
         response = event.get("response")
         if not isinstance(response, dict):
             return []
+        if (response_id := response.get("responseId")) and isinstance(response_id, str):
+            self._response_id = response_id
         candidates = response.get("candidates")
         candidates = candidates if isinstance(candidates, list) else []
         feedback = response.get("promptFeedback")
@@ -965,6 +977,11 @@ class _AntigravityReader:
             )
         if detail := self._guard.done():
             raise ThinkingLoopError(thinking_loop.loop_error_message(detail))
+        # omp: providers/google-gemini-cli.ts :: streamGoogleGeminiCli
+        # Committed only after a fully successful attempt, and overwritten even when the
+        # response had no id, so a stale one never rides the next request.
+        if self._session is not None:
+            self._session.last_execution_id = self._response_id
         return chunks
 
     def _guard_retired(self, pending: str = "", meta: dict[str, Any] | None = None) -> None:
