@@ -37,9 +37,13 @@ measurement, recorded in `docs/OMP.md`.
 - **Antigravity sampling reaches the backend.** `temperature`, `top_p` and `top_k` were
   silently dropped. Penalties on Gemini and `top_p` below 0.95 on a thinking Claude are
   still dropped: the backend refuses them (measured per field and family).
-- **Antigravity: two requests that always failed now work.** A Claude tool without
-  parameters (400 `input_schema.type`), and a small `max_tokens` on a thinking-only model
-  such as gemini-3.1-pro-low (400 "Budget 0 is invalid").
+- **Antigravity: requests that always failed now work.** A Claude tool without parameters
+  (400 `input_schema.type`); a small `max_tokens` on a thinking-only model such as
+  gemini-3.1-pro-low (400 "Budget 0 is invalid"); and `reasoning_effort: "none"` on the
+  models that refuse a zero budget (gemini-3.1-pro-low, gemini-pro-agent,
+  gemini-2.5-flash(-lite), gemini-3.5-flash-lite, gpt-oss), which now keep thinking at the
+  catalog minimum, as omp raises "no reasoning" to the lowest effort. The caller's
+  `max_tokens` stays the total output: measured on 27 cases, none exceeded it.
 - **Anthropic: the client's reasoning request reaches the wire.** An explicit
   `reasoning_effort` on an adaptive model went out as `medium`, a Messages client's own
   `output_config.effort` was overwritten, and a chat request's `max_tokens` was raised to

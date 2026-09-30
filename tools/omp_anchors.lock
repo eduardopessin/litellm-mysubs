@@ -319,7 +319,7 @@
     "pi-ai/stream.ts::THINKING_LOOP_RETRY_MAX_DELAY_MS": "2435f01df42873deca0566e90dac46e983530c2132439f07451fce51e98d5350",
     "pi-ai/stream.ts::mapGoogleToolChoice": "579fbef6c3cd811836933866fdf305cd79a33415c8409ff8b024897c589027c4",
     "pi-ai/stream.ts::mapOptionsForApi": "1d17e4331d456350e74939b75ea35a68e05942a957ef1644539f2d96b0d325ae",
-    "pi-ai/stream.ts::maxTokensWithThinkingBudget": "aac9e798323eb2f68d6caf79c3a0b4cf286c2ae3f3e655acf414a53a917ffff1",
+    "pi-ai/stream.ts::normalizeMandatoryReasoningOptions": "3ff4c00b39a9dfbd8d3c5295e683aaa6cb1b51b1e505c1865ff49cbe196538a9",
     "pi-ai/stream.ts::resolveWithThinkingLoopRetries": "13da527f2401e2087af6fab2061ee4227cd40eedc7defc6d77513cc83393ab47",
     "pi-ai/types.ts::shouldSendServiceTier": "71a975ed90149a3c85f732bc2de155902b8a0779e8bfa51ea6e4bb6e9042dcb6",
     "pi-ai/usage/claude-api.ts::DEFAULT_CLAUDE_API_BASE_URL": "69200334abf3566ce59da563b0585fdb040ed0c3bb86ff095fbd6c9f548d0cd8",
