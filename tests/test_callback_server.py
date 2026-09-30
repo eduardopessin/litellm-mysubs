@@ -26,14 +26,19 @@ from litellm_mysubs.credentials.callback_server import (
 PATH = "/callback"
 STATE = "state-of-this-session"
 
-#: High ephemeral ports, one per test, so that a race between tests does not disguise
-#: itself as a `PortInUseError`.
-_PORTS = iter(range(45100, 45400))
-
 
 @pytest.fixture
 def port() -> Iterator[int]:
-    yield next(_PORTS)
+    """A port nothing holds right now, chosen by the kernel.
+
+    Fixed numbers (45100+) sat inside Linux's ephemeral range, so another test's client
+    socket could be using one as its source port: measured in a shuffled full run, the
+    busy-port test failed binding its own holder with `Address already in use`.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        free = probe.getsockname()[1]
+    yield free
 
 
 async def request(port: int, target: str, *, host: str = "127.0.0.1") -> str:

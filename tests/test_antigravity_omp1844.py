@@ -75,19 +75,6 @@ def proxy(monkeypatch: pytest.MonkeyPatch) -> Iterable[None]:
     # A Router registers its deployments' models into the process-wide cost map; a name
     # left there reprices other tests' calls.
     monkeypatch.setattr(litellm, "model_cost", dict(litellm.model_cost))
-    # Each Router and each call adds to LiteLLM's process-wide callback lists, which cap at
-    # `MAX_CALLBACKS` and then refuse silently: left to grow here, a later test's spend
-    # recorder was never registered. Every list is this test's own copy.
-    for name in (
-        "callbacks",
-        "input_callback",
-        "success_callback",
-        "failure_callback",
-        "_async_success_callback",
-        "_async_failure_callback",
-        "service_callback",
-    ):
-        monkeypatch.setattr(litellm, name, list(getattr(litellm, name)))
     for (module, name), function in _LITELLM_ENTRY_POINTS.items():
         monkeypatch.setattr(module, name, function)
     router = litellm.Router(

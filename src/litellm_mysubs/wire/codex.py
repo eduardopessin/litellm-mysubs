@@ -164,7 +164,7 @@ BETA_RESPONSES: Final = "responses=experimental"
 #: `claude-cli/…` on the Anthropic path, where the CLI *is* the client; here it is not. The
 #: constant lives in a third package (`@oh-my-pi/pi-utils`), which neither `pi-ai` nor
 #: `pi-catalog` contained.
-OMP_VERSION: Final = "18.4.1"
+OMP_VERSION: Final = "18.4.4"
 USER_AGENT: Final = f"omp/{OMP_VERSION}"
 
 # omp: providers/openai-codex-responses.ts :: OpenAICodexRequestKind

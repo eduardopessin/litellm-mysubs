@@ -38,15 +38,6 @@ STREAMING = [pytest.param(False, id="whole"), pytest.param(True, id="stream")]
 def proxy(monkeypatch: pytest.MonkeyPatch) -> Iterable[None]:
     plugin.uninstall()
     monkeypatch.setattr(litellm, "model_cost", dict(litellm.model_cost))
-    # The Router registers its callbacks into these; fresh ones keep a Router per test
-    # from filling LiteLLM's process-wide lists up to `MAX_CALLBACKS`.
-    for name in (
-        "_async_success_callback",
-        "success_callback",
-        "_async_failure_callback",
-        "failure_callback",
-    ):
-        monkeypatch.setattr(litellm, name, [])
     router = litellm.Router(
         model_list=[
             {

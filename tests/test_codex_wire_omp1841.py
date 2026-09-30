@@ -131,7 +131,7 @@ class TestPlainTurn:
             "OpenAI-Beta": "responses=experimental",
             "originator": "omp",
             "version": "0.159.0",
-            "User-Agent": "omp/18.4.1",
+            "User-Agent": "omp/18.4.4",
             "conversation_id": "conv-1",
             "session_id": "conv-1",
             "x-client-request-id": "conv-1",

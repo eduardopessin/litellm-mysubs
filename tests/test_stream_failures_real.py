@@ -108,17 +108,6 @@ RECORDER = Failures()
 @pytest.fixture(autouse=True)
 def proxy(monkeypatch: pytest.MonkeyPatch) -> Iterable[Failures]:
     plugin.uninstall()
-    # Fresh lists before the Router is built: it registers its own callbacks into them,
-    # and into the process-wide ones they would stay, one set per test, until LiteLLM's
-    # `MAX_CALLBACKS` refused any other module's recorder.
-    for name in (
-        "_async_success_callback",
-        "success_callback",
-        "_async_failure_callback",
-        "failure_callback",
-        "input_callback",
-    ):
-        monkeypatch.setattr(litellm, name, [])
     router = litellm.Router(
         model_list=[
             {
