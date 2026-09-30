@@ -17,8 +17,10 @@ trying. When widening is not enough either, it falls back to the empty schema
 
 from __future__ import annotations
 
+import copy
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Final
 
 JsonObject = dict[str, Any]
@@ -523,6 +525,323 @@ def dereference_schema(schema: object) -> object:
     if "$defs" not in schema and "definitions" not in schema:
         return schema
     return _dereference_node(schema, schema, set())
+
+
+# ---------------------------------------------------------------------------
+# Tool wire schema (utils/schema/wire.ts)
+# ---------------------------------------------------------------------------
+
+#: Keys whose value is a single JSON Schema — wire.ts's own list, not normalize.ts's.
+# omp: utils/schema/wire.ts :: SCHEMA_VALUE_KEYS
+WIRE_SCHEMA_VALUE_KEYS: Final[tuple[str, ...]] = (
+    "additionalProperties",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "items",
+    "contains",
+    "propertyNames",
+    "if",
+    "then",
+    "else",
+    "not",
+)
+
+# omp: utils/schema/wire.ts :: SCHEMA_MAP_KEYS
+WIRE_SCHEMA_MAP_KEYS: Final[tuple[str, ...]] = (
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+)
+
+# omp: utils/schema/wire.ts :: SCHEMA_ARRAY_KEYS
+WIRE_SCHEMA_ARRAY_KEYS: Final[tuple[str, ...]] = ("anyOf", "oneOf", "allOf", "prefixItems")
+
+# omp: utils/schema/wire.ts :: NULLABLE_SCALAR_TYPES
+_NULLABLE_SCALAR_TYPES: Final[frozenset[str]] = frozenset(
+    {"string", "number", "integer", "boolean"}
+)
+
+#: Keys that already give a node its shape: a node carrying any of them beside `anyOf` is
+#: not a bare union and must keep it.
+# omp: utils/schema/wire.ts :: SCHEMA_DEFINING_SIBLING_KEYS
+_SCHEMA_DEFINING_SIBLING_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "$ref",
+        "additionalProperties",
+        "allOf",
+        "anyOf",
+        "const",
+        "contains",
+        "enum",
+        "if",
+        "items",
+        "not",
+        "oneOf",
+        "patternProperties",
+        "prefixItems",
+        "properties",
+        "propertyNames",
+        "then",
+        "else",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+
+#: ``name /** description */`` — ArkType writes a property's description into its key.
+_ARK_OBJECT_KEY = re.compile(r"^(.*?)\s*/\*\*\s*([\s\S]*?)\s*\*/\s*$")
+
+
+# omp: utils/schema/wire.ts :: parseArkObjectKey
+def _parse_ark_object_key(key: str) -> tuple[str, str | None]:
+    match = _ARK_OBJECT_KEY.match(key)
+    if match is None:
+        return key, None
+    return match.group(1).strip(), match.group(2).strip()
+
+
+# omp: utils/schema/wire.ts :: withArkKeyDescription
+def _with_ark_key_description(schema: object, description: str | None) -> object:
+    if not description:
+        return schema
+    if isinstance(schema, dict):
+        if not isinstance(schema.get("description"), str):
+            schema["description"] = description
+        return schema
+    return {"anyOf": [schema], "description": description}
+
+
+# omp: utils/schema/wire.ts :: hasSchemaDefiningSibling
+def _has_schema_defining_sibling(schema: JsonObject) -> bool:
+    return any(key != "anyOf" and key in _SCHEMA_DEFINING_SIBLING_KEYS for key in schema)
+
+
+# omp: utils/schema/wire.ts :: copyNullableScalarConstraints
+def _copy_nullable_scalar_constraints(schema: JsonObject, scalar_variant: JsonObject) -> None:
+    for key, value in scalar_variant.items():
+        if key in ("type", "enum", "const") or key in schema:
+            continue
+        schema[key] = value
+    if "const" in scalar_variant:
+        schema["enum"] = [scalar_variant["const"], None]
+        return
+    enum_values = scalar_variant.get("enum")
+    if isinstance(enum_values, list):
+        schema["enum"] = enum_values if None in enum_values else [*enum_values, None]
+
+
+# omp: utils/schema/wire.ts :: rewriteNullableScalarAnyOf
+def _rewrite_nullable_scalar_any_of(schema: JsonObject) -> None:
+    """``anyOf: [{type: T}, {type: "null"}]`` becomes ``type: [T, "null"]`` for a scalar
+    ``T`` — the form pydantic emits for ``T | None``."""
+    if _has_schema_defining_sibling(schema):
+        return
+    variants = schema.get("anyOf")
+    if not isinstance(variants, list) or len(variants) != 2:
+        return
+    scalar_variant: JsonObject | None = None
+    saw_null = False
+    for variant in variants:
+        if not isinstance(variant, dict):
+            return
+        if variant.get("type") == "null" and len(variant) == 1:
+            if saw_null:
+                return
+            saw_null = True
+            continue
+        variant_type = variant.get("type")
+        if not isinstance(variant_type, str) or variant_type not in _NULLABLE_SCALAR_TYPES:
+            return
+        if scalar_variant is not None:
+            return
+        scalar_variant = variant
+    if not saw_null or scalar_variant is None:
+        return
+    del schema["anyOf"]
+    _copy_nullable_scalar_constraints(schema, scalar_variant)
+    schema["type"] = [scalar_variant["type"], "null"]
+
+
+# omp: utils/schema/wire.ts :: homogeneousEnumScalarType
+def _homogeneous_enum_scalar_type(values: list[Any]) -> str | None:
+    inferred: str | None = None
+    for value in values:
+        if isinstance(value, bool):
+            scalar = "boolean"
+        elif isinstance(value, str):
+            scalar = "string"
+        elif isinstance(value, int | float):
+            scalar = "number"
+        else:
+            return None
+        if inferred is None:
+            inferred = scalar
+        elif inferred != scalar:
+            return None
+    return inferred
+
+
+# omp: utils/schema/wire.ts :: inferBareEnumScalarType
+def _infer_bare_enum_scalar_type(obj: JsonObject) -> None:
+    """Gemini rejects an ``enum`` without ``type`` ("schema didn't specify the schema type
+    field"); every member sharing one scalar type supplies it."""
+    if "type" in obj or not isinstance(obj.get("enum"), list):
+        return
+    inferred = _homogeneous_enum_scalar_type(obj["enum"])
+    if inferred is not None:
+        obj["type"] = inferred
+
+
+# omp: utils/schema/wire.ts :: collapseConstUnionAnyOf
+def _collapse_const_union_any_of(obj: JsonObject) -> None:
+    """An ``anyOf`` of bare ``{const}`` branches of one scalar type becomes a typed ``enum``,
+    only when nothing is lost: the branch descriptions are absent or all equal and agree
+    with the node's own."""
+    if _has_schema_defining_sibling(obj) or "type" in obj:
+        return
+    variants = obj.get("anyOf")
+    if not isinstance(variants, list) or len(variants) < 2:
+        return
+    values: list[Any] = []
+    branch_description: str | None = None
+    described = 0
+    for variant in variants:
+        if not isinstance(variant, dict) or "const" not in variant:
+            return
+        if any(key not in ("const", "description") for key in variant):
+            return
+        description = variant.get("description")
+        if isinstance(description, str):
+            if described == 0:
+                branch_description = description
+            elif description != branch_description:
+                return
+            described += 1
+        values.append(variant["const"])
+    if described not in (0, len(variants)):
+        return
+    own = obj.get("description")
+    if described == len(variants) and isinstance(own, str) and own != branch_description:
+        return
+    scalar_type = _homogeneous_enum_scalar_type(values)
+    if scalar_type is None:
+        return
+    del obj["anyOf"]
+    obj["type"] = scalar_type
+    obj["enum"] = values
+    if not isinstance(own, str) and branch_description is not None:
+        obj["description"] = branch_description
+
+
+# omp: utils/schema/wire.ts :: walk
+def _wire_walk(node: object) -> None:
+    """Every object anywhere in the tree, as omp walks it — instance data included."""
+    if isinstance(node, list):
+        for child in node:
+            _wire_walk(child)
+        return
+    if not isinstance(node, dict):
+        return
+    _rewrite_nullable_scalar_any_of(node)
+    _infer_bare_enum_scalar_type(node)
+    _collapse_const_union_any_of(node)
+    for child in list(node.values()):
+        _wire_walk(child)
+
+
+# omp: utils/schema/wire.ts :: normalizeArkPropertyComments
+def _normalize_ark_property_comments(node: object) -> None:
+    if isinstance(node, list):
+        for child in node:
+            _normalize_ark_property_comments(child)
+        return
+    if not isinstance(node, dict):
+        return
+    properties = node.get("properties")
+    if isinstance(properties, dict):
+        required = node.get("required")
+        if isinstance(required, list):
+            node["required"] = [
+                _parse_ark_object_key(key)[0] if isinstance(key, str) else key for key in required
+            ]
+        for key in list(properties):
+            name, description = _parse_ark_object_key(key)
+            property_schema = properties[key]
+            if description:
+                property_schema = _with_ark_key_description(property_schema, description)
+                del properties[key]
+                properties[name] = property_schema
+            _normalize_ark_property_comments(property_schema)
+    for key in WIRE_SCHEMA_VALUE_KEYS:
+        if key in node:
+            _normalize_ark_property_comments(node[key])
+    for map_key in WIRE_SCHEMA_MAP_KEYS:
+        if map_key == "properties":
+            continue
+        schema_map = node.get(map_key)
+        if isinstance(schema_map, dict):
+            for child in schema_map.values():
+                _normalize_ark_property_comments(child)
+    for array_key in WIRE_SCHEMA_ARRAY_KEYS:
+        array = node.get(array_key)
+        if isinstance(array, list):
+            for child in array:
+                _normalize_ark_property_comments(child)
+
+
+# omp: utils/schema/wire.ts :: isEmptyObject
+def _is_empty_object(value: object) -> bool:
+    return isinstance(value, dict) and not value
+
+
+# omp: utils/schema/wire.ts :: normalizeEmptySchemas
+def _normalize_empty_schemas(node: object) -> None:
+    """``{}`` in a schema slot becomes ``true`` — the same schema (draft 2020-12 §4.3.1),
+    which constrained samplers do not misread as "an empty object"."""
+    if isinstance(node, list):
+        for child in node:
+            _normalize_empty_schemas(child)
+        return
+    if not isinstance(node, dict):
+        return
+    for key in WIRE_SCHEMA_VALUE_KEYS:
+        if key in node and _is_empty_object(node[key]):
+            node[key] = True
+    for map_key in WIRE_SCHEMA_MAP_KEYS:
+        schema_map = node.get(map_key)
+        if isinstance(schema_map, dict):
+            for name, child in schema_map.items():
+                if _is_empty_object(child):
+                    schema_map[name] = True
+    for array_key in WIRE_SCHEMA_ARRAY_KEYS:
+        array = node.get(array_key)
+        if isinstance(array, list):
+            for index, child in enumerate(array):
+                if _is_empty_object(child):
+                    array[index] = True
+    for child in list(node.values()):
+        _normalize_empty_schemas(child)
+
+
+# omp: utils/schema/wire.ts :: postProcessJsonSchema
+def _post_process_json_schema(schema: object) -> object:
+    _wire_walk(schema)
+    _normalize_ark_property_comments(schema)
+    _normalize_empty_schemas(schema)
+    return schema
+
+
+# omp: utils/schema/wire.ts :: toolWireSchema
+def tool_wire_schema(schema: object) -> object:
+    """A tool's parameters as the JSON Schema omp puts on every provider's wire.
+
+    A new object; the input is left untouched. omp also accepts ArkType schemas and their
+    JSON AST here — its in-process tool authoring forms. What reaches this proxy is JSON
+    Schema from an HTTP client, so only the plain-JSON branch is ported.
+    """
+    upgraded = upgrade_to_2020_12(copy.deepcopy(schema))
+    return _post_process_json_schema(upgraded)
 
 
 # ---------------------------------------------------------------------------
@@ -1124,19 +1443,146 @@ def _push_enum_value(values: list[Any], value: object) -> None:
         values.append(value)
 
 
+# omp: utils/schema/normalize.ts :: NormalizeSchemaOptions
+@dataclass(frozen=True, slots=True)
+class _NormalizeOptions:
+    """The options on which omp's Google and CCA presets differ.
+
+    What both share stays fixed in the walk: ``standard`` boolean coercion, Google's
+    unsupported fields spilled into the description, snake_case renames, type arrays
+    reduced to one type, bare enums typed, and ``type: object`` given ``properties``.
+    ``collapse_combiners`` stands for omp's three combiner flags (merge object variants,
+    collapse same-type and mixed-type variants), which neither preset sets apart.
+    """
+
+    collapse_null_fields: bool
+    strip_nullable_keyword: bool
+    auto_property_ordering: bool
+    string_enums_only: bool
+    collapse_combiners: bool
+    strip_residual_combiners_fixpoint: bool
+    extract_nullable_from_unions: bool
+    reject_residual_incompatibilities: bool
+    fallback: JsonObject | None
+
+
+# omp: utils/schema/normalize.ts :: normalizeSchemaForGoogle
+_GOOGLE: Final = _NormalizeOptions(
+    collapse_null_fields=True,
+    strip_nullable_keyword=False,
+    auto_property_ordering=True,
+    string_enums_only=True,
+    collapse_combiners=False,
+    strip_residual_combiners_fixpoint=False,
+    extract_nullable_from_unions=False,
+    reject_residual_incompatibilities=False,
+    fallback=None,
+)
+
+# omp: utils/schema/normalize.ts :: normalizeSchemaForCCA
+_CCA: Final = _NormalizeOptions(
+    collapse_null_fields=False,
+    strip_nullable_keyword=True,
+    auto_property_ordering=False,
+    string_enums_only=False,
+    collapse_combiners=True,
+    strip_residual_combiners_fixpoint=True,
+    extract_nullable_from_unions=True,
+    reject_residual_incompatibilities=True,
+    fallback=CCA_FALLBACK_SCHEMA,
+)
+
+
+# omp: utils/schema/normalize.ts :: preHandleNullFields
+def _pre_handle_null_fields(obj: JsonObject) -> JsonObject:
+    """python-genai's ``handle_null_fields``, on the parent before its children: a
+    ``type: "null"`` node and the null branch of an ``anyOf`` become ``nullable: true``."""
+    if obj.get("type") == "null":
+        out = {k: v for k, v in obj.items() if k != "type"}
+        out["nullable"] = True
+        return out
+    variants = obj.get("anyOf")
+    if not isinstance(variants, list):
+        return obj
+    kept = [v for v in variants if not (isinstance(v, dict) and v.get("type") == "null")]
+    if len(kept) == len(variants):
+        return obj
+    out = dict(obj)
+    out["nullable"] = True
+    if not kept:
+        del out["anyOf"]
+    elif len(kept) == 1 and isinstance(kept[0], dict):
+        del out["anyOf"]
+        for key, value in kept[0].items():
+            if key not in out:
+                out[key] = value
+    else:
+        out["anyOf"] = kept
+    return out
+
+
+# omp: utils/schema/normalize.ts :: hasUnrepresentableGoogleEnumConstraint
+def _has_unrepresentable_google_enum_constraint(
+    value: object, inside_schema_map: bool = False, seen: _Seen | None = None
+) -> bool:
+    """A ``not`` whose subtree carries a non-string ``enum``/``const``: Google's enum is
+    string-only, so the negation has no form there and is dropped whole."""
+    if seen is None:
+        seen = _Seen()
+    if isinstance(value, list):
+        if not seen.first(value):
+            return False
+        return any(_has_unrepresentable_google_enum_constraint(v, False, seen) for v in value)
+    if not isinstance(value, dict) or not seen.first(value):
+        return False
+    if inside_schema_map:
+        return any(
+            _has_unrepresentable_google_enum_constraint(v, False, seen) for v in value.values()
+        )
+    enum = value.get("enum")
+    if isinstance(enum, list) and (not enum or any(not isinstance(v, str) for v in enum)):
+        return True
+    if "const" in value and not isinstance(value["const"], str):
+        return True
+    for key, child in value.items():
+        kind = _classify_schema_child(key, child, False)
+        if kind and _has_unrepresentable_google_enum_constraint(child, kind == "map", seen):
+            return True
+    return False
+
+
+# omp: utils/schema/normalize.ts :: dropNonStringEnumForGoogle
+def _drop_non_string_enum_for_google(schema: JsonObject) -> JsonObject:
+    enum = schema.get("enum")
+    if not isinstance(enum, list):
+        return schema
+    if enum and all(isinstance(v, str) for v in enum):
+        return schema
+    return _copy_without(schema, "enum")
+
+
 # omp: utils/schema/normalize.ts :: applyNodePostProcessing
-def _apply_node_post_processing(schema: JsonObject) -> JsonObject:
+def _apply_node_post_processing(
+    schema: JsonObject, options: _NormalizeOptions, boolean_is_subschema: bool
+) -> JsonObject:
     current = schema
-    for combiner in JSON_SCHEMA_COMBINERS:
-        current = _merge_object_combiner_variants(current, combiner)
-        current = _collapse_mixed_type_combiner_variants(current, combiner)
-        current = _collapse_same_type_combiner_variants(current, combiner)
+    if options.collapse_combiners:
+        for combiner in JSON_SCHEMA_COMBINERS:
+            current = _merge_object_combiner_variants(current, combiner)
+            current = _collapse_mixed_type_combiner_variants(current, combiner)
+            current = _collapse_same_type_combiner_variants(current, combiner)
+    if options.string_enums_only and boolean_is_subschema:
+        current = _drop_non_string_enum_for_google(current)
     return current
 
 
 # omp: utils/schema/normalize.ts :: normalizeSchemaNode
 def _normalize_schema_node(
-    value: object, path: set[int], inside_schema_map: bool, boolean_is_subschema: bool
+    value: object,
+    path: set[int],
+    inside_schema_map: bool,
+    boolean_is_subschema: bool,
+    options: _NormalizeOptions,
 ) -> object:
     if isinstance(value, list):
         if id(value) in path:
@@ -1144,7 +1590,9 @@ def _normalize_schema_node(
         path.add(id(value))
         try:
             return [
-                _normalize_schema_node(entry, path, inside_schema_map, boolean_is_subschema)
+                _normalize_schema_node(
+                    entry, path, inside_schema_map, boolean_is_subschema, options
+                )
                 for entry in value
             ]
         finally:
@@ -1164,23 +1612,35 @@ def _normalize_schema_node(
         return {}
     path.add(id(value))
     try:
-        return _normalize_schema_object_node(value, path, inside_schema_map)
+        return _normalize_schema_object_node(
+            value, path, inside_schema_map, boolean_is_subschema, options
+        )
     finally:
         path.discard(id(value))
 
 
-def _walk_child(key: str, entry: object, path: set[int], inside_schema_map: bool) -> object:
+def _walk_child(
+    key: str, entry: object, path: set[int], inside_schema_map: bool, options: _NormalizeOptions
+) -> object:
     child_kind = _classify_schema_child(key, entry, inside_schema_map)
     if child_kind is None:
         return entry
-    return _normalize_schema_node(entry, path, child_kind == "map", child_kind == "schema")
+    return _normalize_schema_node(
+        entry, path, child_kind == "map", child_kind == "schema", options
+    )
 
 
 # omp: utils/schema/normalize.ts :: normalizeSchemaObjectNode
 def _normalize_schema_object_node(
-    value: JsonObject, path: set[int], inside_schema_map: bool
+    value: JsonObject,
+    path: set[int],
+    inside_schema_map: bool,
+    boolean_is_subschema: bool,
+    options: _NormalizeOptions,
 ) -> object:
     obj = value if inside_schema_map else _apply_snake_case_renames(value)
+    if options.collapse_null_fields and not inside_schema_map:
+        obj = _pre_handle_null_fields(obj)
     result: JsonObject = {}
     spill: list[tuple[str, Any]] = []
 
@@ -1190,7 +1650,15 @@ def _normalize_schema_object_node(
             if key in LIFTABLE_TO_DESCRIPTION_FIELDS:
                 spill.append((key, entry))
             return True
-        return key == "nullable"
+        if options.strip_nullable_keyword and key == "nullable":
+            return True
+        # Google's `enum` is string-only: a negation built on another kind has no form.
+        return (
+            options.string_enums_only
+            and not inside_schema_map
+            and key == "not"
+            and _has_unrepresentable_google_enum_constraint(entry)
+        )
 
     for combiner in JSON_SCHEMA_COMBINERS:
         variants = obj.get(combiner)
@@ -1217,13 +1685,15 @@ def _normalize_schema_object_node(
                 non_null = [t for t in inferred if t != "null"]
                 if "null" in inferred and len(set(non_null)) == 1:
                     result["type"] = non_null[0]
+                    if not options.strip_nullable_keyword:
+                        result["nullable"] = True
 
         for key, entry in obj.items():
             if key == combiner or key in result or strip_or_keep(key, entry):
                 continue
-            result[key] = _walk_child(key, entry, path, inside_schema_map)
+            result[key] = _walk_child(key, entry, path, inside_schema_map, options)
         _spill_to_description(result, spill)
-        return _apply_node_post_processing(result)
+        return _apply_node_post_processing(result, options, boolean_is_subschema)
 
     const_value: Any = None
     has_const = False
@@ -1234,11 +1704,13 @@ def _normalize_schema_object_node(
             const_value = entry
             has_const = True
             continue
-        result[key] = _walk_child(key, entry, path, inside_schema_map)
+        result[key] = _walk_child(key, entry, path, inside_schema_map, options)
 
     if isinstance(result.get("type"), list):
         types = [t for t in result["type"] if isinstance(t, str)]
         non_null = [t for t in types if t != "null"]
+        if "null" in types and not options.strip_nullable_keyword:
+            result["nullable"] = True
         result["type"] = non_null[0] if non_null else (types[0] if types else None)
 
     if has_const:
@@ -1261,16 +1733,59 @@ def _normalize_schema_object_node(
         if all(t is not None for t in enum_types) and len(set(enum_types)) == 1:
             result["type"] = enum_types[0]
 
+    if options.collapse_null_fields and result.get("type") == "null":
+        del result["type"]
+        if not options.strip_nullable_keyword:
+            result["nullable"] = True
+
+    if (
+        options.auto_property_ordering
+        and result.get("type") == "object"
+        and "propertyOrdering" not in result
+        and isinstance(result.get("properties"), dict)
+        and len(result["properties"]) > 1
+    ):
+        # Gemini generates the arguments in this order; without it the order is its own.
+        result["propertyOrdering"] = list(result["properties"])
+
     if result.get("type") == "object" and "properties" not in result:
         # The proto requires the field; a `type: object` without it is read as an opaque
         # object and the tool receives arguments it never validated.
         result["properties"] = {}
 
     _spill_to_description(result, spill)
-    return _apply_node_post_processing(result)
+    return _apply_node_post_processing(result, options, boolean_is_subschema)
 
 
-# omp: utils/schema/normalize.ts :: normalizeSchema, normalizeSchemaForCCA
+# omp: utils/schema/normalize.ts :: normalizeSchema
+def _normalize_schema(schema: object, options: _NormalizeOptions) -> object:
+    upgraded = upgrade_to_2020_12(schema)
+    dereferenced = dereference_schema(upgraded)
+    normalized = _normalize_schema_node(dereferenced, set(), False, True, options)
+    if options.strip_residual_combiners_fixpoint:
+        normalized = strip_residual_combiners(normalized)
+    if options.extract_nullable_from_unions:
+        normalized = _normalize_nullable_properties(normalized, False, _Seen())[0]
+    if options.reject_residual_incompatibilities and has_residual_incompatibilities(normalized):
+        return copy.deepcopy(options.fallback) if options.fallback is not None else normalized
+    if options.fallback is not None and not is_valid_json_schema(normalized):
+        return copy.deepcopy(options.fallback)
+    return normalized
+
+
+# omp: utils/schema/normalize.ts :: normalizeSchemaForGoogle
+def normalize_for_google(schema: object) -> object:
+    """A tool JSON Schema in the Gemini `Schema` dialect.
+
+    Null-typed nodes and null branches become ``nullable: true``, non-string enums go (the
+    field is string-only), combiners stay, and an object with more than one property gets
+    ``propertyOrdering`` in declaration order. Nothing falls back: what cannot be expressed
+    is left for the next pass to widen.
+    """
+    return _normalize_schema(schema, _GOOGLE)
+
+
+# omp: utils/schema/normalize.ts :: normalizeSchemaForCCA
 def normalize_for_cca(schema: object) -> dict[str, Any]:
     """Sanitizes a tool JSON Schema for Cloud Code Assist.
 
@@ -1278,16 +1793,8 @@ def normalize_for_cca(schema: object) -> dict[str, Any]:
     the backend rejects or stopped being valid JSON Schema — a request with an invalid
     schema fails in its entirety, not just on that tool.
     """
-    upgraded = upgrade_to_2020_12(schema)
-    dereferenced = dereference_schema(upgraded)
-    normalized = _normalize_schema_node(dereferenced, set(), False, True)
-    normalized = strip_residual_combiners(normalized)
-    normalized = _normalize_nullable_properties(normalized, False, _Seen())[0]
-    if has_residual_incompatibilities(normalized):
-        return dict(CCA_FALLBACK_SCHEMA)
-    if not is_valid_json_schema(normalized) or not isinstance(normalized, dict):
-        return dict(CCA_FALLBACK_SCHEMA)
-    return normalized
+    normalized = _normalize_schema(schema, _CCA)
+    return normalized if isinstance(normalized, dict) else copy.deepcopy(CCA_FALLBACK_SCHEMA)
 
 
 # ---------------------------------------------------------------------------

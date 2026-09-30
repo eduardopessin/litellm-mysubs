@@ -12,6 +12,7 @@ match raises instead of being silently served by another model.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Final
@@ -131,22 +132,57 @@ def base_family(model: str) -> str:
     return base
 
 
+def _wire_name(model: str) -> str:
+    return str(model).split("/")[-1].lower()
+
+
+# omp: providers/google-shared.ts :: convertTools
+# omp: providers/google-gemini-cli.ts :: buildRequest
+def is_claude(model: str) -> bool:
+    """The Anthropic models this backend serves, which omp's catalog frames apart.
+
+    pi-catalog ``classes/anthropic.kdl`` gives them, on ``google-antigravity`` only,
+    ``cca-legacy-parameters-schema`` (tool schemas skip the Google dialect) and
+    ``antigravity-claude-tool-mode`` (``toolConfig`` is always ``VALIDATED``).
+    """
+    return _wire_name(model).startswith("claude-")
+
+
+#: `gemini-1.x` / `gemini-2.x`, the generations before thought signatures.
+_PRE_GEMINI_3: Final = re.compile(r"^gemini-[12](?:[.-]|$)")
+
+
+# omp: providers/google-shared.ts :: convertMessages
+def requires_first_call_signature(model: str) -> bool:
+    """Whether an unsigned first ``functionCall`` of a turn needs the bypass sentinel.
+
+    pi-catalog ``providers/google-antigravity.kdl``: Gemini ``revision >= 3`` only
+    (``requires-skip-thought-signature-on-first-function-call``). The agent ids with no
+    version in the name (``gemini-pro-agent``) are 3.x routes, so only an explicit 1.x or
+    2.x opts out. Claude and ``gpt-oss`` validate no signature and get none.
+    """
+    name = _wire_name(model)
+    return name.startswith("gemini-") and _PRE_GEMINI_3.match(name) is None
+
+
+# omp: providers/google-shared.ts :: convertMessages
 def supports_function_ids(model: str) -> bool:
     """Whether `functionCall`/`functionResponse` carry an ``id`` for this model.
 
-    Two backends sit behind Antigravity and they disagree. Gemini accepts the id from
-    `gemini-3` onwards and 400s on the older variants, which is what the name test covers.
-    The Claude models this account serves run on Vertex, where `tool_use.id` is **required**
-    — a request without it is refused on the turn that carries the result back::
+    pi-catalog grants ``supports-function-part-id`` on this host to the Anthropic class
+    (``classes/anthropic.kdl``) and to ``gpt-oss`` (``classes/gpt-oss.kdl``), and to no
+    Gemini: Gemini's id is a public-API contract (``on-api "google-generative-ai"``).
+
+    The Claude models run on Vertex, where `tool_use.id` is **required** — a request
+    without it is refused on the turn that carries the result back::
 
         HTTP 400 messages.1.content.0.tool_use.id: Field required
 
-    Gating on the name alone meant every Claude served here lost its ids. Measured on the
-    live gateway: 97 failures on `claude-sonnet-4-6` and 88 on `claude-opus-4-6-thinking`,
-    all on the second turn, while the first one — which carries no result — went through.
+    Measured on the live gateway when the gate was the name alone: 97 failures on
+    `claude-sonnet-4-6` and 88 on `claude-opus-4-6-thinking`, all on the second turn,
+    while the first one — which carries no result — went through.
     """
-    name = str(model).split("/")[-1].lower()
-    return name.startswith(("gemini-3", "claude-"))
+    return _wire_name(model).startswith(("claude-", "gpt-oss"))
 
 
 def _from_catalog(raw: str, effort: str, available: tuple[str, ...]) -> str | None:

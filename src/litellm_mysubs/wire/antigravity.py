@@ -11,15 +11,28 @@ network — the original called ``httpx.get`` in the middle of the conversion.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import mimetypes
 import re
+import secrets
+import time
 import urllib.parse
+import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from typing import Any, Final, NamedTuple
 
-from .antigravity_models import ModelCatalog, base_family, map_model, supports_function_ids
-from .schema import normalize_for_cca
+from .antigravity_models import (
+    ModelCatalog,
+    base_family,
+    is_claude,
+    map_model,
+    requires_first_call_signature,
+    supports_function_ids,
+)
+from .schema import normalize_for_cca, normalize_for_google, tool_wire_schema
 
 # Byte limit for inlining media. The backend accepts well beyond this, but a request that
 # drags tens of MB per turn is a latency and context-window problem, not a capacity one.
@@ -55,9 +68,24 @@ THINKING_LEVEL: Final[dict[str, str]] = {
 SUPPRESSED_THINKING_LEVEL: Final = "MINIMAL"
 
 # omp: providers/google-shared.ts :: SKIP_THOUGHT_SIGNATURE
-#: The CCA requires the sentinel when the **first** call of an assistant turn goes without
-#: a signature; later calls in the same turn go bare.
+#: The CCA requires the sentinel when the **first** call of an assistant turn of a Gemini 3+
+#: model goes without a signature; later calls in the same turn go bare.
 SIGNATURE_SENTINEL: Final = "skip_thought_signature_validator"
+
+# omp: providers/google-gemini-cli.ts :: buildRequest
+#: ``google-antigravity-forced-tool.md``, which ``buildRequest`` imports as text — the file's
+#: trailing newline included. Appended as a user turn when a Gemini request forces a tool
+#: call. The drift checker hashes TypeScript and KDL only, so this anchor tracks the function
+#: that sends the text, not the markdown file itself.
+FORCED_TOOL_DIRECTIVE: Final = (
+    "TOOL-ONLY TURN. This turn accepts a tool call and nothing else; a text reply here is "
+    "discarded unread and you will be re-prompted. Emit the tool call now.\n"
+)
+
+#: ``toolConfig`` when nothing else applies. omp: "Antigravity's default tool mode is
+#: VALIDATED (verified for Gemini and Claude)" — the backend checks each call against the
+#: declared schema before emitting it.
+VALIDATED_MODE: Final = "VALIDATED"
 
 # omp: providers/google-shared.ts :: convertMessages
 #: Text of a tool result that carries nothing but an image.
@@ -368,24 +396,108 @@ def content_parts(
     return parts
 
 
+_ASCII_SPACE: Final = " \t\n\v\f\r"
+
+
+# omp: dialect/rendering.ts :: findDelimitedThinkingClose
+def _find_thinking_close(open_: str, close: str, text: str, start: int, end: int) -> int:
+    depth = 1
+    cursor = start
+    while cursor < end:
+        next_close = text.find(close, cursor)
+        if next_close < 0 or next_close >= end:
+            return -1
+        next_open = text.find(open_, cursor)
+        if 0 <= next_open < next_close:
+            depth += 1
+            cursor = next_open + len(open_)
+            continue
+        depth -= 1
+        if depth == 0:
+            return next_close
+        cursor = next_close + len(close)
+    return -1
+
+
+# omp: dialect/rendering.ts :: unwrapDelimitedThinking
+def _unwrap_thinking(open_: str, close: str, text: str) -> str:
+    """Reasoning already wrapped in the target's tags, unwrapped so it is not wrapped twice."""
+    end = len(text.rstrip(_ASCII_SPACE))
+    cursor = len(text) - len(text.lstrip(_ASCII_SPACE))
+    if cursor >= end or not text.startswith(open_, cursor):
+        return text
+    segments: list[str] = []
+    while cursor < end:
+        if not text.startswith(open_, cursor):
+            return text
+        inner_start = cursor + len(open_)
+        inner_end = _find_thinking_close(open_, close, text, inner_start, end)
+        if inner_end < 0:
+            return text
+        inner = text[inner_start:inner_end].strip(_ASCII_SPACE)
+        segments.append(_unwrap_thinking(open_, close, inner))
+        rest = text[inner_end + len(close) : end]
+        cursor = end - len(rest.lstrip(_ASCII_SPACE))
+    return "\n".join(segments)
+
+
+# omp: dialect/demotion.ts :: renderDemotedThinking
+# omp: dialect/gemini.ts :: renderThinking
+# omp: dialect/xml.ts :: renderThinking
+def demoted_thinking(model: str, text: str) -> str:
+    """Prior-turn reasoning as text in the target model's own thinking form.
+
+    omp's reasoning: a replayed unsigned ``thought`` part is accepted and silently discarded
+    — "verified end-to-end against Gemini 3" — so reasoning a client sends back survives
+    only as text, wrapped the way the model writes its own so it reads as reasoning and not
+    as prose to imitate. Claude gets it bare: Anthropic's classifier refuses or leaks
+    reasoning replayed inside thinking tags. ``gpt-oss`` (Harmony) gets a plain ``<think>``
+    block, Gemini its ``thinking`` code fence, anything else omp's XML fallback.
+    """
+    if not text:
+        return ""
+    text = well_formed(text)
+    name = str(model).split("/")[-1].lower()
+    if is_claude(name):
+        return text
+    if name.startswith("gpt-oss"):
+        return f"<think>\n{text}\n</think>"
+    if name.startswith("gemini-"):
+        return f"```thinking\n{text}\n```"
+    return f"<thinking>\n{_unwrap_thinking('<thinking>', '</thinking>', text)}\n</thinking>"
+
+
 # -- tools ---------------------------------------------------------------------
 
 
+# omp: providers/openai-chat-server.ts :: buildTools
+# omp: providers/google-shared.ts :: convertTools
 # omp: providers/google-gemini-cli.ts :: normalizeAntigravityTools
-def tools_to_declarations(
-    model: str, tools: list[Any] | None
-) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]]]:
-    """Function declarations in the Antigravity dialect.
+def tools_to_declarations(model: str, tools: list[Any] | None) -> list[dict[str, Any]] | None:
+    """Function declarations in the Antigravity dialect, the schema built as omp builds it.
 
-    Every declaration goes in ``parameters`` with the sanitized schema — ``model`` is there
-    only for error context. ``parametersJsonSchema`` never reaches this backend's wire:
-    Cloud Code Assist refuses with 400 the constructs full JSON Schema allows (``anyOf``,
-    ``oneOf``, ``not``, ``$ref``, ``type: ["string", "null"]``, ``const``), and sending them
-    raw made the request fail instead of the schema being normalized.
+    Every declaration goes in ``parameters`` normalized for Cloud Code Assist: the CCA
+    refuses with 400 the constructs full JSON Schema allows (``anyOf``, ``oneOf``, ``not``,
+    ``$ref``, ``type: ["string", "null"]``, ``const``), and sending them raw made the
+    request fail instead of the schema being widened. The road there is omp's:
+    ``toolWireSchema`` first; Claude (``ccaLegacyParametersSchema``) straight to the CCA
+    pass; every other model through the Google dialect before it — ``convertTools`` builds
+    ``parametersJsonSchema`` with it and ``normalizeAntigravityTools`` moves that into
+    ``parameters`` through the CCA pass. The Google pass is what adds ``propertyOrdering``
+    and reads a null branch or a ``type: "null"`` field as nullable instead of giving up on
+    the whole schema.
+
+    A tool with no ``parameters`` declares ``{}``, as omp's ``buildTools`` does — except on
+    Claude, where the backend hands ``parameters`` to Anthropic as ``input_schema`` and
+    Anthropic requires its ``type``. Measured on the live backend on 2026-09-30 with a
+    parameterless tool on claude-sonnet-4-6: ``{}`` answered 400
+    "tools.0.custom.input_schema.type: Field required",
+    ``{"type": "object", "properties": {}}`` answered 200; gemini-3-flash took both.
     """
     if not tools:
-        return None, []
+        return None
 
+    legacy_parameters = is_claude(model)
     declarations: list[dict[str, Any]] = []
     for tool in tools:
         if not isinstance(tool, dict):
@@ -395,36 +507,142 @@ def tools_to_declarations(
         name = function.get("name")
         if not isinstance(name, str) or not name:
             continue
-        schema = function.get("parameters") or {"type": "object", "properties": {}}
+        wire = tool_wire_schema(function.get("parameters") or {})
+        parameters = normalize_for_cca(wire if legacy_parameters else normalize_for_google(wire))
+        if legacy_parameters and "type" not in parameters:
+            parameters = {"type": "object", "properties": {}, **parameters}
         declarations.append(
             {
                 "name": name,
                 "description": str(function.get("description") or ""),
-                "parameters": normalize_for_cca(schema),
+                "parameters": parameters,
             }
         )
 
-    return ([{"functionDeclarations": declarations}] if declarations else None), declarations
+    return [{"functionDeclarations": declarations}] if declarations else None
 
 
+# omp: providers/openai-chat-server.ts :: normalizeToolChoice
+# omp: providers/openai-responses-server.ts :: mapToolChoice
+# omp: stream.ts :: mapGoogleToolChoice
 # omp: providers/google-shared.ts :: mapToolChoice
-# omp: providers/google-gemini-cli.ts :: buildRequest
-def tool_config(choice: object, declarations: list[dict[str, Any]]) -> dict[str, Any]:
-    """``VALIDATED`` by default: the backend validates the call against the schema before
-    emitting it."""
-    if choice in (None, "auto"):
-        return {"functionCallingConfig": {"mode": "VALIDATED"}}
+def function_calling_config(choice: object) -> dict[str, Any] | None:
+    """The ``functionCallingConfig`` a chat or Responses ``tool_choice`` asks for, or
+    ``None`` when it asks for nothing beyond the default.
+
+    omp's chain, end to end: the server parser keeps ``auto``/``none``/``required`` and
+    reduces a named choice (chat ``{"function": {"name"}}``, Responses or Anthropic-style
+    ``{"type": ..., "name"}``) to its name; ``mapGoogleToolChoice`` turns ``required`` into
+    ``ANY`` and a name into an ``ANY`` allow-list of one; ``auto`` and everything else set
+    nothing. The name is not checked against the declared tools: omp sends it as asked.
+    """
     if choice == "none":
-        return {"functionCallingConfig": {"mode": "NONE"}}
-    if choice in ("required", "any"):
-        return {"functionCallingConfig": {"mode": "ANY"}}
-    if isinstance(choice, dict):
-        nested = choice.get("function")
-        function = nested if isinstance(nested, dict) else choice
+        return {"mode": "NONE"}
+    if choice == "required":
+        return {"mode": "ANY"}
+    if not isinstance(choice, dict):
+        return None
+    function = choice.get("function")
+    if function:
         name = function.get("name") if isinstance(function, dict) else None
-        if name and any(d.get("name") == name for d in declarations):
-            return {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]}}
-    return {"functionCallingConfig": {"mode": "VALIDATED"}}
+    elif choice.get("type") in ("tool", "function", "custom"):
+        name = choice.get("name")
+    else:
+        return None
+    if isinstance(name, str) and name:
+        return {"mode": "ANY", "allowedFunctionNames": [name]}
+    return None
+
+
+# omp: providers/openai-chat-server.ts :: stringifyContent
+def text_of(content: object) -> str:
+    """A system or assistant message's text: its text parts joined with nothing between.
+
+    omp's chat server reads both roles this way — ``systemInstruction`` is text, and an
+    assistant turn replays as one text block — so the media either carries is dropped.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in TEXT_PART_TYPES
+        )
+    return str(content)
+
+
+_UNSAFE_CALL_ID = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+# omp: utils.ts :: normalizeToolCallId
+# omp: providers/google-shared.ts :: convertMessages
+def wire_call_id(call_id: str) -> str:
+    """A tool call id the backend takes: ``[a-zA-Z0-9_-]``, at most 64 characters.
+
+    Anthropic, behind Claude on this host, refuses anything else in ``tool_use.id``. The call
+    and its result are rewritten alike, so they still pair.
+    """
+    return _UNSAFE_CALL_ID.sub("_", call_id)[:64]
+
+
+# omp: providers/openai-chat-server.ts :: buildAssistantMessage
+def call_arguments(raw: object) -> object:
+    """A replayed call's arguments as the object ``functionCall.args`` must be.
+
+    What does not parse into an object is kept under ``__raw`` rather than thrown away:
+    losing it lost the intent of the call.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    if not isinstance(raw, str):
+        return {"__raw": raw}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"__raw": raw}
+    return parsed if isinstance(parsed, dict) else {"__raw": raw}
+
+
+# omp: stream.ts :: mapOptionsForApi
+# omp: providers/google-gemini-cli.ts :: buildRequest
+#: The caller's sampling fields omp carries into ``generationConfig`` (besides
+#: ``temperature``, which takes the slot ahead of ``maxOutputTokens``).
+SAMPLING_FIELDS: Final[tuple[tuple[str, str], ...]] = (
+    ("top_p", "topP"),
+    ("top_k", "topK"),
+    ("presence_penalty", "presencePenalty"),
+)
+
+#: Claude refuses a lower ``top_p`` while thinking ("`top_p` must be greater than or equal
+#: to 0.95 or unset when thinking is enabled").
+CLAUDE_THINKING_MIN_TOP_P: Final = 0.95
+
+
+def refused_sampling(model: str, field: str, value: object, *, thinking: bool) -> bool:
+    """A sampling field the backend refuses for this model — left out instead of failing
+    the turn. omp sends them all as given; each case below is a measured 400.
+
+    Measured on the live backend on 2026-09-30, one field at a time over a request that
+    otherwise answered 200 (``temperature 0.2``, ``topP 0.9``, ``topK 40``,
+    ``presencePenalty 0.5``, ``frequencyPenalty 0.5``):
+
+    - every Gemini (gemini-3-flash, gemini-3.1-pro-low, gemini-3.8-flash-medium,
+      gemini-2.5-flash) refused both penalties — "Penalty is not enabled for this model" —
+      and took the other three;
+    - claude-sonnet-4-6, thinking, refused ``topP 0.9`` and took the other four;
+    - gpt-oss-120b-medium took all five.
+
+    ``frequencyPenalty`` is not in the list at all: omp never sends it.
+    """
+    name = str(model).split("/")[-1].lower()
+    if field == "presencePenalty":
+        return name.startswith("gemini-")
+    if field == "topP" and thinking and is_claude(name):
+        return isinstance(value, int | float) and value < CLAUDE_THINKING_MIN_TOP_P
+    return False
 
 
 # omp: providers/google-shared.ts :: pendingToolImageParts
@@ -483,7 +701,11 @@ def tool_result_value(
 
 # omp: providers/google-gemini-cli.ts :: buildRequest
 def _thinking_config(
-    effort: str, info: Mapping[str, Any], max_output_tokens: int | None = None
+    effort: str,
+    info: Mapping[str, Any],
+    max_output_tokens: int | None = None,
+    *,
+    claude: bool = False,
 ) -> dict[str, Any]:
     """Omitting ``thinkingConfig`` makes the CCA reapply the server defaults and bill
     thinking tokens without returning the text.
@@ -493,35 +715,28 @@ def _thinking_config(
     -medium 4000, -high -1 = dynamic, pro-agent 10001) plus ``minThinkingBudget`` to turn it
     off. Without a catalog it falls back to ``thinkingLevel``, which is also accepted.
 
-    ``max_output_tokens`` caps the budget because the two are not independent on the
-    Anthropic backend::
-
-        HTTP 400 `max_tokens` must be greater than `thinking.budget_tokens`
-
-    Reproduced on the live gateway with ``max_tokens: 1024`` against a variant whose
-    catalog budget is larger: the request failed on the first turn, while the same call
-    with no ceiling succeeded. The budget is what gives way — it is this plugin's own
-    choice, while the ceiling belongs to the caller, and raising it would bill for output
-    nobody asked for. A dynamic budget (-1) is left alone: the backend picks it itself.
+    ``max_output_tokens`` is the request's total ceiling (`output_ceiling`) — the caller's
+    own; a budget that does not fit under it gives way as `_fit_budget` decides.
     """
     budget = info.get("thinkingBudget")
 
     if effort == "none":
-        # Suppressing means zero budget, not the catalog minimum: with
-        # `includeThoughts: False` a positive budget is billed without returning any text.
-        config: dict[str, Any] = {"includeThoughts": False}
+        if isinstance(budget, int) and not refuses_zero_budget(info, claude=claude):
+            # Suppressing means zero budget, not the catalog minimum: with
+            # `includeThoughts: False` a positive budget is billed without returning text.
+            return {"includeThoughts": False, "thinkingBudget": 0}
         if isinstance(budget, int):
-            config["thinkingBudget"] = 0
-        else:
-            config["thinkingLevel"] = SUPPRESSED_THINKING_LEVEL
-        return config
+            return thinking_floor(budget, info)
+        return {"includeThoughts": False, "thinkingLevel": SUPPRESSED_THINKING_LEVEL}
 
-    config = {"includeThoughts": True}
+    config: dict[str, Any] = {"includeThoughts": True}
     if isinstance(budget, int) and budget > 0:
-        fitted = _fit_budget(budget, max_output_tokens)
+        fitted = _fit_budget(
+            budget, max_output_tokens, claude=claude, floor=info.get("minThinkingBudget")
+        )
         if fitted is None:
-            # No budget can satisfy both bounds: serve the turn without reasoning rather
-            # than fail it. The caller asked for a ceiling, not for thinking.
+            # No budget fits under the ceiling: serve the turn without reasoning, omp's
+            # "budget clamped to zero — fall through to the thinking-off path".
             return {"includeThoughts": False, "thinkingBudget": 0}
         config["thinkingBudget"] = fitted
     elif not isinstance(budget, int):
@@ -529,34 +744,100 @@ def _thinking_config(
     return config
 
 
+#: The ``minThinkingBudget`` of every model measured to accept a budget of 0.
+ZERO_BUDGET_MIN_THINKING: Final = 32
+
+
+def refuses_zero_budget(info: Mapping[str, Any], *, claude: bool) -> bool:
+    """Whether this model answers ``thinkingBudget: 0`` with 400.
+
+    Live 2026-09-30, ``maxOutputTokens: 64``, ``includeThoughts: false``, budget 0:
+
+    - refused — gemini-3.1-pro-low and gemini-pro-agent ("Budget 0 is invalid. This model
+      only works in thinking mode."), gemini-2.5-flash, gemini-2.5-flash-lite,
+      gemini-3.5-flash-lite and gpt-oss-120b-medium ("Request contains an invalid
+      argument"). Their catalog ``minThinkingBudget`` is 128, or absent (gpt-oss);
+    - accepted — Claude (sonnet-4-6, opus-4-6-thinking) and the gemini-3 / 3.6 / 3.7 / 3.8
+      flash ids, whose catalog minimum is 32.
+
+    The catalog minimum is what separates them, so it is what is read: Claude accepts 0,
+    anything else only with a minimum of at most 32. An id not measured is placed by the
+    same reading of its catalog entry.
+    """
+    if claude:
+        return False
+    floor = info.get("minThinkingBudget")
+    if isinstance(floor, bool) or not isinstance(floor, int) or floor <= 0:
+        return True
+    return floor > ZERO_BUDGET_MIN_THINKING
+
+
+# omp: stream.ts :: normalizeMandatoryReasoningOptions
+def thinking_floor(budget: int, info: Mapping[str, Any]) -> dict[str, Any]:
+    """The least thinking a model that cannot turn it off accepts.
+
+    omp answers "no reasoning" on a model whose thinking is mandatory by raising the request
+    to the model's lowest effort, not by switching thinking off. Here the lowest is the
+    catalog's ``minThinkingBudget`` — measured 200 at 128 on gemini-3.1-pro-low,
+    gemini-pro-agent, gemini-2.5-flash, gemini-2.5-flash-lite and gemini-3.5-flash-lite —
+    or, with no minimum (gpt-oss-120b-medium), the catalog budget itself (8192 measured 200;
+    nothing lower was measured). The thoughts come back: with ``includeThoughts: false`` a
+    positive budget is billed without the text.
+    """
+    floor = info.get("minThinkingBudget")
+    if isinstance(floor, int) and not isinstance(floor, bool) and floor > 0:
+        return {"includeThoughts": True, "thinkingBudget": floor}
+    if budget > 0:
+        return {"includeThoughts": True, "thinkingBudget": budget}
+    return {"includeThoughts": True}
+
+
+# omp: stream.ts :: MIN_OUTPUT_TOKENS
+#: Room omp keeps for the visible answer when a ceiling forces the budget down.
+MIN_OUTPUT_TOKENS: Final = 1024
+
 #: Anthropic refuses any positive budget below this — `thinking.enabled.budget_tokens:
 #: Input should be greater than or equal to 1024`. Measured on the live gateway.
 MIN_THINKING_BUDGET: Final = 1024
 
 
-def _fit_budget(budget: int, max_output_tokens: int | None) -> int | None:
-    """The budget that fits under the caller's ceiling, or ``None`` if none does.
+# omp: stream.ts :: mapOptionsForApi
+def _fit_budget(
+    budget: int, max_output_tokens: int | None, *, claude: bool, floor: object = None
+) -> int | None:
+    """The budget for a total ceiling that does not exceed it, or ``None`` for no thinking.
 
-    Two bounds apply at once, and they close on each other::
+    omp's rule (``stream.ts``, the ``google-gemini-cli`` case) is kept where it holds: the
+    budget becomes ``ceiling - MIN_OUTPUT_TOKENS``. Where that leaves nothing, omp turns
+    thinking off with a budget of 0 — and that is only right on Claude, whose own minimum
+    is 1024 and whose budget must stay under the ceiling. Everything else keeps thinking,
+    at the catalog's ``minThinkingBudget`` (or the budget itself when there is none): on
+    this backend ``maxOutputTokens`` bounds thoughts and answer together and a budget above
+    it is accepted, while a budget of 0 is refused by the thinking-only models.
 
-        max_tokens      > budget_tokens      (the ceiling has to leave room)
-        budget_tokens  >= 1024               (Anthropic's own minimum)
+    Measured on the live backend (2026-09-30), ``maxOutputTokens: 64``, an essay prompt:
 
-    Together they mean a ceiling of 1024 or less admits **no** valid budget. The first
-    attempt here capped the budget at three quarters of the ceiling, which turned one
-    rejection into another: ``max_tokens: 1024`` produced 768 and the backend answered
-    `Input should be greater than or equal to 1024`. Both were measured on the live
-    gateway, in that order.
-
-    So a ceiling that cannot host reasoning returns ``None`` and the caller drops thinking
-    for that turn. The budget is what gives way — it is this plugin's own choice, while the
-    ceiling belongs to the caller and raising it would bill for output nobody asked for.
+    - budget 0 refused — gemini-3.1-pro-low and gemini-pro-agent ("Budget 0 is invalid.
+      This model only works in thinking mode."), gemini-2.5-flash, gemini-2.5-flash-lite,
+      gemini-3.5-flash-lite and gpt-oss-120b-medium ("Request contains an invalid
+      argument"); accepted by the gemini-3 / 3.6 / 3.7 / 3.8 flash and 3.1-flash-lite ids;
+    - a budget above the ceiling accepted everywhere but Claude — 1001 and 128 on
+      gemini-3.1-pro-low, 10001 on gemini-pro-agent, 4000 on gemini-3.8-flash-medium, 8192
+      on gpt-oss — each ending ``MAX_TOKENS`` within the 64;
+    - at ``minThinkingBudget`` (32) the flash ids answered 47-53 words, where their own
+      4000 left no answer at all (every token went to thinking).
     """
     if max_output_tokens is None or budget < max_output_tokens:
         return budget
-    if max_output_tokens <= MIN_THINKING_BUDGET:
-        return None
-    return max(MIN_THINKING_BUDGET, max_output_tokens - 1)
+    fitted = max_output_tokens - MIN_OUTPUT_TOKENS
+    if claude:
+        return fitted if fitted >= MIN_THINKING_BUDGET else None
+    minimum = 0
+    if isinstance(floor, int) and not isinstance(floor, bool) and floor > 0:
+        minimum = floor
+    if fitted > 0 and fitted >= minimum:
+        return fitted
+    return minimum or budget
 
 
 # omp: wire/gemini-headers.ts :: ANTIGRAVITY_MODEL_WIRE_PROFILES
@@ -581,19 +862,20 @@ def declared_output_tokens(entry: Any) -> int | None:
 def output_ceiling(requested: Any, entry: Any) -> int | None:
     """``maxOutputTokens`` for one request: the caller's, never above what the model accepts.
 
-    Three cases, none of which invents a number:
+    The caller's ``max_tokens`` is the total — omp's "add thinking budget on top" is not
+    followed. Measured on the live backend (2026-09-30): claude-sonnet-4-6 with no reasoning
+    asked, ``max_tokens: 64`` and the 1024 budget on top went out as 1088, thought for 61
+    characters and answered 623 words (844 completion tokens), ``STOP``; with 64 as the
+    total it stopped at ``MAX_TOKENS`` within 64. The budget only bounds thinking, so the
+    answer takes whatever thinking leaves of the sum.
 
     - the caller asked for a ceiling: it is sent, lowered only to the declared one — Claude
       on this backend answers ``maxOutputTokens > 64000`` with 400 (omp,
       ``ANTIGRAVITY_MODEL_WIRE_PROFILES``);
-    - the caller asked for none and the catalog declares one: the declared one is sent. It
-      is the model's own limit, and for the ids omp profiles it is also the fixed cap the
-      real client sends (65535/65536 for gemini, 64000 for claude);
-    - neither: the field is omitted, as omp does, and the backend applies its own.
-
-    A flat 64000 used to fill the gap. That was a limit nobody set: below the 65536 the
-    gemini 3.x variants accept, and above the 4096 and 32768 of the `tab_*` models and
-    `gpt-oss-120b-medium`.
+    - the caller asked for none and the catalog declares one: the declared one is sent;
+    - neither: the field is omitted and the backend applies its own. A flat 64000 used to
+      fill that gap: below the 65536 the gemini 3.x variants accept, and above the 4096 and
+      32768 of the `tab_*` models and `gpt-oss-120b-medium`.
     """
     declared = declared_output_tokens(entry)
     try:
@@ -605,28 +887,302 @@ def output_ceiling(requested: Any, entry: Any) -> int | None:
     return asked if declared is None else min(asked, declared)
 
 
+# omp: providers/transform-messages.ts :: transformMessages
+#: Result omp synthesizes for a call the history never answered.
+MISSING_TOOL_RESULT: Final = "No result provided"
+
+
+def _pairing_key(call_id: object) -> str:
+    """The call component of an id: what pairs a call with its result."""
+    return str(call_id or "").split("|", 1)[0]
+
+
+def _stale_tool_result(message: dict[str, Any]) -> dict[str, Any] | None:
+    """A result whose call is gone, kept as a user note so the model still sees it."""
+    content = message.get("content")
+    if isinstance(content, list):
+        texts = [
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in (None, *TEXT_PART_TYPES)
+        ]
+    else:
+        texts = [str(content)] if content else []
+    texts = [text for text in texts if text.strip()]
+    if not texts:
+        return None
+    error = ' is-error="true"' if message.get("is_error") else ""
+    body = "\n".join(texts)
+    return {
+        "role": "user",
+        "content": (
+            f'<stale-tool-result tool="{message.get("name") or ""}" '
+            f'id="{message.get("tool_call_id") or ""}"{error}>\n{body}\n</stale-tool-result>'
+        ),
+    }
+
+
+# omp: providers/transform-messages.ts :: transformMessages
+def pair_tool_results(messages: list[Any]) -> list[Any]:
+    """The history with every assistant tool call followed by exactly one result.
+
+    omp's ``transformMessages`` second pass, which runs before ``convertMessages``: a
+    result that arrives late is pulled up behind its call, a duplicate is dropped, a call
+    left unanswered gets an error result (``No result provided``), and a result whose call
+    is nowhere in the history becomes a ``<stale-tool-result>`` user note — or is dropped
+    while other calls still wait for theirs. Cloud Code refuses a turn whose function
+    responses do not match its function calls, so the whole request used to fail.
+
+    System messages pass through without closing a result window: omp's chat server lifts
+    them out of the history before this pass runs.
+    """
+    results: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    declared: set[str] = set()
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool":
+            key = _pairing_key(message.get("tool_call_id"))
+            results.setdefault(key, []).append((index, message))
+        elif message.get("role") == "assistant":
+            declared.update(
+                _pairing_key(call.get("id"))
+                for call in message.get("tool_calls") or []
+                if isinstance(call, dict)
+            )
+    consumed: set[int] = set()
+
+    def take(key: str, after: int) -> dict[str, Any] | None:
+        for index, message in results.get(key, ()):
+            if index in consumed or index <= after:
+                continue
+            consumed.add(index)
+            return message
+        return None
+
+    paired: list[Any] = []
+    pending: list[dict[str, Any]] = []
+    pending_from = -1
+    resolved: set[str] = set()
+
+    def flush() -> None:
+        nonlocal pending
+        for call in pending:
+            key = _pairing_key(call.get("id"))
+            if key in resolved:
+                continue
+            real = take(key, pending_from)
+            paired.append(
+                real
+                if real is not None
+                else {
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "content": MISSING_TOOL_RESULT,
+                    "is_error": True,
+                }
+            )
+            resolved.add(key)
+        pending = []
+
+    for index, message in enumerate(messages):
+        role = message.get("role") if isinstance(message, dict) else None
+        if role == "system":
+            paired.append(message)
+        elif role == "assistant":
+            flush()
+            calls = [c for c in message.get("tool_calls") or [] if isinstance(c, dict)]
+            if calls:
+                pending, pending_from = calls, index
+            paired.append(message)
+        elif role == "tool":
+            key = _pairing_key(message.get("tool_call_id"))
+            if key in resolved:
+                continue
+            if any(_pairing_key(call.get("id")) == key for call in pending):
+                resolved.add(key)
+                paired.append(message)
+                continue
+            if key in declared:
+                # Its call is elsewhere; `flush` pulls it into that call's window.
+                continue
+            if any(_pairing_key(call.get("id")) not in resolved for call in pending):
+                continue
+            if note := _stale_tool_result(message):
+                paired.append(note)
+        else:
+            flush()
+            paired.append(message)
+    flush()
+    return paired
+
+
+# -- request envelope ------------------------------------------------------------
+
+# omp: wire/gemini-headers.ts :: ANTIGRAVITY_MODEL_WIRE_PROFILES
+#: ``labels.model_enum`` per routed wire id — "the opaque token the client tags each request
+#: with". Only the ``modelEnum`` half of omp's profiles: the fixed ``maxOutputTokens`` half
+#: is the output-ceiling divergence recorded in ``docs/OMP.md``. The Claude ids have none.
+ANTIGRAVITY_MODEL_ENUMS: Final[Mapping[str, str]] = {
+    "gemini-3.5-flash-extra-low": "MODEL_PLACEHOLDER_M187",
+    "gemini-3.5-flash-low": "MODEL_PLACEHOLDER_M20",
+    "gemini-3-flash-agent": "MODEL_PLACEHOLDER_M132",
+    "gemini-3.1-pro-low": "MODEL_PLACEHOLDER_M36",
+    "gemini-pro-agent": "MODEL_PLACEHOLDER_M16",
+}
+
+# omp: providers/google-gemini-cli.ts :: INT63_MASK
+_INT63_MASK: Final = (1 << 63) - 1
+# omp: providers/google-gemini-cli.ts :: ANTIGRAVITY_RANDOM_BOUND
+_RANDOM_BOUND: Final = 9_000_000_000_000_000_000
+
+
+# omp: providers/google-gemini-cli.ts :: deriveSignedDecimalFromHash
+def _signed_decimal_from_hash(text: str) -> str:
+    # A lone surrogate does not encode; Bun hashes it as U+FFFD, which `well_formed` gives.
+    digest = hashlib.sha256(well_formed(text).encode("utf-8")).digest()
+    return f"-{int.from_bytes(digest[:8], 'big') & _INT63_MASK}"
+
+
+# omp: providers/google-gemini-cli.ts :: randomBoundedInt63
+# omp: providers/google-gemini-cli.ts :: randomSignedDecimalSessionId
+def _random_signed_decimal() -> str:
+    while True:
+        value = int.from_bytes(secrets.token_bytes(8), "big") & _INT63_MASK
+        if value < _RANDOM_BOUND:
+            return f"-{value}"
+
+
+# omp: providers/google-gemini-cli.ts :: getFirstUserTextForAntigravitySession
+def _first_user_text(messages: list[Any]) -> str | None:
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return next(
+                (
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") in TEXT_PART_TYPES
+                ),
+                None,
+            )
+        return None
+    return None
+
+
+# omp: providers/google-gemini-cli.ts :: deriveAntigravitySessionId
+def derive_session_id(messages: list[Any]) -> str:
+    """``sessionId`` with no session state: the first user text hashed, else random."""
+    text = _first_user_text(messages)
+    return _signed_decimal_from_hash(text) if text and text.strip() else _random_signed_decimal()
+
+
+# omp: providers/google-gemini-cli.ts :: AntigravityProviderSessionState
+@dataclass(slots=True)
+class AntigravitySession:
+    """One conversation's request identity, as the real ``antigravity/hub`` client keeps it.
+
+    ``agent_id``/``trajectory_id`` are UUIDs, ``session_id`` a signed decimal, ``step_index``
+    the monotonic step counter and ``last_execution_id`` the previous successful response's
+    ``responseId``, echoed back as ``labels.last_execution_id``.
+    """
+
+    agent_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    trajectory_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    session_id: str = field(default_factory=_random_signed_decimal)
+    step_index: int = 1
+    last_execution_id: str | None = None
+
+
+#: omp's gateway keeps provider state per conversation in a bounded store; a proxy never
+#: sees a conversation end, so the least recently used one is dropped — it restarts its
+#: step count and trajectory, which the backend reads as a new agent session.
+SESSION_LIMIT: Final = 4096
+
+_sessions: OrderedDict[str, AntigravitySession] = OrderedDict()
+
+
+# omp: providers/google-gemini-cli.ts :: getAntigravityProviderSessionState
+# omp: auth-gateway/session-state.ts :: AuthGatewaySessionStateStore
+def antigravity_session(key: str) -> AntigravitySession:
+    """The state of the conversation ``key`` names, created on first use."""
+    session = _sessions.get(key)
+    if session is None:
+        session = _sessions[key] = AntigravitySession()
+        while len(_sessions) > SESSION_LIMIT:
+            _sessions.popitem(last=False)
+    else:
+        _sessions.move_to_end(key)
+    return session
+
+
+class RequestEnvelope(NamedTuple):
+    session_id: str
+    request_id: str
+    labels: dict[str, str]
+
+
+# omp: providers/google-gemini-cli.ts :: buildAntigravityRequestEnvelope
+def request_envelope(
+    model: str, messages: list[Any], wire_model: str, state: AntigravitySession | None
+) -> RequestEnvelope:
+    """``sessionId``, ``requestId`` and ``labels`` for one request, advancing ``state``.
+
+    ``requestId`` is ``agent/<agentId>/<ms>/<trajectoryId>/<step>`` and
+    ``labels.last_step_index`` trails its step by one. Without state (a direct call) the
+    ids are ephemeral and the session id comes from the first user text, as in omp.
+    """
+    if state is not None:
+        state.step_index += 1
+    agent_id = state.agent_id if state else str(uuid.uuid4())
+    trajectory_id = state.trajectory_id if state else str(uuid.uuid4())
+    session_id = state.session_id if state else derive_session_id(messages)
+    step = state.step_index if state else 2
+    request_id = f"agent/{agent_id}/{int(time.time() * 1000)}/{trajectory_id}/{step}"
+    labels: dict[str, str] = {}
+    if state is not None and state.last_execution_id:
+        labels["last_execution_id"] = state.last_execution_id
+    labels["last_step_index"] = str(step - 1)
+    if (model_enum := ANTIGRAVITY_MODEL_ENUMS.get(wire_model)) is not None:
+        labels["model_enum"] = model_enum
+    labels["trajectory_id"] = trajectory_id
+    # `antigravityUsageLabel ?? String(isClaude)`: the catalog sets "true" on the Claude
+    # class only, so the fallback and the label agree.
+    usage_label = "true" if is_claude(model) else "false"
+    labels["used_claude"] = usage_label
+    labels["used_claude_conservative"] = usage_label
+    return RequestEnvelope(session_id, request_id, labels)
+
+
 def build_payload(
     model: str,
     messages: list[Any],
     project_id: str,
-    request_id: str,
     tools: list[Any] | None = None,
     extra: dict[str, Any] | None = None,
     catalog: ModelCatalog | None = None,
     fetch: UrlFetcher | None = None,
     thought_signatures: Mapping[str, str] | None = None,
     supports_images: bool = True,
+    session: AntigravitySession | None = None,
 ) -> dict[str, Any]:
     """``:streamGenerateContent`` envelope.
 
-    ``request_id`` comes in as an argument: it has the form ``agent/<id>/<ts>/<traj>/<step>``
-    and is session state, not something the conversion should invent.
+    ``session`` is the conversation's state (`antigravity_session`); the request's ids and
+    labels come from it, and building the payload advances its step.
     """
     extra = extra or {}
+    messages = pair_tool_results(messages)
     signatures = thought_signatures or {}
     effort = normalize_effort(extra.get("reasoning_effort"))[0] or ""
     mapped_model = map_model(model, effort or None, catalog)
     supports_ids = supports_function_ids(model)
+    first_call_sentinel = requires_first_call_signature(model)
+    claude = is_claude(model)
 
     # The function name does not travel in the OpenAI-shaped tool result; collect it from
     # the calls.
@@ -641,7 +1197,7 @@ def build_payload(
                 tool_names[call_id] = function.get("name") or "tool"
 
     contents: list[dict[str, Any]] = []
-    system_parts: list[dict[str, Any]] = []
+    system_texts: list[str] = []
     pending_tool_responses: list[dict[str, Any]] = []
 
     def flush() -> None:
@@ -660,23 +1216,39 @@ def build_payload(
             call_id = str(message.get("tool_call_id") or "").split("|", 1)[0]
             value, media = tool_result_value(message, fetch, supports_images=supports_images)
             function_response: dict[str, Any] = {
-                "name": message.get("name") or tool_names.get(call_id) or "tool",
+                # The name of the call it answers wins over the one the result carries, so
+                # the pair always matches.
+                "name": tool_names.get(call_id) or message.get("name") or "tool",
                 "response": value,
             }
             if media:
                 function_response["parts"] = media
             if supports_ids and call_id:
-                function_response["id"] = call_id
+                function_response["id"] = wire_call_id(call_id)
             pending_tool_responses.append({"functionResponse": function_response})
             continue
 
-        parts = content_parts(content, fetch, supports_images=supports_images)
-
         if role == "system":
-            system_parts.extend(parts)
+            if text := text_of(content):
+                system_texts.append(text)
             continue
 
         if role == "assistant":
+            # Whitespace-only text is left out: the source says it "can cause issues with
+            # some models (e.g. Claude via Antigravity)".
+            text = well_formed(text_of(content))
+            parts = [{"text": text}] if text.strip() else []
+        else:
+            parts = content_parts(content, fetch, supports_images=supports_images)
+
+        if role == "assistant":
+            # omp: providers/openai-chat-server.ts :: buildAssistantMessage
+            # omp: providers/transform-messages.ts :: transformMessages
+            # Reasoning the client sends back leads the turn as text (`demoted_thinking`).
+            reasoning = message.get("reasoning_content")
+            demoted = isinstance(reasoning, str) and bool(reasoning.strip())
+            if demoted:
+                parts.insert(0, {"text": demoted_thinking(model, str(reasoning))})
             # The sentinel is per **turn**, not per request: the CCA requires it whenever the
             # first call of an assistant turn goes without a signature. Marking it only once
             # left later turns with bare calls and a 400 at validation.
@@ -684,19 +1256,12 @@ def build_payload(
             for tool_call in message.get("tool_calls") or []:
                 function = tool_call.get("function") or {}
                 call_id, _, encoded_signature = str(tool_call.get("id") or "").partition("|")
-                arguments = function.get("arguments") or {}
-                if isinstance(arguments, str):
-                    try:
-                        arguments = json.loads(arguments)
-                    except json.JSONDecodeError:
-                        arguments = {"__raw": arguments}
-
                 function_call: dict[str, Any] = {
                     "name": function.get("name") or "",
-                    "args": arguments,
+                    "args": call_arguments(function.get("arguments")),
                 }
                 if supports_ids and call_id:
-                    function_call["id"] = call_id
+                    function_call["id"] = wire_call_id(call_id)
                 part: dict[str, Any] = {"functionCall": function_call}
 
                 # Only a signature that is valid base64 is resent: an arbitrary string gives
@@ -716,10 +1281,14 @@ def build_payload(
                 )
                 if candidate:
                     part["thoughtSignature"] = candidate
-                elif first_tool_call:
+                elif first_tool_call and first_call_sentinel:
                     part["thoughtSignature"] = SIGNATURE_SENTINEL
                 first_tool_call = False
                 parts.append(part)
+            if demoted and len(parts) == 1:
+                # As the turn's last block it loses its trailing whitespace: Anthropic
+                # refuses a final assistant text that ends in whitespace.
+                parts[0]["text"] = parts[0]["text"].rstrip()
             if parts:
                 contents.append({"role": "model", "parts": parts})
             continue
@@ -728,32 +1297,67 @@ def build_payload(
             contents.append({"role": "user", "parts": parts})
     flush()
 
+    request: dict[str, Any] = {"contents": contents}
+
+    # omp: utils.ts :: normalizeSystemPrompts
+    # omp's chat server joins every system message into one prompt. The native field is
+    # accepted with role "user" and with no practical size limit — verified with 2520
+    # chars: HTTP 200.
+    system_prompt = well_formed("\n\n".join(system_texts))
+    if system_prompt.strip():
+        request["systemInstruction"] = {"role": "user", "parts": [{"text": system_prompt}]}
+
+    antigravity_tools = tools_to_declarations(model, tools)
+    if antigravity_tools:
+        request["tools"] = antigravity_tools
+        calling = function_calling_config(extra.get("tool_choice"))
+        if calling is not None:
+            request["toolConfig"] = {"functionCallingConfig": calling}
+            # omp: "Cloud Code Assist drops `toolConfig` on Antigravity's Gemini routes: the
+            # backend answers in text under `mode: "ANY"`" — so a Gemini request that forces
+            # a call restates it in the transcript. Claude honours the config itself.
+            if not claude and calling["mode"] == "ANY":
+                contents.append({"role": "user", "parts": [{"text": FORCED_TOOL_DIRECTIVE}]})
+        request.setdefault("toolConfig", {"functionCallingConfig": {"mode": VALIDATED_MODE}})
+    if claude:
+        # `antigravity-claude-tool-mode`: Claude on Antigravity always goes out VALIDATED,
+        # with or without tools and over any explicit choice — the framing omp sends.
+        request["toolConfig"] = {"functionCallingConfig": {"mode": VALIDATED_MODE}}
+
+    envelope = request_envelope(model, messages, mapped_model, session)
+    # Inside `request`, where omp puts them. Measured on the live backend (2026-09-30):
+    # HTTP 200 on gemini-3-flash and claude-sonnet-4-6; the 400 "Unknown name" once
+    # recorded was for the top level of the body.
+    request["labels"] = envelope.labels
+
     # omp sends max_completion_tokens (OpenAI style); accept both spellings, otherwise the
     # output ceiling the client asked for is silently replaced.
     info = (catalog.info.get(mapped_model) if catalog else None) or {}
     max_tokens = output_ceiling(
         extra.get("max_tokens") or extra.get("max_completion_tokens"), info
     )
+    # The caller's sampling knobs, in the slots omp gives them: `temperature` ahead of the
+    # ceiling, which keeps its place ahead of `thinkingConfig`.
+    thinking_config = _thinking_config(effort, info, max_tokens, claude=claude)
+    thinking = bool(thinking_config.get("includeThoughts"))
     generation: dict[str, Any] = {}
+    if (temperature := extra.get("temperature")) is not None:
+        generation["temperature"] = temperature
     if max_tokens is not None:
-        # Ahead of `thinkingConfig`, the slot the real client gives it.
         generation["maxOutputTokens"] = max_tokens
-    generation["thinkingConfig"] = _thinking_config(effort, info, max_tokens)
-    request: dict[str, Any] = {"contents": contents, "generationConfig": generation}
-
-    # The native field is accepted with role "user" and with no practical size limit —
-    # verified with 2520 chars: HTTP 200.
-    if system_parts:
-        request["systemInstruction"] = {"role": "user", "parts": system_parts}
-
-    antigravity_tools, declarations = tools_to_declarations(model, tools)
-    if antigravity_tools:
-        request["tools"] = antigravity_tools
-        request["toolConfig"] = tool_config(extra.get("tool_choice"), declarations)
+    for source, target in SAMPLING_FIELDS:
+        sampled = extra.get(source)
+        if sampled is not None and not refused_sampling(
+            mapped_model, target, sampled, thinking=thinking
+        ):
+            generation[target] = sampled
+    generation["thinkingConfig"] = thinking_config
+    request["generationConfig"] = generation
+    request["sessionId"] = envelope.session_id
 
     return {
         "project": project_id,
-        "requestId": request_id,
+        "requestId": envelope.request_id,
         "model": mapped_model,
         "userAgent": "antigravity",
         "requestType": "agent",
@@ -762,18 +1366,33 @@ def build_payload(
 
 
 __all__ = [
+    "ANTIGRAVITY_MODEL_ENUMS",
+    "CLAUDE_THINKING_MIN_TOP_P",
+    "FORCED_TOOL_DIRECTIVE",
     "INLINE_MAX_BYTES",
+    "MIN_OUTPUT_TOKENS",
+    "MISSING_TOOL_RESULT",
     "NON_VISION_IMAGE_PLACEHOLDER",
     "RETIREMENT_MARKERS",
+    "SAMPLING_FIELDS",
+    "SESSION_LIMIT",
     "SIGNATURE_SENTINEL",
+    "ZERO_BUDGET_MIN_THINKING",
+    "AntigravitySession",
     "FetchedMedia",
     "MediaFetchError",
     "MediaTooLargeError",
     "ModelRetiredError",
+    "RequestEnvelope",
+    "antigravity_session",
     "base_family",
     "build_payload",
+    "call_arguments",
     "content_parts",
     "declared_output_tokens",
+    "demoted_thinking",
+    "derive_session_id",
+    "function_calling_config",
     "inline_part",
     "is_retired_response",
     "is_retirement_notice",
@@ -781,10 +1400,16 @@ __all__ = [
     "media_part",
     "normalize_effort",
     "output_ceiling",
+    "pair_tool_results",
     "raise_if_retired",
-    "tool_config",
+    "refused_sampling",
+    "refuses_zero_budget",
+    "request_envelope",
+    "text_of",
+    "thinking_floor",
     "tool_result_value",
     "tools_to_declarations",
     "usage_is_zero",
     "well_formed",
+    "wire_call_id",
 ]

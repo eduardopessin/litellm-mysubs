@@ -7,8 +7,9 @@ field is a behaviour that disappears silently.
 
 from __future__ import annotations
 
+import hashlib
 import json
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
@@ -19,21 +20,48 @@ PNG = (
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
     "AAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
-REQUEST_ID = "agent/abc/1000/def/1"
 
 
 def payload(messages: list[Any], model: str = "gemini-3-pro", **kwargs: Any) -> dict[str, Any]:
-    return ag.build_payload(model, messages, "proj-1", REQUEST_ID, **kwargs)
+    return ag.build_payload(model, messages, "proj-1", **kwargs)
 
 
 class TestEnvelope:
-    def test_fixed_envelope_fields(self) -> None:
-        """`labels` and `sessionId` do not go in: the endpoint returns 400 Unknown name."""
+    def test_session_fields_ride_inside_the_request(self) -> None:
+        """``labels`` and ``sessionId`` go inside ``request``, where omp's
+        ``buildAntigravityRequestEnvelope`` puts them; the top level keeps its six fields.
+
+        Measured on the live backend on 2026-09-30: ``request.sessionId`` and
+        ``request.labels`` answered HTTP 200 on gemini-3-flash and on claude-sonnet-4-6.
+        The 400 "Unknown name" once recorded here was for the top-level placement.
+        """
         body = payload([{"role": "user", "content": "x"}])
         assert body["userAgent"] == "antigravity"
         assert body["requestType"] == "agent"
         assert body["project"] == "proj-1"
         assert set(body) == {"project", "requestId", "model", "userAgent", "requestType", "request"}
+        assert list(body["request"]) == [
+            "contents",
+            "labels",
+            "generationConfig",
+            "sessionId",
+        ]
+
+    def test_without_state_the_session_id_comes_from_the_first_user_text(self) -> None:
+        """omp's ``deriveAntigravitySessionId``: the first 8 bytes of the text's SHA-256,
+        masked to 63 bits, as a negative decimal; the step is 2."""
+        body = payload([{"role": "system", "content": "s"}, {"role": "user", "content": "x"}])
+        digest = hashlib.sha256(b"x").digest()
+        expected = -(int.from_bytes(digest[:8], "big") & ((1 << 63) - 1))
+        assert body["request"]["sessionId"] == str(expected)
+        assert body["requestId"].startswith("agent/") and body["requestId"].endswith("/2")
+        assert body["request"]["labels"]["last_step_index"] == "1"
+
+    def test_without_user_text_the_session_id_is_random(self) -> None:
+        first = payload([{"role": "assistant", "content": "x"}])["request"]["sessionId"]
+        second = payload([{"role": "assistant", "content": "x"}])["request"]["sessionId"]
+        assert first != second
+        assert first.startswith("-") and 0 <= int(first[1:]) < 9_000_000_000_000_000_000
 
     def test_system_becomes_native_instruction(self) -> None:
         """The native field is accepted with role "user"; splicing into the first turn is
@@ -127,10 +155,11 @@ class TestThinkingConfig:
 
     def test_suppression_is_zero_budget_not_the_catalog_minimum(self) -> None:
         """With `includeThoughts: False`, a positive budget is billed without returning any
-        text at all. The catalog's `minThinkingBudget` is not zero on several variants."""
+        text at all. A model whose catalog minimum is 32 accepts a budget of 0 (measured on
+        the gemini-3 / 3.6-3.8 flash ids), so that is what goes."""
         catalog = ModelCatalog(
             ids=("gemini-3-pro-low",),
-            info={"gemini-3-pro-low": {"thinkingBudget": 1000, "minThinkingBudget": 128}},
+            info={"gemini-3-pro-low": {"thinkingBudget": 1000, "minThinkingBudget": 32}},
             fetched_at=1.0,
         )
         config = payload(
@@ -286,26 +315,11 @@ class TestMultimodal:
             "gemini-3-pro",
             [{"role": "user", "content": "a\ud800b \ud83d\ude00 c"}],
             "proj",
-            REQUEST_ID,
         )
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 class TestToolCalls:
-    def test_function_ids_only_on_gemini_3(self) -> None:
-        messages: list[Any] = [
-            {
-                "role": "assistant",
-                "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}],
-            },
-            {"role": "tool", "tool_call_id": "c1", "content": "r"},
-        ]
-        modern = payload(messages, model="gemini-3-pro")["request"]["contents"]
-        assert modern[0]["parts"][0]["functionCall"]["id"] == "c1"
-
-        legacy = payload(messages, model="gemini-2.5-flash")["request"]["contents"]
-        assert "id" not in legacy[0]["parts"][0]["functionCall"]
-
     def test_sentinel_used_once_per_request(self) -> None:
         """The CCA validates the signature of the turn's first functionCall."""
         body = payload(
@@ -448,54 +462,71 @@ class TestToolCalls:
         assert call["id"] == "c1", "Vertex refuses a tool_use without an id"
         assert result["id"] == "c1", "the result has to name the call it answers"
 
-    def _claude_config(self, ceiling: int | None) -> dict[str, Any]:
-        catalog = ModelCatalog(
-            ids=("claude-sonnet-4-6",),
-            info={"claude-sonnet-4-6": {"thinkingBudget": 4000}},
-            fetched_at=1.0,
-        )
+    def _config(
+        self, model: str, ceiling: int | None, entry: dict[str, Any], effort: str | None = None
+    ) -> dict[str, Any]:
+        # The variant each name resolves to with a catalog listing only it.
+        wire = {
+            "gemini-3.1-pro": "gemini-3.1-pro-low",
+            "gemini-3.8-flash": "gemini-3.8-flash-medium",
+        }.get(model, model)
+        catalog = ModelCatalog(ids=(wire,), info={wire: entry}, fetched_at=1.0)
+        extra: dict[str, Any] = {} if ceiling is None else {"max_tokens": ceiling}
+        if effort:
+            extra["reasoning_effort"] = effort
         body = payload(
-            [{"role": "user", "content": "x"}],
-            model="claude-sonnet-4-6",
-            catalog=catalog,
-            extra={} if ceiling is None else {"max_tokens": ceiling},
+            [{"role": "user", "content": "x"}], model=model, catalog=catalog, extra=extra
         )
         return body["request"]["generationConfig"]
 
+    CLAUDE: Final = {"thinkingBudget": 1024, "maxOutputTokens": 64000}
+    PRO_LOW: Final = {"thinkingBudget": 1001, "minThinkingBudget": 128, "maxOutputTokens": 65535}
+    FLASH: Final = {"thinkingBudget": 4000, "minThinkingBudget": 32, "maxOutputTokens": 65536}
+    GPT_OSS: Final = {"thinkingBudget": 8192, "maxOutputTokens": 32768}
+
+    @pytest.mark.parametrize("effort", [None, "low", "high"])
+    def test_the_callers_ceiling_is_the_total(self, effort: str | None) -> None:
+        """The budget is not added on top of ``max_tokens``: with 1024 on top of 64,
+        claude-sonnet-4-6 thought 61 characters and answered 623 words (live,
+        2026-09-30). Anthropic needs a budget of at least 1024 under the ceiling, so a small
+        one turns thinking off — measured ``MAX_TOKENS`` within the 64 for every effort."""
+        config = self._config("claude-sonnet-4-6", 64, self.CLAUDE, effort)
+        assert config == {
+            "maxOutputTokens": 64,
+            "thinkingConfig": {"includeThoughts": False, "thinkingBudget": 0},
+        }
+
     def test_a_roomy_ceiling_keeps_the_catalog_budget(self) -> None:
-        config = self._claude_config(64000)
+        config = self._config("claude-sonnet-4-6", 64000, self.CLAUDE)
         assert config["maxOutputTokens"] == 64000
-        assert config["thinkingConfig"]["thinkingBudget"] == 4000
+        assert config["thinkingConfig"] == {"includeThoughts": True, "thinkingBudget": 1024}
 
-    def test_a_tight_ceiling_shrinks_the_budget_under_it(self) -> None:
-        """`max_tokens` must be strictly greater than `budget_tokens`.
+    def test_a_tight_ceiling_leaves_omps_room_for_the_answer(self) -> None:
+        """omp: the budget becomes ``ceiling - MIN_OUTPUT_TOKENS`` when it does not fit."""
+        config = self._config("gpt-oss-120b-medium", 5000, self.GPT_OSS)
+        assert config["maxOutputTokens"] == 5000
+        assert config["thinkingConfig"]["thinkingBudget"] == 5000 - ag.MIN_OUTPUT_TOKENS
 
-        Measured on the live gateway: a ceiling at or below the catalog budget was refused
-        on the first turn, while the same call with no ceiling succeeded.
-        """
-        config = self._claude_config(2048)
-        assert config["maxOutputTokens"] == 2048, "the caller's ceiling is not raised"
-        assert config["thinkingConfig"]["thinkingBudget"] < 2048
-        assert config["thinkingConfig"]["thinkingBudget"] >= ag.MIN_THINKING_BUDGET
+    def test_a_thinking_only_model_keeps_its_minimum_budget(self) -> None:
+        """gemini-3.1-pro-low refuses a budget of 0 ("This model only works in thinking
+        mode") and accepts a budget above the ceiling; with ``minThinkingBudget`` it
+        answered 200 ``MAX_TOKENS`` within 64 (live, 2026-09-30)."""
+        config = self._config("gemini-3.1-pro", 64, self.PRO_LOW)
+        assert config == {
+            "maxOutputTokens": 64,
+            "thinkingConfig": {"includeThoughts": True, "thinkingBudget": 128},
+        }
 
-    def test_a_ceiling_too_small_for_any_budget_drops_thinking(self) -> None:
-        """Two bounds close on each other and leave nothing valid.
+    def test_a_flash_model_thinks_at_its_minimum_under_a_small_ceiling(self) -> None:
+        """Its own 4000 took all 64 tokens and left no answer; at 32 it answered ~50 words."""
+        config = self._config("gemini-3.8-flash", 64, self.FLASH, "medium")
+        assert config["thinkingConfig"] == {"includeThoughts": True, "thinkingBudget": 32}
 
-        `max_tokens > budget_tokens` and Anthropic's own `budget_tokens >= 1024` mean a
-        ceiling of 1024 admits no budget at all. Shrinking to three quarters — the first
-        attempt — merely swapped one rejection for the other::
-
-            HTTP 400 thinking.enabled.budget_tokens: Input should be greater than or
-                     equal to 1024
-
-        Serving the turn without reasoning is the honest answer: the caller asked for a
-        ceiling, not for thinking.
-        """
-        for ceiling in (512, 1024):
-            config = self._claude_config(ceiling)
-            thinking = config["thinkingConfig"]
-            assert thinking["includeThoughts"] is False, ceiling
-            assert thinking["thinkingBudget"] == 0, ceiling
+    def test_without_a_minimum_the_budget_stays(self) -> None:
+        """gpt-oss refuses a budget of 0 and declares no minimum; 8192 over a 64 ceiling
+        answered 200 ``MAX_TOKENS`` within the 64."""
+        config = self._config("gpt-oss-120b-medium", 64, self.GPT_OSS)
+        assert config["thinkingConfig"] == {"includeThoughts": True, "thinkingBudget": 8192}
 
     def test_sentinel_is_per_turn_not_per_request(self) -> None:
         """The CCA requires the sentinel on the first call of **every** assistant turn.
@@ -614,7 +645,7 @@ class TestTools:
         OMP converts **every** declaration on the Antigravity path; the full JSON Schema
         field was a misreading of the public Gemini API.
         """
-        tools, _ = ag.tools_to_declarations(
+        tools = ag.tools_to_declarations(
             "gemini-3-pro",
             [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
         )
@@ -625,7 +656,7 @@ class TestTools:
 
     def test_unsupported_constructs_are_sanitised(self) -> None:
         """`anyOf`/`$ref`/`not` give 400 on the CCA; sending them raw made the request fail."""
-        tools, _ = ag.tools_to_declarations(
+        tools = ag.tools_to_declarations(
             "gemini-3-pro",
             [
                 {
@@ -647,34 +678,94 @@ class TestTools:
     def test_every_model_uses_the_same_field(self) -> None:
         """Choosing by family was a local invention: OMP does not distinguish here."""
         for model in ("gemini-3-pro", "claude-sonnet-4-6", "gemini-2.5-flash"):
-            tools, _ = ag.tools_to_declarations(
+            tools = ag.tools_to_declarations(
                 model, [{"type": "function", "function": {"name": "f", "parameters": {}}}]
             )
             assert tools is not None
             assert "parameters" in tools[0]["functionDeclarations"][0], model
 
-    def test_validated_is_the_default_mode(self) -> None:
-        assert ag.tool_config(None, []) == {"functionCallingConfig": {"mode": "VALIDATED"}}
-
     @pytest.mark.parametrize(
-        ("choice", "mode"), [("none", "NONE"), ("required", "ANY"), ("any", "ANY")]
+        ("choice", "config"),
+        [
+            pytest.param(None, None, id="absent"),
+            pytest.param("auto", None, id="auto"),
+            pytest.param("none", {"mode": "NONE"}, id="none"),
+            pytest.param("required", {"mode": "ANY"}, id="required"),
+            # Neither server parser accepts Anthropic's bare "any"; the Messages route
+            # translates it to "required" before it gets here.
+            pytest.param("any", None, id="bare-any"),
+            pytest.param(
+                {"type": "function", "function": {"name": "read"}},
+                {"mode": "ANY", "allowedFunctionNames": ["read"]},
+                id="chat-named",
+            ),
+            pytest.param(
+                {"type": "function", "name": "read"},
+                {"mode": "ANY", "allowedFunctionNames": ["read"]},
+                id="responses-named",
+            ),
+            pytest.param(
+                {"type": "tool", "name": "read"},
+                {"mode": "ANY", "allowedFunctionNames": ["read"]},
+                id="anthropic-named",
+            ),
+            pytest.param({"type": "function", "function": {"name": ""}}, None, id="nameless"),
+            pytest.param({"type": "web_search_preview"}, None, id="hosted"),
+            pytest.param({"type": "allowed_tools", "mode": "auto"}, None, id="allowed-tools"),
+        ],
     )
-    def test_choice_modes(self, choice: str, mode: str) -> None:
-        assert ag.tool_config(choice, [])["functionCallingConfig"]["mode"] == mode
-
-    def test_named_choice_restricts_to_that_function(self) -> None:
-        config = ag.tool_config(
-            {"type": "function", "function": {"name": "read"}}, [{"name": "read"}]
-        )
-        assert config["functionCallingConfig"]["allowedFunctionNames"] == ["read"]
-
-    def test_unknown_named_choice_falls_back(self) -> None:
-        """A name that was not declared cannot restrict to anything."""
-        config = ag.tool_config(
-            {"type": "function", "function": {"name": "nonexistent"}}, [{"name": "read"}]
-        )
-        assert config["functionCallingConfig"]["mode"] == "VALIDATED"
+    def test_choice_maps_as_omp_maps_it(self, choice: object, config: object) -> None:
+        """``normalizeToolChoice`` / Responses ``mapToolChoice`` into ``mapGoogleToolChoice``:
+        ``None`` leaves the request on the default mode."""
+        assert ag.function_calling_config(choice) == config
 
     def test_no_tools_means_no_config(self) -> None:
         body = payload([{"role": "user", "content": "x"}])
         assert "tools" not in body["request"] and "toolConfig" not in body["request"]
+
+
+class TestDemotedThinking:
+    @pytest.mark.parametrize(
+        ("text", "demoted"),
+        [
+            ("plain", "<thinking>\nplain\n</thinking>"),
+            ("  <thinking>a</thinking>  ", "<thinking>\na\n</thinking>"),
+            (
+                "<thinking>\n a \n</thinking>\n<thinking>b</thinking>",
+                "<thinking>\na\nb\n</thinking>",
+            ),
+            ("<thinking><thinking>n</thinking></thinking>", "<thinking>\nn\n</thinking>"),
+            ("<thinking>open only", "<thinking>\n<thinking>open only\n</thinking>"),
+            ("<thinking>a</thinking> tail", "<thinking>\n<thinking>a</thinking> tail\n</thinking>"),
+        ],
+    )
+    def test_the_xml_fallback_does_not_wrap_twice(self, text: str, demoted: str) -> None:
+        """omp 18.4.4 ``renderDelimitedThinking`` outputs for a model with no dialect of its
+        own: reasoning already in the tags is unwrapped first, and only when every segment
+        closes — otherwise it is wrapped as it came."""
+        assert ag.demoted_thinking("tab_flash_lite_preview", text) == demoted
+
+
+class TestToolPairing:
+    def test_a_stray_result_inside_an_open_window_is_dropped(self) -> None:
+        """A note there would sit between a call and its result, breaking the pair; omp
+        drops the stray one and still closes the window."""
+        call = {"id": "c1", "function": {"name": "f", "arguments": "{}"}}
+        paired = ag.pair_tool_results(
+            [
+                {"role": "assistant", "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "gone", "content": "stray"},
+                {"role": "user", "content": "next"},
+            ]
+        )
+
+        assert paired == [
+            {"role": "assistant", "tool_calls": [call]},
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": ag.MISSING_TOOL_RESULT,
+                "is_error": True,
+            },
+            {"role": "user", "content": "next"},
+        ]

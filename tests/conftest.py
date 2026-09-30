@@ -1,4 +1,4 @@
-"""Isolation of on-disk state during the tests.
+"""Isolation of process-wide state during the tests.
 
 This exists because of a measured defect: the suite wrote to `~/.litellm/mysubs/models.json`
 — the user's real file — because `MySubsService` builds the `SelectionStore` with the
@@ -8,13 +8,43 @@ restart.
 
 Redirecting `HOME` covers the three things that land there — credentials, selection and
 the refresher's locks — without every test having to remember to pass a `tmp_path`.
+
+LiteLLM's callback lists are the other process-wide state: see `_isolate_callbacks`.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import litellm
 import pytest
+
+#: Every `litellm.Router` and every logged call append to these module-level lists, and
+#: LiteLLM's `LoggingCallbackManager` refuses new entries past `MAX_CALLBACKS` without an
+#: error.
+_CALLBACK_LISTS = (
+    "callbacks",
+    "input_callback",
+    "success_callback",
+    "failure_callback",
+    "service_callback",
+    "_async_success_callback",
+    "_async_failure_callback",
+    "_async_input_callback",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_callbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every test its own copy of LiteLLM's callback lists.
+
+    Measured: with one Router per test the lists filled up, and a later test's spend
+    recorder was silently never registered — `test_the_streamed_usage_reaches_the_client_and_
+    the_spend_row` failed in the full suite, passed alone, and passed in reverse order.
+    """
+    for name in _CALLBACK_LISTS:
+        if isinstance(getattr(litellm, name, None), list):
+            monkeypatch.setattr(litellm, name, list(getattr(litellm, name)))
 
 
 @pytest.fixture(autouse=True)

@@ -10,9 +10,7 @@ from __future__ import annotations
 import pytest
 
 from litellm_mysubs.wire.usage import (
-    codex_finish_reason,
     codex_usage,
-    google_finish_reason,
     google_stop_reason,
     google_usage,
 )
@@ -110,18 +108,7 @@ class TestCodexUsage:
         assert codex_usage({"input_tokens": value}).prompt_tokens == 0
 
 
-class TestGoogleFinishReason:
-    def test_tool_calls_win_over_stop(self) -> None:
-        assert google_finish_reason("STOP", has_tool_calls=True) == "tool_calls"
-
-    def test_max_tokens_is_truncation(self) -> None:
-        """Without this, a cut-off by limit arrived as a normal, short answer."""
-        assert google_finish_reason("MAX_TOKENS", has_tool_calls=False) == "length"
-
-    def test_max_tokens_with_pending_tool_call(self) -> None:
-        """The call is still the turn outcome, even with the limit reached."""
-        assert google_finish_reason("MAX_TOKENS", has_tool_calls=True) == "tool_calls"
-
+class TestGoogleStopReason:
     @pytest.mark.parametrize(
         "reason",
         [
@@ -142,19 +129,3 @@ class TestGoogleFinishReason:
     )
     def test_everything_but_stop_and_max_tokens_is_an_error(self, reason: str) -> None:
         assert google_stop_reason(reason) == "error"
-
-    @pytest.mark.parametrize("reason", [None, "", "STOP"])
-    def test_normal_completion(self, reason: object) -> None:
-        assert google_finish_reason(reason, has_tool_calls=False) == "stop"
-
-
-class TestCodexFinishReason:
-    def test_incomplete_is_truncation(self) -> None:
-        assert codex_finish_reason("incomplete", has_tool_calls=False) == "length"
-
-    def test_tool_calls_win(self) -> None:
-        assert codex_finish_reason("incomplete", has_tool_calls=True) == "tool_calls"
-
-    def test_default_is_stop(self) -> None:
-        assert codex_finish_reason(None, has_tool_calls=False) == "stop"
-        assert codex_finish_reason("completed", has_tool_calls=False) == "stop"

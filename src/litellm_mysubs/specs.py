@@ -12,15 +12,14 @@ every request; `plugin.py` only writes the patch bookkeeping into it. One object
 from __future__ import annotations
 
 import contextlib
-import time
-import uuid
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Final
 
 import httpx
 import litellm
 
+from .credentials import refresher
 from .credentials.store import CredentialStore, ProviderId
 from .transport import hosts
 from .transport.client import RequestSpec, Transport
@@ -38,12 +37,6 @@ ANTIGRAVITY_USER_AGENT: Final = (
 #: ends.
 _SIGNATURE_LIMIT: Final = 512
 
-#: This instance's transport identity (Antigravity's request ids). Codex's thread and
-#: window ids are per conversation, not per process: see `codex.turn_metadata`.
-_AGENT_ID: Final = uuid.uuid4().hex[:16]
-_TRAJECTORY_ID: Final = uuid.uuid4().hex[:16]
-
-
 class _State:
     """Module state, in a single object so that `uninstall` leaves no loose ends."""
 
@@ -55,7 +48,6 @@ class _State:
         "rebound_messages_routers",
         "rebound_routers",
         "signatures",
-        "step",
         "store",
         "transport",
     )
@@ -75,7 +67,6 @@ class _State:
         self.store: CredentialStore | None = None
         self.transport: Transport | None = None
         self.signatures: OrderedDict[str, str] = OrderedDict()
-        self.step = 0
         #: The Antigravity catalog, with `ModelCatalog`'s own TTL. Without it `map_model`
         #: falls back to the curated static map, which only knows the Gemini family —
         #: measured: `claude-sonnet-4-6`, `gpt-oss-120b-medium`, `chat_23310` and eight
@@ -107,53 +98,27 @@ def _transport() -> Transport:
 
 
 async def _refresh(provider: str) -> str | None:
-    """Renews the credential after a 401.
+    """The token to retry with after a 401.
 
-    Two steps, in this order:
-
-    1. **Re-read the source.** Another process — another proxy worker, the dashboard — may
-       have rotated the token in the meantime. If the read already brings a token different
-       from the one that failed, it is done, and the refresh token is not spent.
-    2. **Renew**, but only if this store is the owner. Single-use rotating tokens do not
-       tolerate two renewers: the rule is at the top of `credentials/store.py`, and a store
-       with `owns_refresh=False` reads and never exchanges.
+    `refresher.recover` decides, in omp's order: a token another worker already put in the
+    store wins, a token this process minted moments ago is reused, and only otherwise is the
+    refresh token spent — under the cross-process lock, and only by a store that owns it.
 
     A failure here returns `None`, which the transport translates into the upstream's real
     error. It does not raise: the original 401 is more informative than "I failed to
-    renew".
+    renew" — and a store whose source cannot be re-read (a vault that does not answer, a
+    file caught mid-write) must not replace the upstream's refusal with its own error.
     """
     store = _state.store
     if store is None:
         return None
-
-    provider_id = _PROVIDER_IDS[provider]
     try:
-        store.reload()
-        credential = store.get(provider_id)
-    except Exception:
-        # The re-read failing — a vault that does not answer, a file caught mid-write —
-        # is a failure like any other here. Raised, it replaced the upstream's 401 with the
-        # store's own error, on a request the upstream had refused for its own reason.
-        return None
-    if credential is None:
-        return None
-    if not credential.is_expired():
-        # The re-read brought something still usable: another process already renewed.
-        return credential.access_token
-
-    if not getattr(store, "owns_refresh", False) or not credential.refresh_token:
-        return None
-
-    try:
-        from .credentials import oauth
-
-        async with httpx.AsyncClient() as client:
-            renewed = await oauth.refresh(credential, client=client, store=store)
+        credential = await refresher.recover(
+            store, _PROVIDER_IDS[provider], client_factory=httpx.AsyncClient
+        )
     except Exception:
         return None
-
-    store.set(provider_id, renewed)
-    return renewed.access_token
+    return credential.access_token if credential is not None else None
 
 
 _PROVIDER_IDS: Final[dict[str, ProviderId]] = {
@@ -171,8 +136,10 @@ async def _access_token(provider: str) -> str:
     retries what it has not yet delivered, and a 401 after the first event is not
     recoverable.
 
-    `Credential.is_expired` already carries 60 seconds of slack: the token is renewed while
-    it still works, so there is no window between the check and the request.
+    `refresher.fresh` renews a token within a minute of expiry (omp's
+    `OAUTH_REFRESH_SKEW_MS`), while it still works, so there is no window between the check
+    and the request; the renewal is shared with any other request of this worker that needs
+    it, and locked against every other worker.
 
     No token at all is refused before anything is built, as omp refuses a request with no
     key: a Codex or Antigravity request went out with ``Authorization: Bearer `` — which
@@ -183,11 +150,11 @@ async def _access_token(provider: str) -> str:
     call without a key.
     """
     store = _state.store
-    credential = store.get(_PROVIDER_IDS[provider]) if store is not None else None
-    if credential is not None and credential.is_expired():
-        renewed = await _refresh(provider)
-        if renewed:
-            return renewed
+    credential = (
+        await refresher.fresh(store, _PROVIDER_IDS[provider], client_factory=httpx.AsyncClient)
+        if store is not None
+        else None
+    )
     token = credential.access_token if credential is not None else ""
     if not token and provider != "anthropic":
         # omp: error/auth.ts :: MissingApiKeyError
@@ -211,10 +178,20 @@ def _remember_signature(call_id: str, signature: str) -> None:
 set_signature_sink(_remember_signature)
 
 
-def _request_id() -> str:
-    """``agent/<id>/<ts>/<traj>/<step>`` — the format the CCA expects."""
-    _state.step += 1
-    return f"agent/{_AGENT_ID}/{int(time.time() * 1000)}/{_TRAJECTORY_ID}/{_state.step}"
+def _observe_codex_usage(headers: Mapping[str, str]) -> None:
+    """Hands the response's `x-codex-*` quota headers to the usage the UI shows.
+
+    omp ingests them on every Codex response (`usage/openai-codex.ts ::
+    parseCodexRateLimitHeaders`); here they used to die in the transport, so the card only
+    moved when the quota endpoint was polled. As in `callback.py`, the UI's state must
+    never cost the client its response: a failure here is swallowed.
+    """
+    with contextlib.suppress(Exception):
+        from .ui.install import shared_service
+
+        service = shared_service()
+        if service is not None:
+            service.observe("openai-codex", headers)
 
 
 # omp: providers/openai-codex-responses.ts :: createCodexRequestContext
@@ -227,23 +204,39 @@ async def _codex_spec(model: str, messages: list[Any], extra: dict[str, Any]) ->
     # One identity per request, shared by the body's `client_metadata` and the headers,
     # as omp builds it once and hands it to both.
     session_id = codex.session_key(model, messages, extra.get("tools"), extra)
-    metadata = codex.turn_metadata(session_id, messages)
+    context = codex.request_context(
+        session_id, messages, model=codex.resolve_model(model), token=token
+    )
     body = codex.build_request_body(
         model,
         messages,
         tools=extra.get("tools"),
         extra=extra,
         session_id=session_id,
-        metadata=metadata,
+        metadata=context.metadata,
     )
     headers = codex.build_headers(
         token,
         session_id=session_id,
-        metadata=metadata,
+        metadata=context.metadata,
+        turn_state=context.turn_state.value,
+        models_etag=context.models_etag,
         model=str(body["model"]),
         service_tier=body.get("service_tier"),
     )
-    return RequestSpec(url=CODEX_URL, headers=headers, body=body, provider="codex", model=model)
+
+    def on_response(status: int, response_headers: Mapping[str, str]) -> None:
+        context.on_response(status, response_headers)
+        _observe_codex_usage(response_headers)
+
+    return RequestSpec(
+        url=CODEX_URL,
+        headers=headers,
+        body=body,
+        provider="codex",
+        model=model,
+        on_response=on_response,
+    )
 
 
 async def _refresh_catalog(token: str, project_id: str) -> antigravity_models.ModelCatalog:
@@ -273,7 +266,21 @@ async def _refresh_catalog(token: str, project_id: str) -> antigravity_models.Mo
     return catalog
 
 
-async def _antigravity_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> RequestSpec:
+# omp: auth-gateway/session-state.ts :: sessionKeys
+def _antigravity_session(
+    model: str, messages: list[Any], extra: dict[str, Any]
+) -> antigravity.AntigravitySession:
+    """The conversation's Antigravity state, keyed like omp's gateway keys provider state:
+    the model, then the client's session key or the one derived from the conversation (the
+    same derivation Codex uses, `codex.session_key`)."""
+    session = codex.session_key(model, messages, extra.get("tools"), extra)
+    return antigravity.antigravity_session(f"{model}\x00{session}")
+
+
+async def _antigravity_spec(
+    model: str, messages: list[Any], extra: dict[str, Any]
+) -> tuple[RequestSpec, antigravity.AntigravitySession]:
+    """The request, and the conversation state its reader commits the response id to."""
     token = await _access_token("antigravity")
     store = _state.store
     credential = store.get("google-antigravity") if store else None
@@ -282,11 +289,11 @@ async def _antigravity_spec(model: str, messages: list[Any], extra: dict[str, An
         model,
         messages,
         project_id=project_id,
-        request_id=_request_id(),
         tools=extra.get("tools"),
         extra=extra,
         thought_signatures=_state.signatures,
         catalog=await _refresh_catalog(token, project_id),
+        session=(session := _antigravity_session(model, messages, extra)),
     )
     headers = {
         "Authorization": f"Bearer {token}",
@@ -294,13 +301,14 @@ async def _antigravity_spec(model: str, messages: list[Any], extra: dict[str, An
         "Accept": "text/event-stream",
         "User-Agent": ANTIGRAVITY_USER_AGENT,
     }
-    return RequestSpec(
+    spec = RequestSpec(
         url=hosts.HOSTS[0] + hosts.STREAM_PATH,
         headers=headers,
         body=body,
         provider="antigravity",
         model=model,
     )
+    return spec, session
 
 
 # -- event interpretation, chunk shaping: see `turns.py` -----------------------

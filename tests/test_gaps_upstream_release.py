@@ -97,6 +97,6 @@ async def test_a_braked_responses_stream_releases_the_upstream() -> None:
         failure = str(error)
     await client.close()
 
-    assert "whitespace loop" in failure
+    assert "whitespace-only tool-call argument" in failure
     assert transport.pulled < 300
     assert transport.released

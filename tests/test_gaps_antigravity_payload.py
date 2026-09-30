@@ -1,18 +1,19 @@
 """Tools reaching Antigravity: what the Cloud Code request carries for a client's tools.
 
-`test_wire_antigravity.py` checks `tools_to_declarations` and `tool_config` on their own and
-that a request *without* tools carries neither field. Here the tools come from a client —
-the OpenAI SDK, through the real proxy app and a real `litellm.Router` — with the schemas a
-real tool library emits (pydantic 2: ``$defs``/``$ref``, ``anyOf`` with ``null``,
-``const`` unions, numeric bounds), and the request body the subscription receives is read
-back. Only the subscription's HTTP is faked.
+`test_wire_antigravity.py` checks `tools_to_declarations` and `function_calling_config` on
+their own and that a request *without* tools carries neither field. Here the tools come
+from a client — the OpenAI SDK, through the real proxy app and a real `litellm.Router` —
+with the schemas a real tool library emits (pydantic 2: ``$defs``/``$ref``, ``anyOf`` with
+``null``, ``const`` unions, numeric bounds), and the request body the subscription
+receives is read back. Only the subscription's HTTP is faked.
 
-The Claude-on-Antigravity expectations are omp 18.4.1's own output for the same schemas —
-``normalizeSchemaForCCA(toolWireSchema(tool))``, the path `convertTools` takes when
-``ccaLegacyParametersSchema`` is set (pi-catalog ``rules/classes/anthropic.kdl``), run from
-the tarball. For Gemini omp inserts ``normalizeSchemaForGoogle`` first, which adds
-``propertyOrdering``; that step is not ported, so the Gemini test asserts what both paths
-agree on rather than a byte-for-byte copy.
+The expectations are omp 18.4.4's own output for the same schemas, run from its sources.
+Claude on Antigravity takes ``normalizeSchemaForCCA(toolWireSchema(tool))`` — the path
+`convertTools` takes when ``ccaLegacyParametersSchema`` is set (pi-catalog
+``rules/classes/anthropic.kdl``); every other model takes
+``normalizeSchemaForCCA(normalizeSchemaForGoogle(toolWireSchema(tool)))``, the Google
+dialect first (``convertTools``' ``parametersJsonSchema``) and the CCA pass after it
+(``normalizeAntigravityTools``), which is where ``propertyOrdering`` comes from.
 """
 
 from __future__ import annotations
@@ -114,7 +115,7 @@ APPLY_EDITS: Final[dict[str, Any]] = {
     "type": "object",
 }
 
-#: omp 18.4.1, ``normalizeSchemaForCCA(toolWireSchema(tool))`` on `GET_WEATHER`.
+#: omp 18.4.4, ``normalizeSchemaForCCA(toolWireSchema(tool))`` on `GET_WEATHER`.
 GET_WEATHER_CCA: Final[dict[str, Any]] = {
     "description": "Current weather and forecast for a place.",
     "properties": {
@@ -155,7 +156,7 @@ GET_WEATHER_CCA: Final[dict[str, Any]] = {
     "type": "object",
 }
 
-#: omp 18.4.1, ``normalizeSchemaForCCA(toolWireSchema(tool))`` on `APPLY_EDITS`.
+#: omp 18.4.4, ``normalizeSchemaForCCA(toolWireSchema(tool))`` on `APPLY_EDITS`.
 APPLY_EDITS_CCA: Final[dict[str, Any]] = {
     "properties": {
         "edits": {
@@ -184,6 +185,84 @@ APPLY_EDITS_CCA: Final[dict[str, Any]] = {
     "required": ["edits"],
     "title": "ApplyEdits",
     "type": "object",
+}
+
+#: omp 18.4.4, ``normalizeSchemaForCCA(normalizeSchemaForGoogle(toolWireSchema(tool)))``
+#: on `GET_WEATHER`.
+GET_WEATHER_GEMINI: Final[dict[str, Any]] = {
+    "description": "Current weather and forecast for a place.",
+    "properties": {
+        "location": {
+            "properties": {
+                "city": {"description": "City name", "title": "City", "type": "string"},
+                "country": {
+                    "default": None,
+                    "description": "ISO country code",
+                    "title": "Country",
+                    "type": "string",
+                },
+            },
+            "required": ["city"],
+            "title": "Location",
+            "type": "object",
+            "propertyOrdering": ["city", "country"],
+        },
+        "units": {
+            "enum": ["metric", "imperial"],
+            "title": "Unit",
+            "type": "string",
+            "default": "metric",
+        },
+        "days": {
+            "default": 1,
+            "description": "Days of forecast\n\n{maximum: 14, minimum: 1}",
+            "title": "Days",
+            "type": "integer",
+        },
+        "include": {
+            "items": {"enum": ["wind", "rain"], "type": "string"},
+            "title": "Include",
+            "type": "array",
+        },
+    },
+    "required": ["location"],
+    "title": "GetWeather",
+    "type": "object",
+    "propertyOrdering": ["location", "units", "days", "include"],
+}
+
+#: omp 18.4.4, ``normalizeSchemaForCCA(normalizeSchemaForGoogle(toolWireSchema(tool)))``
+#: on `APPLY_EDITS`.
+APPLY_EDITS_GEMINI: Final[dict[str, Any]] = {
+    "properties": {
+        "edits": {
+            "items": {
+                "properties": {
+                    "path": {"title": "Path", "type": "string"},
+                    "old": {"title": "Old", "type": "string"},
+                    "new": {"title": "New", "type": "string"},
+                },
+                "required": ["path", "old", "new"],
+                "title": "Edit",
+                "type": "object",
+                "propertyOrdering": ["path", "old", "new"],
+            },
+            "title": "Edits",
+            "type": "array",
+            "description": "{minItems: 1}",
+        },
+        "dry_run": {"default": None, "title": "Dry Run", "type": "boolean"},
+        "mode": {
+            "enum": ["strict", "fuzzy"],
+            "type": "string",
+            "default": "strict",
+            "title": "Mode",
+        },
+    },
+    "required": ["edits"],
+    "title": "ApplyEdits",
+    "type": "object",
+    "propertyOrdering": ["edits", "dry_run", "mode"],
 }
 
 TOOLS: Final = [
@@ -299,32 +378,30 @@ class TestToolsLandInTheRequest:
         ]
         assert request["toolConfig"] == {"functionCallingConfig": {"mode": "VALIDATED"}}
 
-    async def test_gemini_gets_a_schema_the_backend_accepts(self) -> None:
-        """The constructs CCA answers 400 to must not survive anywhere in the tree, and
-        what they meant must: the referenced object inlined, the optional field typed, the
-        literal union an enum, the bounds in the description."""
+    async def test_gemini_gets_omps_declarations(self) -> None:
+        """Gemini goes through the Google dialect before the CCA pass, as omp sends it: the
+        same widening as Claude's, plus ``propertyOrdering`` on every object with more than
+        one property — the order Gemini then generates the arguments in."""
         request = await upstream_request(GEMINI, tools=TOOLS)
 
-        (declarations,) = request["tools"]
-        weather, edits = declarations["functionDeclarations"]
-        assert [weather["name"], edits["name"]] == ["get_weather", "apply_edits"]
-        rejected = {"$ref", "$defs", "anyOf", "oneOf", "allOf", "const", "not", "minItems"}
-        assert rejected.isdisjoint(walk(declarations))
-
-        location = weather["parameters"]["properties"]["location"]
-        assert location["required"] == ["city"]
-        assert location["properties"]["country"]["type"] == "string"
-        assert weather["parameters"]["properties"]["units"]["enum"] == ["metric", "imperial"]
-        assert (
-            "{maximum: 14, minimum: 1}"
-            in weather["parameters"]["properties"]["days"]["description"]
-        )
-        assert edits["parameters"]["properties"]["mode"]["enum"] == ["strict", "fuzzy"]
-        assert edits["parameters"]["properties"]["edits"]["items"]["required"] == [
-            "path",
-            "old",
-            "new",
+        assert request["tools"] == [
+            {
+                "functionDeclarations": [
+                    {
+                        "name": "get_weather",
+                        "description": "Weather for a city.",
+                        "parameters": GET_WEATHER_GEMINI,
+                    },
+                    {
+                        "name": "apply_edits",
+                        "description": "Apply text edits.",
+                        "parameters": APPLY_EDITS_GEMINI,
+                    },
+                ]
+            }
         ]
+        rejected = {"$ref", "$defs", "anyOf", "oneOf", "allOf", "const", "not", "minItems"}
+        assert rejected.isdisjoint(walk(request["tools"]))
         assert request["toolConfig"] == {"functionCallingConfig": {"mode": "VALIDATED"}}
 
     async def test_a_schema_cca_cannot_express_degrades_to_an_open_object(self) -> None:

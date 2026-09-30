@@ -8,13 +8,17 @@ at 8. Changing them without an equivalent corpus is guesswork.
 Three forms of runaway, with distinct purposes:
 
 1. **Exact suffix cycle** — literal repetition. Two regimes: short cycles (≤60 chars)
-   require 4 repetitions and ≥180 chars; long cycles require 3 and ≥1024. Always applied.
+   require 4 repetitions and ≥180 chars; long cycles require 3 and ≥1024. Applied to
+   every model, as omp's `stream()` wraps every provider in the guard.
 2. **Near-duplicate cluster** — the same paragraph rewritten with cosmetic drift, by
    word-trigram overlap.
 3. **Lexical stall** — paragraphs that recycle recent vocabulary and introduce no new
    concrete reference.
 
-The last two are semantic heuristics and can be switched off; the first cannot.
+The last two are semantic heuristics, armed only for the families that run away
+(`is_loop_guarded_model`). `LoopGuard` is omp's `guardThinkingLoopStream` on the reasoning
+channel: which deltas the detector sees, when it is flushed, and when visible text latches
+it off. omp also judges the visible text; that half is a measured divergence.
 """
 
 from __future__ import annotations
@@ -93,14 +97,6 @@ _HAS_LETTER = re.compile(r"[a-z]")
 _LETTER_OR_EMOJI = re.compile(r"[^\W\d_]", re.UNICODE)
 
 
-class ThinkingLoopError(Exception):
-    """Runaway reasoning.
-
-    Distinct from ``Exception`` so it passes through the handlers that tolerate malformed
-    chunks: a detected loop is not a malformed chunk.
-    """
-
-
 # omp: utils/thinking-loop.ts :: normalizeSegment
 def normalize_segment(segment: str) -> str:
     """Lowercase, no punctuation, only words that contain letters."""
@@ -172,13 +168,9 @@ def detect_exact_suffix_cycle(text: str) -> tuple[str, int] | None:
 
 # omp: utils/thinking-loop.ts :: ThinkingLoopDetector
 class ThinkingLoopDetector:
-    """Fed with the reasoning deltas; returns the reason on the first runaway.
+    """Fed with streamed deltas; returns the reason on the first runaway.
 
-    Deliberate deviation from omp: there the trigger is a *retryable* error and the retry
-    layer asks again. Here it raises. The generator has already flushed everything that is
-    ``reasoning_content`` to the client before detection happens, and retrying would
-    duplicate reasoning in the same stream — omp avoids that with a replay-safe window that
-    does not exist here.
+    `LoopGuard` decides which deltas reach it and when it is flushed.
     """
 
     __slots__ = (
@@ -191,7 +183,6 @@ class ThinkingLoopDetector:
         "_tail",
         "_window",
         "_word_window",
-        "chars",
     )
 
     def __init__(self, *, semantic_heuristics: bool = True) -> None:
@@ -204,13 +195,11 @@ class ThinkingLoopDetector:
         self._anchor_window: list[set[str]] = []
         self._count = 0
         self._lex_stall_run = 0
-        self.chars = 0
 
     def feed(self, delta: str) -> str | None:
         """Reason for the loop, or ``None``. Never raises."""
         if not delta:
             return None
-        self.chars += len(delta)
 
         # 1. Exact cycles, scanned at a limited stride instead of quadratic work on every
         # token-sized delta.
@@ -260,7 +249,8 @@ class ThinkingLoopDetector:
         if found is None:
             return None
         unit, times = found
-        return f"exact cycle of {len(unit)} characters repeated {times}x in a row"
+        # omp's wording, multiplication sign included: it ends up in the client's error.
+        return f"repeated an exact {len(unit)}-character cycle {times}× back-to-back"  # noqa: RUF001
 
     def _consume_chunks(self, raw: str) -> str | None:
         """Split an over-long segment so that each chunk stays comparable."""
@@ -319,19 +309,84 @@ class ThinkingLoopDetector:
         if self._count < SEGMENT_MIN_COUNT:
             return None
         if cluster >= SEGMENT_MIN_CLUSTER:
-            return f"{cluster} near-identical segments in the last {SEGMENT_WINDOW}"
+            return f"{cluster} near-identical segments within the last {SEGMENT_WINDOW}"
         if self._lex_stall_run >= LEX_STALL_MIN_RUN:
-            return f"{self._lex_stall_run} low-information segments recycling recent text"
+            return f"{self._lex_stall_run} low-information segments recycling recent wording"
         return None
 
 
-# omp: utils/thinking-loop.ts :: isLoopGuardedModel
-def guard_for(model: str) -> ThinkingLoopDetector | None:
-    """Guards the families that actually run away.
+# omp: utils/thinking-loop.ts :: THINKING_LOOP_ERROR_MARKER
+#: Lead phrase of the error a tripped guard ends the turn with.
+THINKING_LOOP_ERROR_MARKER: Final = "Thinking loop detected"
 
-    omp guards Gemini, DeepSeek and xAI. Only Gemini is served here, but the list stays
-    aligned with the source so that a new provider does not slip through unnoticed.
+
+# omp: utils/thinking-loop.ts :: buildThinkingLoopError
+def loop_error_message(detail: str) -> str:
+    """omp's ``errorMessage`` for a tripped guard, verbatim."""
+    return (
+        f"{THINKING_LOOP_ERROR_MARKER}: the model repeated near-identical content ({detail}). "
+        "Treating as a stream stall and retrying."
+    )
+
+
+# omp: utils/thinking-loop.ts :: isLoopGuardedModel
+def is_loop_guarded_model(model: str) -> bool:
+    """Whether the semantic heuristics are armed: the Gemini, DeepSeek and xAI classes.
+
+    omp reads the class off a typed catalog (`thinking-loop-guard` in
+    ``classes/{gemini,deepseek,xai}.kdl``); here the wire name is all there is.
     """
     lowered = str(model).lower()
-    guarded = ("gemini", "deepseek", "grok", "xai")
-    return ThinkingLoopDetector() if any(name in lowered for name in guarded) else None
+    return any(name in lowered for name in ("gemini", "deepseek", "grok", "xai"))
+
+
+# omp: utils/thinking-loop.ts :: guardThinkingLoopStream
+class LoopGuard:
+    """omp's guard around a provider stream, on the reasoning channel only.
+
+    Each hook returns the loop's reason, or ``None``; the reader stops at the first
+    reason, before the delta that tripped it goes out. What omp's guard does per event,
+    as far as it is kept here:
+
+    - reasoning deltas feed the detector until visible text has started;
+    - the end of a reasoning block flushes it while it is armed;
+    - visible text latches it off;
+    - a turn that ends normally flushes it if still armed. A turn that fails is not
+      flushed: the failure is already the answer.
+
+    Exact cycles are checked for every model; the semantic heuristics only where
+    `is_loop_guarded_model` says the family runs away.
+
+    Deliberate divergence: omp also feeds the visible text to a second detector
+    (``checkAssistantContent``, on by default, and its gateway never turns it off).
+    Measured live on 0.1.17's candidate against the real backends, prompt "Write the line
+    'hello world' 60 times, one per line, nothing else.", non-streamed chat: gpt-5.5 and
+    gemini-3-flash both failed with 502 "repeated an exact 12-character cycle 21x/32x
+    back-to-back", after three billed attempts, where 0.1.16 answered 200 with the 60
+    lines. Lists, tables, CSV and code repeat by design; only reasoning is judged here.
+    """
+
+    __slots__ = ("_text_started", "_thinking", "_thinking_armed")
+
+    def __init__(self, model: str) -> None:
+        self._thinking = ThinkingLoopDetector(semantic_heuristics=is_loop_guarded_model(model))
+        self._thinking_armed = True
+        self._text_started = False
+
+    def thinking_delta(self, delta: str) -> str | None:
+        if self._text_started:
+            return None
+        self._thinking_armed = True
+        return self._thinking.feed(delta)
+
+    def thinking_end(self) -> str | None:
+        return self._thinking.flush() if self._thinking_armed else None
+
+    def text_delta(self, delta: str) -> None:
+        """Visible text latches the reasoning detector off; the text itself is not judged."""
+        if delta:
+            self._thinking_armed = False
+            self._text_started = True
+
+    def done(self) -> str | None:
+        return self._thinking.flush() if self._thinking_armed else None

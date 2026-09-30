@@ -258,6 +258,7 @@ def build_app(service: MySubsService, *, guard: Any | None = _UNSET) -> FastAPI:
                             "wire_name": model.wire_name,
                             "suggested_name": model.suggested_name,
                             "verified": model.verified,
+                            "refused": model.refused,
                             "note": model.note,
                         }
                         for model in models
@@ -545,10 +546,19 @@ def _card(card: ProviderCard, service: MySubsService) -> str:
             _ROW.format(
                 name=html.escape(model.suggested_name),
                 wire=html.escape(model.wire_name),
-                checked=" checked" if not chosen or model.suggested_name in chosen else "",
+                # A model the upstream answered and refused (retired, name rejected) starts
+                # unticked even if it was selected: applying the page as shown drops it.
+                checked=(
+                    " checked"
+                    if (not chosen or model.suggested_name in chosen) and not model.refused
+                    else ""
+                ),
                 mark=(
                     '<span class="chip on">verified</span>'
                     if model.verified
+                    else f'<span class="chip off" title="{html.escape(model.note)}">'
+                    f"not served: {html.escape(model.note)}</span>"
+                    if model.refused
                     else f'<span class="chip unk" title="{html.escape(model.note)}">'
                     "unverified</span>"
                 ),

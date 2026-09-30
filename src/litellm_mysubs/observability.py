@@ -18,19 +18,29 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Coroutine, Mapping
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, cast
 
+import httpx
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.litellm_core_utils.litellm_logging import Logging
+from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
 from litellm.types.utils import ModelResponseStream
 
 from .transport.client import RedeemRequired, RemapRequired, UpstreamError
+from .turns import StreamError
+from .wire.antigravity import ModelRetiredError
+
+#: Failures that leave as the exception LiteLLM answers the client with
+#: (`_as_litellm_error`). A retired model is neither an upstream nor a stream error — it
+#: must stay distinguishable from a transport failure — but it too needs a status.
+TRANSLATED_ERRORS: Final = (UpstreamError, StreamError, ModelRetiredError)
 
 #: Operator-facing log. `litellm_mysubs.*` loggers are silent inside the proxy: the root
 #: logger has no handlers, so a plain `getLogger(__name__)` emits nowhere — measured, and
@@ -55,12 +65,74 @@ async def _translate_errors(
     try:
         async for chunk in chunks:
             yield chunk
-    except UpstreamError as error:
-        raise _as_litellm_error(error, model, kwargs) from error
+    except TRANSLATED_ERRORS as error:
+        translated = _as_litellm_error(error, model, kwargs)
+        if translated is error:
+            raise
+        raise translated from error
 
 
-def _as_litellm_error(error: UpstreamError, model: str, kwargs: dict[str, Any]) -> Exception:
-    """Translates an upstream refusal into the exception LiteLLM understands.
+# omp: error/gateway.ts :: extractEmbeddedStatus
+_EMBEDDED_STATUS: Final = re.compile(
+    r"(?:\bHTTP\b|\bAPI error\b|\bstatus(?:[- _]?code)?\b)\s*[:=]?\s*\(?\s*(\d{3})\b|\((\d{3})\)",
+    re.IGNORECASE,
+)
+_ABORTED: Final = re.compile(r"\baborted\b|\babort signal\b", re.IGNORECASE)
+_RATE_LIMITED: Final = re.compile(
+    r"\brate[- _]?limit(?:s|ed|ing)?\b|\bquota(?:_exceeded| exceeded)?\b"
+    r"|\btoo[- _]many[- _]requests\b",
+    re.IGNORECASE,
+)
+_UNAUTHORIZED: Final = re.compile(r"\b(?:unauthorized|forbidden)\b", re.IGNORECASE)
+_INVALID_REQUEST: Final = re.compile(
+    r"\b(?:unsupported|invalid_request|invalid request|bad request|malformed)\b", re.IGNORECASE
+)
+
+
+# omp: error/gateway.ts :: bucketStatus
+def _bucket_status(status: int) -> tuple[int, str]:
+    if status in (401, 403):
+        return status, "authentication_error"
+    if status == 429:
+        return status, "rate_limit_error"
+    if 400 <= status < 500:
+        return status, "invalid_request_error"
+    if status >= 500:
+        return status, "upstream_error"
+    return 502, "upstream_error"
+
+
+# omp: error/gateway.ts :: classifyGatewayError
+def classify_gateway_error(error: BaseException) -> tuple[int, str]:
+    """``(status, type)`` omp's gateway answers a failed turn with.
+
+    A status the failure carries wins; then one embedded in its message (``HTTP 429``,
+    ``API error (400)``); then word-boundaried wording. What says nothing is 502
+    ``upstream_error``: the upstream failed, not the proxy. omp also counts its central
+    usage-limit phrasings as a 429; that classifier is not ported, and the Codex usage
+    limit arrives here as an HTTP 429 the transport already carries.
+    """
+    status = getattr(error, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return _bucket_status(status)
+    message = str(error)
+    if match := _EMBEDDED_STATUS.search(message):
+        code = int(match.group(1) or match.group(2))
+        if 100 <= code < 600:
+            return _bucket_status(code)
+    if _ABORTED.search(message):
+        return 499, "request_aborted"
+    if _RATE_LIMITED.search(message):
+        return 429, "rate_limit_error"
+    if _UNAUTHORIZED.search(message):
+        return 401, "authentication_error"
+    if _INVALID_REQUEST.search(message):
+        return 400, "invalid_request_error"
+    return 502, "upstream_error"
+
+
+def _as_litellm_error(error: Exception, model: str, kwargs: dict[str, Any]) -> Exception:
+    """Translates an upstream failure into the exception LiteLLM understands.
 
     `UpstreamError` already carries the real status, but the proxy has no class for it: an
     unrecognised exception is reported as `internal_server_error` with HTTP 500, and the
@@ -71,8 +143,12 @@ def _as_litellm_error(error: UpstreamError, model: str, kwargs: dict[str, Any]) 
                              "message": "HTTP 429: ... RESOURCE_EXHAUSTED ..."}}
 
     A client cannot back off on a 500. It can on a 429, and backing off is the one correct
-    response to a quota refusal — so the status is mapped, never invented: anything that is
-    not a status LiteLLM has a class for propagates unchanged.
+    response to a quota refusal. The same goes for a 401 the transport's refresh-once did
+    not cure: as a 500 the client blamed the proxy, and LiteLLM's failure log filed it
+    under the wrong class. Both become the exception LiteLLM has for them, so the client
+    gets the status and the log the class. A failure inside a 200 stream (`StreamError`)
+    is classified the way omp's gateway classifies it and keeps its own class otherwise,
+    carrying the status and type the proxy answers with.
 
     `RemapRequired` and `RedeemRequired` are excluded even though the latter is also a 429:
     they are signals to `plugin.py`, not answers to the client, and the module docstring's
@@ -80,12 +156,96 @@ def _as_litellm_error(error: UpstreamError, model: str, kwargs: dict[str, Any]) 
     """
     if isinstance(error, RemapRequired | RedeemRequired):
         return error
+    if isinstance(error, ModelRetiredError):
+        # No omp counterpart (the notice is CCA-specific). The model is gone for good:
+        # 404 tells the client and LiteLLM's Router not to try again, where the 500 it
+        # used to be told them the proxy broke.
+        _, family = _cost_identity(model, kwargs)
+        return _litellm_status_error(404, str(error), family, model)
+    status, kind = classify_gateway_error(error)
     _, family = _cost_identity(model, kwargs)
-    if error.status == 429:
-        return litellm.exceptions.RateLimitError(
-            message=str(error), llm_provider=family, model=model
-        )
+    if isinstance(error, UpstreamError) or status in (401, 429):
+        return _litellm_status_error(status, str(error), family, model)
+    if isinstance(error, StreamError):
+        error.status_code = status
+        error.type = kind
     return error
+
+
+def _litellm_status_error(status: int, message: str, provider: str, model: str) -> Exception:
+    """LiteLLM's exception for an upstream status, so the proxy answers with that status.
+
+    The proxy answers ``status_code`` off the exception, and 500 for one without it —
+    which is how an upstream HTTP error that is not a 401 or a 429 still reached the
+    client. Measured live on 0.1.16 and the 0.1.17 candidate alike: Cloud Code's 503 "No
+    capacity available for model gemini-2.5-pro" went out as 500
+    ``internal_server_error``, telling the client the proxy broke and not to come back
+    later. omp's gateway answers with the upstream's own status (``bucketStatus``).
+    """
+    exceptions = litellm.exceptions
+    named: dict[int, Any] = {
+        400: exceptions.BadRequestError,
+        401: exceptions.AuthenticationError,
+        404: exceptions.NotFoundError,
+        429: exceptions.RateLimitError,
+        500: exceptions.InternalServerError,
+        502: exceptions.BadGatewayError,
+        503: exceptions.ServiceUnavailableError,
+    }
+    if status in named:
+        return cast(Exception, named[status](message=message, llm_provider=provider, model=model))
+    if status in (403, 422):
+        # Both require the response they would normally be built from.
+        response = httpx.Response(status, request=httpx.Request("POST", "https://upstream"))
+        refusal = (
+            exceptions.PermissionDeniedError
+            if status == 403
+            else exceptions.UnprocessableEntityError
+        )
+        return cast(
+            Exception,
+            refusal(message=message, llm_provider=provider, model=model, response=response),
+        )
+    return exceptions.APIError(
+        status_code=status, message=message, llm_provider=provider, model=model
+    )
+
+
+def _record_failed_usage(usage: litellm.Usage, model: str, kwargs: dict[str, Any]) -> None:
+    """Records what a failed turn cost, where LiteLLM bills a failure from.
+
+    LiteLLM keeps a failed request's consumption in ``combined_usage_object`` and
+    ``response_cost`` on the logging object (`Logging.record_partial_usage_for_failure`):
+    the failure handler keeps that cost instead of zeroing it, and the proxy's
+    ``post_call_failure_hook`` lifts both onto the request it bills the key for. Without
+    this a Gemini turn stopped for SAFETY after 165 tokens was billed at zero on every
+    route; on the chat stream LiteLLM guessed 8 + 2 tokens by counting the text.
+
+    Priced under the wire identity, as `_stamp_cost` prices a success. omp skips a usage
+    that is all zeros (``recordGatewayUsage``); so does this.
+    """
+    if not (usage.prompt_tokens or usage.completion_tokens):
+        return
+    logging_obj = kwargs.get("litellm_logging_obj")
+    details = getattr(logging_obj, "model_call_details", None)
+    if not isinstance(details, dict):
+        return
+    cost_model, cost_provider = _cost_identity(model, kwargs)
+    cost = 0.0
+    with contextlib.suppress(Exception):
+        cost = float(
+            litellm.completion_cost(
+                completion_response=litellm.ModelResponse(model=cost_model, usage=usage),
+                model=cost_model,
+                custom_llm_provider=cost_provider,
+            )
+        )
+    record = getattr(logging_obj, "record_partial_usage_for_failure", None)
+    if callable(record):
+        record(usage, cost)
+        return
+    details["combined_usage_object"] = usage
+    details["response_cost"] = cost
 
 
 async def _logged(turn: Coroutine[Any, Any, Any], kwargs: dict[str, Any]) -> Any:
@@ -274,6 +434,12 @@ class _LoggedResponsesStream(BaseResponsesAPIStreamingIterator):
         except StopAsyncIteration:
             await self._emit()
             raise
+        except Exception:
+            # A failed turn is billed by LiteLLM's failure path, from what
+            # `_record_failed_usage` left on the logging object; a success row on top of
+            # it would count the turn twice and read it as answered.
+            self._emitted = True
+            raise
         # The first event that carries **output** is the time-to-first-token, not the
         # first event of any kind: `response.created` is an envelope this plugin emits
         # the moment the stream opens, before the upstream has answered anything.
@@ -411,6 +577,11 @@ async def _logged_messages(
             if kind == "message_delta":
                 final = event
             yield event
+    except Exception:
+        # Failed, not stopped early: LiteLLM's failure path bills it. Measured before
+        # this: a SAFETY turn logged a zero-token success row beside its failure.
+        emitted = True
+        raise
     finally:
         await _emit()
 
@@ -604,12 +775,55 @@ def _wrap_stream(
     it can price.
     """
     cost_model, cost_provider = _cost_identity(model, kwargs)
-    return litellm.CustomStreamWrapper(
-        completion_stream=chunks,
+    return _ServedStream(
+        completion_stream=_openai_errors(chunks, model, kwargs),
         model=cost_model,
         custom_llm_provider=cost_provider,
         logging_obj=kwargs.get("litellm_logging_obj") or _logging_obj(cost_model, kwargs),
     )
+
+
+class _ServedStream(CustomStreamWrapper):
+    """LiteLLM's chat stream iterator, keeping the upstream's count for a failed turn.
+
+    When a stream breaks, `CustomStreamWrapper` estimates what it cost by counting the
+    tokens of the chunks already sent, and overwrites whatever the logging object held.
+    Our turns know better whenever the upstream reported usage before failing — a Gemini
+    SAFETY stop reports all of it — and `_record_failed_usage` has already put that there.
+    The estimate stays LiteLLM's answer when there is nothing reported to keep.
+    """
+
+    def _record_partial_usage_for_failure(self) -> None:
+        details = getattr(self.logging_obj, "model_call_details", None)
+        if isinstance(details, dict) and details.get("combined_usage_object") is not None:
+            return
+        super()._record_partial_usage_for_failure()
+
+
+async def _openai_errors(
+    chunks: AsyncIterator[ModelResponseStream], model: str, kwargs: dict[str, Any]
+) -> AsyncIterator[ModelResponseStream]:
+    """A `StreamError` as the LiteLLM exception for its status, for the chat stream only.
+
+    `CustomStreamWrapper` keeps an exception of LiteLLM's own and maps anything else
+    through the provider's exception table, which turned a 502 upstream failure into
+    ``APIConnectionError`` 500 on the Gemini table. The other routes answer with their own
+    error events and read the status off the exception, so they get it untranslated.
+    """
+    try:
+        async for chunk in chunks:
+            yield chunk
+    except ModelRetiredError as error:
+        raise _as_litellm_error(error, model, kwargs) from error
+    except StreamError as error:
+        _, family = _cost_identity(model, kwargs)
+        if error.status_code == 502:
+            raise litellm.exceptions.BadGatewayError(
+                message=str(error), llm_provider=family, model=model
+            ) from error
+        raise litellm.exceptions.APIError(
+            status_code=error.status_code, message=str(error), llm_provider=family, model=model
+        ) from error
 
 
 def _logging_obj(model: str, kwargs: dict[str, Any]) -> Logging:

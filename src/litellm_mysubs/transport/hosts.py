@@ -10,7 +10,10 @@ Two invariants that come from the source and are easy to lose:
    the connection and then cut the stream in half.
 2. Failover is only legal while **nothing** has been emitted. After the first event the
    client has already seen part of the response, and restarting on another host would
-   duplicate it.
+   duplicate it. That is tracked per request, by the transport.
+3. Only a transient failure moves to the other host — 408, 5xx, a network failure, a
+   first-event timeout, an empty response. A 4xx is the request's own fault and the other
+   host would refuse it the same way (`retry.decide_antigravity`).
 
 Note established in production: when both fail, the error message names the **last** host
 tried — which is what makes `sandbox` show up in errors without it being "stuck".
@@ -21,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
+# omp: providers/google-gemini-cli.ts :: ANTIGRAVITY_ENDPOINT_FALLBACKS
 HOSTS: Final[tuple[str, ...]] = (
     "https://daily-cloudcode-pa.googleapis.com",
     "https://daily-cloudcode-pa.sandbox.googleapis.com",
@@ -42,36 +46,50 @@ def empty_retry_delay(attempt: int) -> float:
     return float(EMPTY_RETRY_BASE_S * (2 ** max(0, attempt - 1)))
 
 
+# omp: providers/google-gemini-cli.ts :: DEFAULT_FIRST_EVENT_TIMEOUT_MS
+#: Wait for the first event — response headers included. Five minutes is the allowance
+#: omp keeps for a cold Pro reasoning start.
+FIRST_EVENT_TIMEOUT_S: Final = 300.0
+# omp: compat/rules/classes/gemini.kdl :: flash
+#: ``stream-first-event-timeout-ms 60000`` on the Gemini flash family, on the Antigravity
+#: and Gemini CLI hosts: flash does not inherit the Pro allowance.
+FLASH_FIRST_EVENT_TIMEOUT_S: Final = 60.0
+# omp: providers/google-gemini-cli.ts :: FIRST_EVENT_TIMEOUT_ERROR
+FIRST_EVENT_TIMEOUT_ERROR: Final = (
+    "Cloud Code Assist stream timed out while waiting for the first event"
+)
+
+
+def first_event_timeout(model: str) -> float:
+    """The first-event watchdog for a wire model name.
+
+    The catalog's flash family is ``flash`` without ``lite``: the lite line is a family of
+    its own and keeps the default, as does every Claude and GPT model the host serves.
+    """
+    name = model.rsplit("/", 1)[-1].lower()
+    if "flash" in name and "lite" not in name:
+        return FLASH_FIRST_EVENT_TIMEOUT_S
+    return FIRST_EVENT_TIMEOUT_S
+
+
 # omp: providers/google-gemini-cli.ts :: lastGoodEndpoint
 @dataclass(slots=True)
 class HostRotation:
     """Endpoint try order, with memory of the last good one.
 
     An instance rather than a global: two clients in the same process must not share the
-    memory of which host answered.
+    memory of which host answered. What a single request has already emitted is not kept
+    here: the rotation is shared by every request in flight, so a flag on it let one
+    stream that had started forbid failover to another that had not.
     """
 
     hosts: tuple[str, ...] = HOSTS
     index: int = 0
-    #: Flips to ``True`` on the first event emitted to the client.
-    started: bool = False
 
     def urls(self, path: str = STREAM_PATH) -> list[str]:
         """Every endpoint, starting at the last good one."""
         count = len(self.hosts)
         return [self.hosts[(self.index + offset) % count] + path for offset in range(count)]
-
-    def can_failover(self, *, is_last: bool) -> bool:
-        """Whether trying the next endpoint is legal.
-
-        Once the client has seen the first event, switching host would duplicate the part
-        already delivered.
-        """
-        return not is_last and not self.started
-
-    def mark_started(self) -> None:
-        """Record that content has been emitted: the endpoint is now committed."""
-        self.started = True
 
     def commit(self, url: str) -> None:
         """Remember the host **after** a complete stream.

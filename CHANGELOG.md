@@ -7,6 +7,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-09-30
+
+omp 18.4.4, and the rest of the upstream protocol inherited from it: the transport and its
+retries, the stream readers and error mapping, and credential refresh are now omp ports too.
+607 anchors (342 in 0.1.16). Validated against the three live subscriptions from a
+throwaway proxy before release; every divergence from omp that remains is a live
+measurement, recorded in `docs/OMP.md`.
+
+### Fixed
+
+- **The Codex quota card follows every request.** The `x-codex-*` rate-limit headers of each
+  successful response update the plan and the 5h/7d bars; before, the card only moved when
+  the usage probe ran, because the transport dropped response headers.
+- **Codex tool continuations resend the turn state.** The `x-codex-turn-state` a turn's
+  first response returns goes back on its tool-result follow-ups, and `x-models-etag` is
+  echoed, as omp does; a new user turn starts without it.
+- **Tool schemas are normalized as omp normalizes them**, byte for byte on 1,200 corpus
+  schemas: for Codex, `oneOf` becomes `anyOf`, lookaround `pattern`s are dropped, bare
+  objects gain `properties`; for Gemini, `propertyOrdering` is added and a nullable field
+  no longer collapses the whole tool into an open object.
+- **Errors keep their status.** An upstream HTTP error reaches the client with the status
+  class omp's gateway gives it on every route (a Cloud Code 503 "No capacity" was a 500);
+  an upstream 401 is a 401 `AuthenticationError`; a Codex stream cut before its terminal
+  event is a 502 (was 500); a Cloud Code stream that ends without a finish reason fails
+  with 502 instead of passing as a success; a model the upstream retired is a 404 (was
+  500), which neither the client nor LiteLLM's Router retries.
+- **A non-streamed Cloud Code turn that failed to sample is asked again**, up to three
+  attempts: reasoning with no answer, or `MALFORMED_FUNCTION_CALL`. Measured on
+  gemini-3.1-pro-low with a forced tool, 3-4 in 25 attempts ended that way, independently.
+  A streamed turn (its reasoning already went out) and a refusal such as SAFETY still fail.
+- **After a restart the selection screen showed nothing ticked**, and applying it as shown
+  removed every model: the restored selection carried the public `mysubs/<provider>/` names
+  while the page compares the bare ones.
+- **Antigravity discovery no longer calls an advertised model verified.** The catalog kept
+  listing retired models, and an unprobed discovery marked them verified, so three dead
+  models stayed selected. Discovery now probes the models already selected (all of them
+  when nothing is selected yet; one short billed turn each), lists the rest as unverified
+  with the reason, and a selected model the upstream refuses or retired starts unticked,
+  marked "not served". A probe that billed tokens counts as served even with no text (the
+  8-token budget goes to thinking on thinking models), and a probe gets 30 s instead of 10:
+  measured, thinking flash models take 9-25 s, and at 10 s most of the selection came back
+  unprobed.
+- **Failed turns are billed what the upstream reported**, at the wire rate, and a failed
+  Messages or Responses stream no longer also logs a zero-token success.
+- **Antigravity sampling reaches the backend.** `temperature`, `top_p` and `top_k` were
+  silently dropped. Penalties on Gemini and `top_p` below 0.95 on a thinking Claude are
+  still dropped: the backend refuses them (measured per field and family).
+- **Antigravity: requests that always failed now work.** A Claude tool without parameters
+  (400 `input_schema.type`); a small `max_tokens` on a thinking-only model such as
+  gemini-3.1-pro-low (400 "Budget 0 is invalid"); and `reasoning_effort: "none"` on the
+  models that refuse a zero budget (gemini-3.1-pro-low, gemini-pro-agent,
+  gemini-2.5-flash(-lite), gemini-3.5-flash-lite, gpt-oss), which now keep thinking at the
+  catalog minimum, as omp raises "no reasoning" to the lowest effort. The caller's
+  `max_tokens` stays the total output: measured on 27 cases, none exceeded it.
+- **Anthropic: the client's reasoning request reaches the wire.** An explicit
+  `reasoning_effort` on an adaptive model went out as `medium`, a Messages client's own
+  `output_config.effort` was overwritten, and a chat request's `max_tokens` was raised to
+  the model ceiling.
+- **Credential renewal is single-flight and locked on every path**, as omp's
+  `OAuthRefresher`: requests needing a renewal at the same time share one token exchange
+  across workers; a 401 on a token the clock still calls valid mints a new one instead of
+  retrying the rejected token; two workers renewing different providers no longer undo
+  each other's write; the token endpoint gets 30 s (Codex 15 s) instead of httpx's 5 s, and
+  the exchange is capped at 10 s.
+
+### Changed
+
+- **omp 18.4.4 wire values**: Codex client `0.159.0` (newer SKUs such as gpt-6.1-sol become
+  discoverable), user agent `omp/18.4.4`; `service_tier` `priority`/`scale` is not sent to a
+  model whose advertised tiers don't list it.
+- **Retries follow omp.** A persistent Codex 429/5xx is retried up to 6 times within
+  omp's 5-minute budget (it was sent once); Antigravity gets omp's per-host attempts,
+  retry hints, first-event and idle watchdogs (60 s first event on flash) and the
+  empty-response replay. Nothing is retried once the client has seen an event. LiteLLM's
+  Router does not retry these on top (measured: one client request, six upstream sends).
+- **Stream readers are omp's** for Codex and Cloud Code: deltas routed to the item they
+  name, text kept beside tool calls, compact JSON arguments in non-streamed answers,
+  reasoning summary parts separated by a blank line, leaked `<think>`-style markup in
+  Gemini text moved to reasoning, a Gemini turn that stops with nothing in it fails as
+  "empty response".
+- **Loop guards are omp's** (`Thinking loop detected: …`): exact cycles in reasoning on
+  every model, omp's semantic heuristics on Gemini; a non-streamed turn is re-sampled up to
+  3 times; the Codex whitespace brake counts per tool call and re-samples non-streamed
+  turns.
+- **Anthropic with no reasoning requested follows omp's thinking-off branch**:
+  adaptive-only models get `output_config.effort: "low"`, budget models `thinking:
+  disabled`, Sonnet 5.5 `between_tools`. A forced `tool_choice` is downgraded to `auto` on
+  the models that refuse it, and signed thinking on Fable 5.1+/Sonnet 5.5 is sent with
+  `prefix_mismatch_behavior: drop_block`.
+- **Antigravity requests are omp's `buildRequest`**: `VALIDATED` by default, omp's
+  forced-tool directive when Gemini must call a tool, Claude always `VALIDATED`, call ids
+  and signature sentinels per model family, system messages merged, an assistant's
+  `reasoning_content` replayed as demoted thinking, mismatched tool call/result histories
+  repaired, and `requestId`/`sessionId`/`labels` per conversation inside `request`.
+- **A refresh token the provider rejects for good is removed**: the card shows the
+  subscription disconnected instead of presenting the dead grant every minute. A token
+  response without `expires_in` is an error.
+
+### Kept from 0.1.16 against omp (measured)
+
+- Codex `reasoning_effort: "none"` on GPT-5.6+ is `# Juice: 0` (gpt-6-astra refuses
+  `effort: none`); a Codex tool without parameters sends an empty object schema (omp's
+  `parameters: true` is a 400); hosted tools are passed through.
+- Legitimately repetitive visible output is never judged a loop (omp's guard cut "hello
+  world" ×60 on Codex and Gemini); a Gemini turn cut by `max_tokens` while reasoning ends
+  `length`, not "thought-only" (omp fails it).
+
+### Upgrade note
+
+0.1.16 processes do not take the new whole-file lock on `credentials.json`. Do not run
+0.1.16 and 0.1.17 workers on the same credentials file at once; the gateway's `Recreate`
+strategy already guarantees that.
+
 ## [0.1.16] - 2026-09-28
 
 More of the upstream protocol inherited from omp 18.4.1, so that following omp stays a
@@ -925,7 +1038,8 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.13...v0.1.14

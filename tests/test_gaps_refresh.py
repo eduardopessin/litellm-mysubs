@@ -17,7 +17,9 @@ import asyncio
 import json
 import time
 import types
+import urllib.parse
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any, Final
 
 import httpx
@@ -28,6 +30,8 @@ import openai
 import pytest
 
 from litellm_mysubs import plugin, specs
+from litellm_mysubs.credentials import refresher
+from litellm_mysubs.credentials.lock import file_lock
 from litellm_mysubs.credentials.store import Credential, ProviderId
 from litellm_mysubs.transport.client import Transport
 from litellm_mysubs.transport.hosts import HostRotation
@@ -209,7 +213,11 @@ class TestRenewalThatFails:
         """Expired token, and the OAuth endpoint refuses the refresh token. The request
         still goes out once with the token there is — a clock skew is not proof it is dead
         — and the upstream's own refusal is what the client reads. One attempt: retrying a
-        credential the server rejects is a loop of rejections at network speed."""
+        credential the server rejects is a loop of rejections at network speed.
+
+        `invalid_grant` means the grant is dead, so the credential is dropped, as omp
+        disables the row: the refresh token is presented exactly once, not again on the 401
+        and not again by every sweep after it."""
         credential = expired()
         store = OwningStore({"openai-codex": credential})
         hosts = Hosts(rejected)
@@ -219,8 +227,8 @@ class TestRenewalThatFails:
             await ask(CODEX, stream=stream)
 
         assert hosts.bearers == ["Bearer AT-old"]
-        assert hosts.token_calls >= 1
-        assert store.get("openai-codex") == credential
+        assert hosts.token_calls == 1
+        assert store.get("openai-codex") is None
 
     async def test_a_source_that_cannot_be_reread_still_surfaces_the_401(
         self, stream: bool, monkeypatch: pytest.MonkeyPatch
@@ -368,3 +376,163 @@ async def test_models_that_are_not_ours_do_not_need_a_claude_credential(
 
     assert await ask("house-model", stream=False) == "from the house"
     assert hosts.bearers == []
+
+
+class RotatingTokenEndpoint:
+    """A token endpoint with the providers' rotation: each refresh token works once."""
+
+    def __init__(self, refresh_token: str = "RT", *, delay_s: float = 0.0) -> None:
+        self.live = refresh_token
+        self.minted = 0
+        self.delay_s = delay_s
+        #: Refresh tokens presented, in order.
+        self.presented: list[str] = []
+
+    def answer(self, request: httpx.Request) -> httpx.Response:
+        sent = _token_params(request).get("refresh_token", "")
+        self.presented.append(sent)
+        if sent != self.live:
+            return httpx.Response(
+                400, json={"error": "invalid_grant", "error_description": "already used"}
+            )
+        self.minted += 1
+        self.live = f"RT-{self.minted}"
+        return httpx.Response(
+            200,
+            json={
+                "access_token": f"AT-{self.minted}",
+                "refresh_token": self.live,
+                "expires_in": 3600,
+            },
+        )
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if self.delay_s:
+            # Long enough for a second request to arrive while the exchange is in the air.
+            await asyncio.sleep(self.delay_s)
+        return self.answer(request)
+
+
+def _token_params(request: httpx.Request) -> dict[str, str]:
+    body = request.content.decode()
+    if body.startswith("{"):
+        return {k: str(v) for k, v in json.loads(body).items()}
+    return {k: v[0] for k, v in urllib.parse.parse_qs(body).items()}
+
+
+class AsyncHosts(Hosts):
+    """`Hosts` whose token endpoint can take time, as a real one does."""
+
+    def __init__(self, inference: Any, endpoint: RotatingTokenEndpoint) -> None:
+        super().__init__(inference)
+        self.endpoint = endpoint
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:  # type: ignore[override]
+        if request.url.host in TOKEN_HOSTS:
+            self.token_calls += 1
+            return await self.endpoint(request)
+        return super().__call__(request)
+
+
+def accepting(*tokens: str) -> Any:
+    """Inference that answers only these access tokens and refuses the rest with 401."""
+    bearers = {f"Bearer {token}" for token in tokens}
+
+    def inference(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("authorization") in bearers:
+            return sse(codex_events(text="answered"))
+        return rejected(request)
+
+    return inference
+
+
+def expired_codex(token: str = "AT-old") -> Credential:
+    return Credential(
+        provider="openai-codex",
+        access_token=token,
+        refresh_token="RT",
+        expires_at=time.time() - 10,
+    )
+
+
+def provider_lock(credentials_file: Path, provider: ProviderId) -> Path:
+    """The renewal lock target, spelled out: ``credentials.json.<provider>``.
+
+    Spelled out rather than asked from the module because it is a contract with the
+    processes still running 0.1.16 against the same file: they lock this very path, and a
+    different one would let a mixed rollout exchange the same token twice.
+    """
+    return credentials_file.with_name(f"{credentials_file.name}.{provider}")
+
+
+class TestRequestPath:
+    async def test_concurrent_requests_share_one_exchange(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two requests find the same expired token. One exchange serves both — a second
+        one would present a refresh token the first just rotated away."""
+        endpoint = RotatingTokenEndpoint(delay_s=0.2)
+        hosts = AsyncHosts(accepting("AT-1"), endpoint)
+        store = OwningStore({"openai-codex": expired_codex()})
+        serve(hosts, store, monkeypatch)
+
+        answers = await asyncio.gather(ask(CODEX, stream=False), ask(CODEX, stream=True))
+
+        assert answers == ["answered", "answered"]
+        assert endpoint.presented == ["RT"]
+        assert hosts.bearers == ["Bearer AT-1", "Bearer AT-1"]
+
+    async def test_a_worker_renewing_is_waited_for_and_adopted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Another worker holds the renewal lock. The request waits, finds the credential
+        that worker wrote, and uses it — without spending the refresh token itself."""
+        endpoint = RotatingTokenEndpoint()
+        hosts = AsyncHosts(accepting("AT-peer"), endpoint)
+        store = OwningStore({"openai-codex": expired_codex()})
+        serve(hosts, store, monkeypatch)
+
+        with file_lock(provider_lock(refresher.DEFAULT_PATH, "openai-codex")):
+            request = asyncio.create_task(ask(CODEX, stream=False))
+            await asyncio.sleep(0.3)
+            assert endpoint.presented == [], "renewed while another worker held the lock"
+            store.set("openai-codex", valid("AT-peer"))
+        answer = await request
+
+        assert answer == "answered"
+        assert endpoint.presented == []
+        assert hosts.bearers == ["Bearer AT-peer"]
+
+    async def test_a_401_on_a_token_the_clock_calls_valid_mints_a_new_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The provider rejected a token that has not reached its stated expiry (revoked,
+        invalidated by a login elsewhere). Retrying the same token is a second certain 401;
+        omp re-mints, and the retry carries the new token."""
+        endpoint = RotatingTokenEndpoint()
+        hosts = AsyncHosts(accepting("AT-1"), endpoint)
+        store = OwningStore({"openai-codex": valid("AT-old")})
+        serve(hosts, store, monkeypatch)
+
+        assert await ask(CODEX, stream=True) == "answered"
+        assert endpoint.presented == ["RT"]
+        assert hosts.bearers == ["Bearer AT-old", "Bearer AT-1"]
+        stored = store.get("openai-codex")
+        assert stored is not None and stored.refresh_token == "RT-1"
+
+    async def test_a_token_just_minted_here_is_not_minted_again_on_a_401(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The upstream refuses even the token this worker minted a moment ago — an outage,
+        not a dead token. Re-minting on every refusal would rotate the refresh token once
+        per rejected request; within the cooldown the fresh token is retried instead."""
+        endpoint = RotatingTokenEndpoint()
+        hosts = AsyncHosts(accepting(), endpoint)
+        store = OwningStore({"openai-codex": expired_codex()})
+        serve(hosts, store, monkeypatch)
+
+        with pytest.raises(openai.APIError, match="authentication token has expired"):
+            await ask(CODEX, stream=False)
+
+        assert endpoint.presented == ["RT"]
+        assert hosts.bearers == ["Bearer AT-1", "Bearer AT-1"]

@@ -39,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, replace
 from typing import Any, Final
 
@@ -49,7 +49,7 @@ from ..credentials.store import Credential
 from ..transport import hosts, sse
 from ..transport.retry import is_unsupported_model
 from ..wire import anthropic, codex
-from ..wire.antigravity import declared_output_tokens, is_retired_response
+from ..wire.antigravity import declared_output_tokens, is_retired_response, usage_is_zero
 from ..wire.antigravity_models import BROKEN_WIRE, ModelCatalog
 
 #: Probes in flight at once. The limit exists because a curated list fires one request per
@@ -57,11 +57,11 @@ from ..wire.antigravity_models import BROKEN_WIRE, ModelCatalog
 #: dozen simultaneous connections to the upstream just to draw a selection screen.
 PROBE_CONCURRENCY: Final = 4
 
-#: Wait ceiling per Antigravity probe. Short on purpose: what the probe produces is a mark
-#: on a selection screen, not a response for the user to read. Anything exceeding this is a
-#: fact about this machine's network, and the verdict for those is always "could not
-#: probe" — never "not served".
-PROBE_TIMEOUT_S: Final = 10.0
+#: Wait ceiling per Antigravity probe. What the probe produces is a mark on a selection
+#: screen, and anything exceeding this is "could not probe" — never "not served". Measured
+#: on 2026-09-30 (4 probes in flight): thinking flash models took 9-25 s to finish a probe,
+#: and at 10 s most of the selection came back unprobed.
+PROBE_TIMEOUT_S: Final = 30.0
 
 #: Output ceiling for Antigravity probes. Each probe is a billed turn; the verdict comes
 #: from the status and the in-band warning, not from the generated text, so there is no
@@ -234,6 +234,13 @@ class DiscoveredModel:
     """Output ceiling a request through this plugin can actually use, when the provider
     declares one. ``None`` means nothing was declared — never a default filled in."""
 
+    refused: bool = False
+    """The upstream answered and does **not** serve it (retired, or the name refused).
+
+    Not the same as ``verified=False``, which also covers "nobody asked" and "could not
+    ask": only a measured refusal is a reason for the selection screen to untick a model.
+    """
+
 
 def suggested_name(wire_name: str) -> str:
     """Public name from the wire name: ``anthropic/claude-opus-5`` -> ``claude-opus-5``.
@@ -256,6 +263,9 @@ class _Probe:
 #: A probe: client, credential, wire name -> verdict.
 Probe = Callable[[httpx.AsyncClient, Credential, str], Awaitable[_Probe]]
 
+#: Note on a Google name this discovery did not probe: advertised is not served.
+NOT_PROBED: Final = "advertised by the catalog; not probed in this discovery"
+
 
 async def discover(
     credential: Credential,
@@ -263,7 +273,7 @@ async def discover(
     client: httpx.AsyncClient,
     catalog: ModelCatalog | None = None,
     now: float | None = None,
-    probe: bool = False,
+    probe: bool | Collection[str] = False,
 ) -> list[DiscoveredModel]:
     """The models this subscription serves.
 
@@ -271,15 +281,15 @@ async def discover(
     empty response from the endpoint from erasing what was already known. ``now`` exists to
     make the snapshot age deterministic in tests.
 
-    ``probe`` only affects Google, and it **spends quota**: it fires a minimal
-    ``:streamGenerateContent`` turn per catalog name — on the measured account that is 32
-    names, hence 32 billed turns per discovery. That is why it is off by default: the
-    unprobed list is what the account advertises, which is legitimate information, only
-    unconfirmed. Turned on, it replaces that advertisement with measurement — it is the only
-    way to tell `gemini-3.5-flash-lite` (answers "2 + 2 = 4") from `gemini-3.5-flash-low`
-    (200 with a retirement warning), or `tab_flash_lite_preview` (answers) from
-    `tab_jump_flash_lite_preview` (400). Neither pair is separable by name, and no model is
-    removed from the list because of the probe — see `_discover_google`.
+    ``probe`` only affects Google, and it **spends quota**: a minimal
+    ``:streamGenerateContent`` turn per probed name — on the measured account the catalog
+    has 32 names. ``True`` probes them all, a collection of wire names probes only those
+    (the UI passes the ones already selected: what serves traffic is what must be true),
+    and ``False`` probes none. It is the only way to tell `gemini-3.5-flash-lite` (answers
+    "2 + 2 = 4") from `gemini-3.5-flash-low` (200 with a retirement warning), or
+    `tab_flash_lite_preview` (answers) from `tab_jump_flash_lite_preview` (400). Neither
+    pair is separable by name; a name not probed is unverified, and no model is removed
+    from the list because of the probe — see `_discover_google`.
 
     The probe lives here as a parameter and not as a separate `probe_models(...)` because
     the verdict has to land on the same `DiscoveredModel` the catalog produces: a separate
@@ -352,11 +362,17 @@ async def _discover_codex(
             ),
         )
 
-    slugs = [
-        slug
+    entries = [
+        entry
         for entry in payload.get("models") or ()
-        if isinstance(entry, dict) and (slug := entry.get("slug")) and slug not in CODEX_NON_MODELS
+        if isinstance(entry, dict)
+        and isinstance(slug := entry.get("slug"), str)
+        and slug
+        and slug not in CODEX_NON_MODELS
     ]
+    slugs = [entry["slug"] for entry in entries]
+    for entry in entries:
+        codex.remember_service_tiers(entry["slug"], _codex_service_tiers(entry))
     if not slugs:
         return await _discover_probed(
             credential,
@@ -382,6 +398,23 @@ async def _discover_codex(
     ]
 
 
+# omp: discovery/codex.ts :: parseCodexModelEntry
+def _codex_service_tiers(entry: dict[str, Any]) -> tuple[str, ...] | None:
+    """Tier ids the entry advertises (codex-rs ``ModelServiceTier {id, name, description}``;
+    only the id reaches the wire), or ``None`` when it has no ``service_tiers`` array. An
+    explicit empty array is kept: the model offers no optional tier."""
+    raw = entry.get("service_tiers")
+    if not isinstance(raw, list):
+        return None
+    tiers: list[str] = []
+    for tier in raw:
+        identifier = tier.get("id") if isinstance(tier, dict) else None
+        name = identifier.strip() if isinstance(identifier, str) else ""
+        if name and name not in tiers:
+            tiers.append(name)
+    return tuple(tiers)
+
+
 # -- Google Antigravity: real catalog ------------------------------------------
 
 
@@ -392,19 +425,21 @@ async def _discover_google(
     client: httpx.AsyncClient,
     catalog: ModelCatalog,
     now: float | None,
-    probe: bool = False,
+    probe: bool | Collection[str] = False,
 ) -> list[DiscoveredModel]:
     """The account's catalog, trying both endpoints in order.
 
     Only the `BROKEN_WIRE` subtraction happens here: the ``deprecatedModelIds`` one belongs
     to `ModelCatalog`, which is where the payload shape is verified.
 
-    With ``probe``, ``verified`` stops coming from the catalog and starts coming from the
-    response: the catalog advertises `chat_23310` (400 INVALID_ARGUMENT) next to
-    `tab_flash_lite_preview` (answers), and being advertised was never proof of being
-    served. No name leaves the list because of the probe — the user sees what the account
-    advertises, marked with what was measured; hiding an advertised model would be deciding
-    for them.
+    ``verified`` comes from the response, never from the catalog: the catalog advertises
+    `chat_23310` (400 INVALID_ARGUMENT) next to `tab_flash_lite_preview` (answers), and it
+    went on advertising `gemini-3.5-flash-low` after it was retired — measured on
+    2026-09-30, three retired models stayed selected because an unprobed discovery listed
+    them as verified. ``probe`` is ``True`` (every name), a set of wire names (only those),
+    or ``False``; a name not probed is listed unverified, saying so. No name leaves the list
+    because of the probe — the user sees what the account advertises, marked with what was
+    measured; hiding an advertised model would be deciding for them.
     """
     moment = time.time() if now is None else now
     payload = await _fetch_catalog(credential, client=client)
@@ -441,15 +476,18 @@ async def _discover_google(
         )
         age = f"catalog snapshot {seconds} s old; {reason} now"
 
-    verdicts = await _probe_catalog(credential, catalog.ids, client=client) if probe else {}
+    targets = (
+        catalog.ids if probe is True else tuple(w for w in catalog.ids if probe and w in probe)
+    )
+    verdicts = await _probe_catalog(credential, targets, client=client) if targets else {}
 
     discovered: list[DiscoveredModel] = []
     for wire in catalog.ids:
         notes = [age] if age else []
         verdict = verdicts.get(wire)
+        refused = False
         if verdict is None:
-            broken = wire in BROKEN_WIRE
-            if broken:
+            if wire in BROKEN_WIRE:
                 # The catalog advertises them and streamGenerateContent refuses them.
                 # Hiding them would lose real information; advertising them as served would
                 # repeat the defect.
@@ -457,12 +495,15 @@ async def _discover_google(
                     "the catalog advertises it but streamGenerateContent returns 400 "
                     "INVALID_ARGUMENT for this variant"
                 )
-            served = not broken
+            else:
+                notes.append(NOT_PROBED)
+            served = False
         else:
             # Measured beats advertised, both ways: a `BROKEN_WIRE` name that answers
             # becomes verified, and a clean name that returns the retirement warning does
             # not. The name decides nothing here.
             served = verdict.served is True
+            refused = verdict.served is False
             if verdict.note:
                 notes.append(verdict.note)
         discovered.append(
@@ -473,6 +514,7 @@ async def _discover_google(
                 note="; ".join(notes),
                 family=_catalog_family(catalog.info.get(wire)),
                 max_output_tokens=declared_output_tokens(catalog.info.get(wire)),
+                refused=refused,
             )
         )
     return discovered
@@ -639,8 +681,12 @@ def _antigravity_stream(lines: list[str]) -> _Probe:
         return _Probe(False, "model retired by upstream")
     if joined.strip():
         return _Probe(True)
-    # A 200 with no text at all. Measured: `gemini-pro-agent` answers empty to "hi" and is
-    # still served, so this is not a refusal — it is a probe that measured nothing.
+    # A 200 with no text. If tokens were billed, the model ran: measured on 2026-09-30,
+    # gemini-3-flash, 3.6/3.8-flash and gemini-pro-agent spend the probe's 8-token budget
+    # thinking (`thoughtsTokenCount` 4-5) and answer nothing, while a retired model bills
+    # zero. With nothing billed either, the probe measured nothing — not a refusal.
+    if usage is not None and not usage_is_zero(usage):
+        return _Probe(True)
     return _Probe(None, "could not probe: the stream closed with no content")
 
 

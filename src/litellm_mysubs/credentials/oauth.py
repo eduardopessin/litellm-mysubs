@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import math
+import re
 import secrets
 import time
 import urllib.parse
@@ -48,6 +50,7 @@ __all__ = [
     "begin",
     "callback_origin",
     "complete",
+    "is_definitive_failure",
     "refresh",
 ]
 
@@ -70,6 +73,50 @@ class OAuthError(RuntimeError):
 
 class NotRefreshOwnerError(OAuthError):
     """A renewal requested from a store that does not own the refresh."""
+
+
+# omp: error/flags.ts :: OAUTH_DEFINITIVE_FAILURE_PATTERN
+_DEFINITIVE_FAILURE: Final = re.compile(
+    r"invalid_grant|invalid_token|unauthorized_client|\brevoked\b|refresh[\s_]?token.*expired",
+    re.IGNORECASE,
+)
+# omp: error/flags.ts :: OAUTH_TRANSIENT_FAILURE_PATTERN
+_TRANSIENT_FAILURE: Final = re.compile(
+    r"timeout|network|fetch failed|ECONN(?:REFUSED|RESET)|ETIMEDOUT|EAI_AGAIN|socket hang up"
+    r"|\b(?:408|425|429|5\d{2})\b|rate.?limit|too many requests|temporar|unavailable|forbidden"
+    r"|permission_denied|cloudflare|captcha",
+    re.IGNORECASE,
+)
+# omp: error/flags.ts :: OAUTH_HTTP_AUTH_PATTERN
+_HTTP_AUTH: Final = re.compile(r"\b401\b")
+
+
+# omp: error/auth-classify.ts :: isDefinitiveOAuthFailure
+# omp: error/flags.ts :: isOAuthExpiry
+def is_definitive_failure(error: BaseException) -> bool:
+    """Whether a failed renewal means the grant is dead, not that the attempt failed.
+
+    Dead: the provider named the grant (``invalid_grant``, ``revoked``, an expired refresh
+    token) or answered a bare 401. Not dead: a network failure, a timeout, a 429/5xx, a
+    Cloudflare page — retrying those later can work, and dropping the credential over one
+    would force a login nobody needed.
+
+    omp classifies ``String(error)``, whose message carries the status and the raw body;
+    ours keeps the body apart, so both are read.
+    """
+    text = str(error)
+    if isinstance(error, OAuthError) and error.body:
+        text = f"{text} {error.status} {error.body[:500]}"
+    if _DEFINITIVE_FAILURE.search(text):
+        return True
+    return bool(_HTTP_AUTH.search(text)) and not _TRANSIENT_FAILURE.search(text)
+
+
+# omp: registry/engine/common.ts :: DEFAULT_REQUEST_TIMEOUT_MS
+#: Ceiling of one token endpoint request when the rule declares none (Codex declares 15 s).
+#: Without it the request inherited the caller's client default — httpx's 5 s per phase —
+#: and a renewal abandoned after the provider already rotated loses the new refresh token.
+DEFAULT_TOKEN_TIMEOUT_S: Final = 30.0
 
 
 # omp: registry/oauth/anthropic-constants.ts :: ANTHROPIC_OAUTH_GRANT_TTL_MS
@@ -134,6 +181,8 @@ class _Provider:
     client_secret: str = ""
     #: Margin subtracted from ``expires_in``, to renew before the token dies.
     expiry_skew_s: float = 0.0
+    #: The rule's ``timeout-ms`` on its ``token`` node, per request to the token endpoint.
+    token_timeout_s: float = DEFAULT_TOKEN_TIMEOUT_S
 
 
 # The three provider records come from the OMP declarative rules
@@ -170,6 +219,7 @@ _CODEX: Final = _Provider(
         ("originator", "omp"),
     ),
     token_body="form",
+    token_timeout_s=15.0,
 )
 
 # omp: compat/rules/auth/anthropic.kdl :: OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl
@@ -441,9 +491,13 @@ async def _post_token(
     # `json` and `form` are not interchangeable: Anthropic refuses the urlencoded body and
     # Google refuses the JSON. Each provider's rule says which one it is.
     if spec.token_body == "json":
-        response = await client.post(spec.token_url, headers=dict(headers), json=params)
+        response = await client.post(
+            spec.token_url, headers=dict(headers), json=params, timeout=spec.token_timeout_s
+        )
     else:
-        response = await client.post(spec.token_url, headers=dict(headers), data=params)
+        response = await client.post(
+            spec.token_url, headers=dict(headers), data=params, timeout=spec.token_timeout_s
+        )
 
     body = response.text
     payload: Any = None
@@ -572,10 +626,17 @@ def _credential(
     if not refresh_token and previous is not None:
         refresh_token = previous.refresh_token
 
+    # The three rules declare `expires "seconds" path="expires_in"` with no fallback, and
+    # omp refuses a response without it. Accepting it here stored `expires_at=0` — "unknown"
+    # — which no refresher ever renews again: the credential then lives until its first 401.
     expires_in = payload.get("expires_in")
-    expires_at = 0.0
-    if isinstance(expires_in, int | float) and not isinstance(expires_in, bool):
-        expires_at = time.time() + float(expires_in) - spec.expiry_skew_s
+    if (
+        not isinstance(expires_in, int | float)
+        or isinstance(expires_in, bool)
+        or not math.isfinite(expires_in)
+    ):
+        raise OAuthError(provider, "token response without `expires_in`")
+    expires_at = time.time() + float(expires_in) - spec.expiry_skew_s
 
     return Credential(
         provider=provider,

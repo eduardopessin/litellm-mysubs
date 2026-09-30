@@ -24,6 +24,7 @@ import pytest
 from litellm_mysubs.catalog.discovery import (
     CURATED_ANTHROPIC,
     CURATED_CODEX,
+    NOT_PROBED,
     PROBE_CONCURRENCY,
     DiscoveredModel,
     DiscoveryError,
@@ -110,8 +111,10 @@ class TestGoogleCatalog:
 
         assert [m.wire_name for m in models] == ["gemini-3.1-pro"]
 
-    async def test_catalog_ids_are_verified_without_probing(self) -> None:
-        """The catalogue is the upstream's own answer: it needs no confirmation."""
+    async def test_catalog_ids_without_probing_are_unverified(self) -> None:
+        """Advertised is not served: the catalogue went on listing `gemini-3.5-flash-low`
+        after it was retired, and calling it verified kept three dead models selected
+        (measured 2026-09-30). Unprobed, a name is listed, unverified, and says why."""
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=catalog_payload("gemini-3.1-pro"))
@@ -121,7 +124,10 @@ class TestGoogleCatalog:
 
         assert models == [
             DiscoveredModel(
-                wire_name="gemini-3.1-pro", suggested_name="gemini-3.1-pro", verified=True
+                wire_name="gemini-3.1-pro",
+                suggested_name="gemini-3.1-pro",
+                verified=False,
+                note=NOT_PROBED,
             )
         ]
 
@@ -164,7 +170,7 @@ class TestGoogleCatalog:
 
         assert found[broken].verified is False
         assert "400" in found[broken].note
-        assert found["gemini-3.1-pro"].verified is True
+        assert found["gemini-3.1-pro"].note == NOT_PROBED
 
     async def test_empty_catalog_keeps_previous_snapshot_labelled_with_age(self) -> None:
         """A response with no models does not erase what was already known, and does not pass
@@ -218,7 +224,7 @@ class TestGoogleCatalog:
             models = await discover(GOOGLE, client=http, catalog=catalog, now=9000.0)
 
         assert [m.wire_name for m in models] == ["gemini-3.1-pro"]
-        assert models[0].note == ""
+        assert "s old" not in models[0].note
 
     async def test_unreachable_catalog_without_snapshot_raises(self) -> None:
         """With no catalogue and no snapshot there is no honest answer shaped like a list."""
@@ -844,3 +850,104 @@ class TestSuggestedName:
         """The normal case: the catalogue's wire name already comes bare and must not be
         touched."""
         assert suggested_name("gemini-3.1-pro") == "gemini-3.1-pro"
+
+
+class TestGoogleProbeTargets:
+    """What serves traffic is what must be true: the UI probes the selected names only."""
+
+    async def test_only_the_named_wires_are_probed(self) -> None:
+        probed: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(
+                    200,
+                    json=catalog_payload(
+                        "gemini-3.5-flash-low", "gemini-3.5-flash-lite", "gemini-3-flash"
+                    ),
+                )
+            probed.append(json.loads(request.read())["model"])
+            if probed[-1] == "gemini-3.5-flash-low":
+                return httpx.Response(
+                    200, text=sse_stream(text=RETIREMENT_NOTICE, usage={"totalTokenCount": 0})
+                )
+            return httpx.Response(200, text=sse_stream(text="2 + 2 = 4"))
+
+        async with client(handler) as http:
+            found = by_name(
+                await discover(
+                    GOOGLE, client=http, probe={"gemini-3.5-flash-low", "gemini-3.5-flash-lite"}
+                )
+            )
+
+        assert sorted(probed) == ["gemini-3.5-flash-lite", "gemini-3.5-flash-low"]
+        dead, alive, unprobed = (
+            found["gemini-3.5-flash-low"],
+            found["gemini-3.5-flash-lite"],
+            found["gemini-3-flash"],
+        )
+        assert (dead.verified, dead.refused) == (False, True)
+        assert (alive.verified, alive.refused) == (True, False)
+        assert (unprobed.verified, unprobed.refused, unprobed.note) == (False, False, NOT_PROBED)
+
+    async def test_a_probe_that_could_not_ask_is_not_a_refusal(self) -> None:
+        """A timeout says nothing about the account: unverified, never unticked."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(200, json=catalog_payload("gemini-3.1-pro"))
+            raise httpx.ReadTimeout("took too long", request=request)
+
+        async with client(handler) as http:
+            (model,) = await discover(GOOGLE, client=http, probe={"gemini-3.1-pro"})
+
+        assert (model.verified, model.refused) == (False, False)
+
+
+class TestGoogleProbeReasoningOnly:
+    """The probe's 8-token budget goes to thinking on thinking models: no text, tokens
+    billed. Measured on 2026-09-30 on gemini-3-flash, 3.6/3.8-flash and gemini-pro-agent
+    (`thoughtsTokenCount` 4-5); at the time they all came back "could not probe"."""
+
+    @staticmethod
+    def thinking_only(usage: dict[str, object]) -> str:
+        event = {
+            "response": {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "", "thought": True}]},
+                        "finishReason": "MAX_TOKENS",
+                    }
+                ],
+                "usageMetadata": usage,
+            }
+        }
+        return f"data: {json.dumps(event)}\n\n"
+
+    async def test_billed_reasoning_with_no_text_is_served(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(200, json=catalog_payload("gemini-3-flash"))
+            return httpx.Response(
+                200,
+                text=self.thinking_only(
+                    {"promptTokenCount": 5, "thoughtsTokenCount": 5, "totalTokenCount": 10}
+                ),
+            )
+
+        async with client(handler) as http:
+            (model,) = await discover(GOOGLE, client=http, probe=True)
+
+        assert (model.verified, model.refused) == (True, False)
+
+    async def test_nothing_billed_and_no_text_is_still_unprobed(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if MODELS_PATH in str(request.url):
+                return httpx.Response(200, json=catalog_payload("gemini-pro-agent"))
+            return httpx.Response(200, text=self.thinking_only({"totalTokenCount": 0}))
+
+        async with client(handler) as http:
+            (model,) = await discover(GOOGLE, client=http, probe=True)
+
+        assert (model.verified, model.refused) == (False, False)
+        assert "no content" in model.note

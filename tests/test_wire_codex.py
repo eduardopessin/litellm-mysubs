@@ -352,6 +352,8 @@ class TestMessagesToInput:
 
 class TestTools:
     def test_function_tool_flattened(self) -> None:
+        """An object node without `properties` gets an empty one: the backend rejects it
+        otherwise (sanitizeSchemaForOpenAIResponses)."""
         tools = codex.tools_to_codex_tools(
             [{"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}]
         )
@@ -360,7 +362,7 @@ class TestTools:
                 "type": "function",
                 "name": "read",
                 "description": "",
-                "parameters": {"type": "object"},
+                "parameters": {"type": "object", "properties": {}},
             }
         ]
 

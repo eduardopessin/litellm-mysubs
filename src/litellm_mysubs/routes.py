@@ -18,33 +18,45 @@ Nothing here patches LiteLLM or reads process state; `plugin.py` owns that.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, AsyncIterator
-from typing import Any, Protocol, cast
+import asyncio
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from typing import Any, Final, NoReturn, Protocol, TypeVar, cast
 
 from litellm.types.utils import ModelResponse, ModelResponseStream
 
 from .credentials.store import ProviderId
 from .observability import (
+    TRANSLATED_ERRORS,
     _as_litellm_error,
     _logged,
     _logged_messages,
     _logged_stream,
+    _record_failed_usage,
     _stamp_logging_identity,
     _translate_errors,
 )
 from .observability import _wrap_stream as _wrap_stream
 from .specs import _antigravity_spec, _codex_spec, _transport
-from .transport.client import UpstreamError
+from .transport.client import RequestSpec
 from .turns import (
+    MalformedCallError,
+    ThinkingLoopError,
+    UnansweredTurnError,
+    WhitespaceLoopError,
     _AntigravityReader,
     _CodexReader,
     _finish_chunk,
+    _litellm_usage,
     _model_response,
     _Turn,
     _usage_chunk,
+    finish_reason,
 )
 from .wire import anthropic, codex, messages, responses
-from .wire.usage import codex_finish_reason, codex_usage, google_finish_reason, google_usage
+from .wire.antigravity import AntigravitySession
+from .wire.usage import Usage
+
+_T = TypeVar("_T")
 
 
 def is_gemini_model(model: str) -> bool:
@@ -59,6 +71,9 @@ def is_gemini_model(model: str) -> bool:
 
 
 class _Reader(Protocol):
+    #: The terminal event has been read; omp reads no further.
+    done: bool
+
     def feed(self, event: dict[str, Any]) -> list[ModelResponseStream]: ...
     def close(self) -> list[ModelResponseStream]: ...
 
@@ -96,6 +111,8 @@ async def _drive(events: AsyncIterator[dict[str, Any]], reader: _Reader) -> None
     try:
         async for event in events:
             reader.feed(event)
+            if reader.done:
+                break
     finally:
         await _release(events)
     reader.close()
@@ -109,37 +126,159 @@ async def _pump(
         async for event in events:
             for chunk in reader.feed(event):
                 yield chunk
+            if reader.done:
+                break
     finally:
         await _release(events)
     for chunk in reader.close():
         yield chunk
 
 
-async def _codex_turn(model: str, messages: list[Any], extra: dict[str, Any]) -> ModelResponse:
-    spec = await _codex_spec(model, messages, extra)
-    turn = _Turn()
-    await _drive(_transport().stream(spec), _CodexReader(turn))
-    return _model_response(
-        model,
-        turn,
-        finish_reason=codex_finish_reason(turn.finish_raw, bool(turn.tool_calls)),
-        usage=codex_usage(turn.usage_meta),
+def _record_failure(turn: _Turn, error: Exception, model: str, extra: dict[str, Any]) -> None:
+    """Bills a failed turn for what the upstream reported it cost before failing.
+
+    omp's gateway records the usage of every finished turn, failed ones included
+    (``recordGatewayUsage`` runs before the stop reason is looked at): a Gemini turn
+    stopped for SAFETY, or cut before its finish, has consumed the subscription all the
+    same. The exception is omp's loop guard, which ends the turn with an empty message and
+    zero usage; so does this. The Codex whitespace brake cannot carry any: it trips before
+    the terminal event, the only one Codex reports usage in.
+    """
+    if turn.usage is None or isinstance(error, ThinkingLoopError | WhitespaceLoopError):
+        return
+    _record_failed_usage(_litellm_usage(turn.usage), model, extra)
+
+
+async def _served_turn(
+    spec: RequestSpec, reader: _Reader, turn: _Turn, model: str, extra: dict[str, Any]
+) -> ModelResponse:
+    try:
+        await _drive(_transport().stream(spec), reader)
+    except Exception as error:
+        _record_failure(turn, error, model, extra)
+        raise
+    return _model_response(model, turn)
+
+
+async def _served_stream(
+    spec: RequestSpec, reader: _Reader, turn: _Turn, model: str, extra: dict[str, Any]
+) -> AsyncIterator[ModelResponseStream]:
+    try:
+        async for chunk in _pump(_transport().stream(spec), reader):
+            yield chunk
+    except Exception as error:
+        _record_failure(turn, error, model, extra)
+        raise
+    yield _finish_chunk(finish_reason(turn))
+    yield _usage_chunk(turn.usage or Usage())
+
+
+def _antigravity_tool_names(spec: RequestSpec) -> frozenset[str]:
+    """The declared tool names, as the model sees them: the planning filter matches them."""
+    request = spec.body.get("request")
+    tools = request.get("tools") if isinstance(request, dict) else None
+    return frozenset(
+        str(declaration.get("name"))
+        for tool in tools or []
+        if isinstance(tool, dict)
+        for declaration in tool.get("functionDeclarations") or []
+        if isinstance(declaration, dict) and declaration.get("name")
     )
+
+
+def _codex_reader(spec: RequestSpec, model: str, turn: _Turn) -> _CodexReader:
+    return _CodexReader(turn, wire_model=str(spec.body.get("model") or model))
+
+
+def _antigravity_reader(
+    spec: RequestSpec, model: str, turn: _Turn, session: AntigravitySession
+) -> _AntigravityReader:
+    return _AntigravityReader(
+        turn,
+        wire_model=str(spec.body.get("model") or model),
+        tool_names=_antigravity_tool_names(spec),
+        session=session,
+    )
+
+
+# omp: stream.ts :: THINKING_LOOP_MAX_ATTEMPTS
+THINKING_LOOP_MAX_ATTEMPTS: Final = 3
+# omp: stream.ts :: THINKING_LOOP_RETRY_BASE_DELAY_MS
+THINKING_LOOP_RETRY_BASE_DELAY: Final = 0.5
+# omp: stream.ts :: THINKING_LOOP_RETRY_MAX_DELAY_MS
+THINKING_LOOP_RETRY_MAX_DELAY: Final = 8.0
+
+
+# omp: stream.ts :: resolveWithThinkingLoopRetries
+async def _resampling_loops(attempt: Callable[[], Awaitable[_T]]) -> _T:
+    """A non-streamed turn the loop guard stopped is asked again, up to three attempts.
+
+    omp's gateway answers a non-streamed request through ``completeSimple``, which
+    re-samples a thinking-loop stall; nothing of the failed attempt has reached the client
+    yet, so the retry is invisible to it. A streamed turn is not retried, there or here:
+    its reasoning already went out.
+
+    Diverges from omp by also re-sampling a Cloud Code turn that stopped unanswered or with
+    a malformed call (`UnansweredTurnError`, `MalformedCallError`): the same reasoning holds
+    — nothing reached the client — and the live measurement in `UnansweredTurnError` shows
+    these are sampling failures a fresh attempt usually avoids.
+    """
+    for number in range(1, THINKING_LOOP_MAX_ATTEMPTS + 1):
+        try:
+            return await attempt()
+        except (ThinkingLoopError, UnansweredTurnError, MalformedCallError):
+            if number >= THINKING_LOOP_MAX_ATTEMPTS:
+                raise
+        await asyncio.sleep(
+            min(THINKING_LOOP_RETRY_BASE_DELAY * 2 ** (number - 1), THINKING_LOOP_RETRY_MAX_DELAY)
+        )
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+# omp: providers/openai-codex-responses.ts :: CODEX_WHITESPACE_LOOP_RETRY_LIMIT
+WHITESPACE_LOOP_RETRY_LIMIT: Final = 2
+# omp: providers/openai-codex-responses.ts :: CODEX_WHITESPACE_LOOP_RETRY_DELAY_MS
+WHITESPACE_LOOP_RETRY_DELAY: Final = 0.25
+
+
+async def _replaying_whitespace_loops(attempt: Callable[[], Awaitable[_T]]) -> _T:
+    """A non-streamed Codex turn the whitespace brake stopped is asked again, twice at most.
+
+    omp's ``CodexStreamProcessor`` (``#tryRecoverWhitespaceToolCallLoop``) replays the
+    request when the looping call was the only thing produced besides reasoning: sampling
+    usually breaks the loop on a fresh attempt. Nothing of a non-streamed turn has reached
+    the client, so the replay is invisible to it. A streamed turn is not replayed: the
+    call's opening chunk already went out, and a second one would read as another call.
+    """
+    for replay in range(WHITESPACE_LOOP_RETRY_LIMIT + 1):
+        try:
+            return await attempt()
+        except WhitespaceLoopError as error:
+            if not error.replayable or replay >= WHITESPACE_LOOP_RETRY_LIMIT:
+                raise
+        await asyncio.sleep(WHITESPACE_LOOP_RETRY_DELAY * (replay + 1))
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+async def _codex_turn(model: str, messages: list[Any], extra: dict[str, Any]) -> ModelResponse:
+    async def attempt() -> ModelResponse:
+        spec = await _codex_spec(model, messages, extra)
+        turn = _Turn()
+        return await _served_turn(spec, _codex_reader(spec, model, turn), turn, model, extra)
+
+    return await _resampling_loops(lambda: _replaying_whitespace_loops(attempt))
 
 
 async def _antigravity_turn(
     model: str, messages: list[Any], extra: dict[str, Any]
 ) -> ModelResponse:
-    spec = await _antigravity_spec(model, messages, extra)
-    turn = _Turn()
-    reader = _AntigravityReader(turn, wire_model=str(spec.body.get("model") or model))
-    await _drive(_transport().stream(spec), reader)
-    return _model_response(
-        model,
-        turn,
-        finish_reason=google_finish_reason(turn.finish_raw, bool(turn.tool_calls)),
-        usage=google_usage(turn.usage_meta),
-    )
+    async def attempt() -> ModelResponse:
+        spec, session = await _antigravity_spec(model, messages, extra)
+        turn = _Turn()
+        reader = _antigravity_reader(spec, model, turn, session)
+        return await _served_turn(spec, reader, turn, model, extra)
+
+    return await _resampling_loops(attempt)
 
 
 async def _codex_stream(
@@ -147,22 +286,26 @@ async def _codex_stream(
 ) -> AsyncIterator[ModelResponseStream]:
     spec = await _codex_spec(model, messages, extra)
     turn = _Turn()
-    async for chunk in _pump(_transport().stream(spec), _CodexReader(turn)):
+    async for chunk in _served_stream(spec, _codex_reader(spec, model, turn), turn, model, extra):
         yield chunk
-    yield _finish_chunk(codex_finish_reason(turn.finish_raw, bool(turn.tool_calls)))
-    yield _usage_chunk(codex_usage(turn.usage_meta))
 
 
 async def _antigravity_stream(
     model: str, messages: list[Any], extra: dict[str, Any]
 ) -> AsyncIterator[ModelResponseStream]:
-    spec = await _antigravity_spec(model, messages, extra)
+    spec, session = await _antigravity_spec(model, messages, extra)
     turn = _Turn()
-    reader = _AntigravityReader(turn, wire_model=str(spec.body.get("model") or model))
-    async for chunk in _pump(_transport().stream(spec), reader):
+    reader = _antigravity_reader(spec, model, turn, session)
+    async for chunk in _served_stream(spec, reader, turn, model, extra):
         yield chunk
-    yield _finish_chunk(google_finish_reason(turn.finish_raw, bool(turn.tool_calls)))
-    yield _usage_chunk(google_usage(turn.usage_meta))
+
+
+def _raise_translated(error: Exception, model: str, kwargs: dict[str, Any]) -> NoReturn:
+    """Re-raises an upstream failure as the exception LiteLLM has a class for."""
+    translated = _as_litellm_error(error, model, kwargs)
+    if translated is error:
+        raise error
+    raise translated from error
 
 
 async def dispatch_responses(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
@@ -215,19 +358,27 @@ async def dispatch_responses(*, provider: ProviderId | None = None, **kwargs: An
     }
     converted.update(responses.to_options(kwargs))
     turn_messages = responses.to_chat_messages(kwargs)
-    chunks = (
-        _antigravity_stream(model, turn_messages, converted)
-        if is_gemini
-        else _codex_stream(model, turn_messages, converted)
-    )
+
+    def chunks() -> AsyncIterator[ModelResponseStream]:
+        return (
+            _antigravity_stream(model, turn_messages, converted)
+            if is_gemini
+            else _codex_stream(model, turn_messages, converted)
+        )
+
     try:
         if kwargs.get("stream"):
             return _logged_stream(
-                _responses_events(_translate_errors(chunks, model, kwargs), model), kwargs
+                _responses_events(_translate_errors(chunks(), model, kwargs), model), kwargs
             )
-        return await _logged(_responses_turn(chunks, model), kwargs)
-    except UpstreamError as error:
-        raise _as_litellm_error(error, model, kwargs) from error
+        return await _logged(
+            _resampling_loops(
+                lambda: _replaying_whitespace_loops(lambda: _responses_turn(chunks(), model))
+            ),
+            kwargs,
+        )
+    except TRANSLATED_ERRORS as error:
+        _raise_translated(error, model, kwargs)
 
 
 # omp: providers/openai-responses-server.ts :: sseEvent
@@ -365,8 +516,8 @@ async def dispatch_messages(*, provider: ProviderId | None = None, **kwargs: Any
             else _codex_turn(model, converted["messages"], converted)
         )
         response = await _logged(turn, kwargs)
-    except UpstreamError as error:
-        raise _as_litellm_error(error, model, kwargs) from error
+    except TRANSLATED_ERRORS as error:
+        _raise_translated(error, model, kwargs)
     return messages.encode_response(response, model)
 
 
@@ -522,8 +673,8 @@ async def dispatch(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
                     kwargs,
                 )
             return await _logged(_codex_turn(model, messages, kwargs), kwargs)
-    except UpstreamError as error:
-        raise _as_litellm_error(error, model, kwargs) from error
+    except TRANSLATED_ERRORS as error:
+        _raise_translated(error, model, kwargs)
 
     # `anthropic` has no branch of its own: it is served by LiteLLM's native path with the
     # prompt and the token that `_delegate_kwargs` injects. Returning `None` is what routes

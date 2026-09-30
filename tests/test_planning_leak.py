@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from litellm_mysubs.wire.planning_leak import (
-    PlanningLeakFilter,
+    consume_planning_buffer,
     is_flash_leak_model,
     is_leak_object,
     is_leak_prefix,
@@ -74,63 +74,54 @@ class TestObjectSignature:
         assert is_leak_object(payload) is False
 
 
-class TestStreamFiltering:
-    def test_plain_text_passes_through(self) -> None:
-        assert PlanningLeakFilter().feed("hello world") == "hello world"
+class TestConsumePlanningBuffer:
+    """omp's `consumePlanningBuffer`: what the reader releases from its held text."""
 
-    def test_whole_leak_in_one_chunk_is_dropped(self) -> None:
-        leak = PlanningLeakFilter()
-        assert leak.feed('{"thought": "let me read"}') == ""
-        assert leak.stripped is True
+    def test_text_that_cannot_open_a_leak_is_plain(self) -> None:
+        assert consume_planning_buffer("hello world") == ("plain", "hello world")
 
-    def test_leak_split_across_chunks_is_dropped(self) -> None:
+    def test_whole_leak_is_dropped(self) -> None:
+        assert consume_planning_buffer('{"thought": "let me read"}') == ("leak", "")
+
+    def test_leak_split_across_deltas_is_held_until_it_closes(self) -> None:
         """Deciding per chunk let through everything that did not fit in a single one."""
-        leak = PlanningLeakFilter()
-        assert leak.feed('{"thou') == ""
-        assert leak.feed('ght": "let me read the fi') == ""
-        assert leak.feed('le"}') == ""
-        assert leak.stripped is True
+        held = ""
+        for delta in ['{"thou', 'ght": "let me read the fi', 'le"}']:
+            held += delta
+            outcome = consume_planning_buffer(held)
+            if outcome[0] != "incomplete":
+                break
+        assert outcome == ("leak", "")
 
     def test_text_after_the_leak_survives(self) -> None:
-        leak = PlanningLeakFilter()
-        assert leak.feed('{"thought": "x"}visible answer') == "visible answer"
+        assert consume_planning_buffer('{"thought": "x"}visible answer') == (
+            "leak",
+            "visible answer",
+        )
 
     def test_legitimate_json_is_not_dropped(self) -> None:
         """An object without a planning signature is an answer, not a leak."""
-        leak = PlanningLeakFilter()
-        assert leak.feed('{"result": 42}') == '{"result": 42}'
-        assert leak.stripped is False
+        assert consume_planning_buffer('{"result": 42}') == ("plain", '{"result": 42}')
+
+    def test_only_an_object_opening_with_thought_is_suspected(self) -> None:
+        """omp checks the first key: `{"thing": .., "command": ..}` is an answer."""
+        text = '{"thing": 1, "command": "ls"}'
+        assert consume_planning_buffer(text) == ("plain", text)
 
     def test_unbalanced_quotes_still_close_the_object(self) -> None:
         """A leak with unbalanced quotes would never close through the normal path."""
-        leak = PlanningLeakFilter()
-        assert leak.feed('{"thought": "quote " too many"}') == ""
-        assert leak.stripped is True
+        assert consume_planning_buffer('{"thought": "quote " too many"}') == ("leak", "")
 
-    def test_unterminated_leak_is_discarded_at_eof(self) -> None:
+    def test_unterminated_leak_is_dropped_at_the_end(self) -> None:
         """Delivering it would mean showing half of the internal planning."""
-        leak = PlanningLeakFilter()
-        assert leak.feed('{"thought": "nunca fecha') == ""
-        assert leak.flush() == ""
-        assert leak.stripped is True
+        assert consume_planning_buffer('{"thought": "never closes', final=True) == ("leak", "")
 
-    def test_lone_brace_is_discarded_at_eof(self) -> None:
-        """A lone brace has the signature of an incomplete leak; it is not text."""
-        leak = PlanningLeakFilter()
-        assert leak.feed("{") == ""
-        assert leak.flush() == ""
-        assert leak.stripped is True
+    def test_unterminated_brace_without_a_signature_is_text_at_the_end(self) -> None:
+        """omp: an unclosed prefix with no leak key in it is released as written."""
+        assert consume_planning_buffer("{", final=True) == ("plain", "{")
+        assert consume_planning_buffer('{"tho', final=True) == ("plain", '{"tho')
 
-    def test_non_leak_json_is_emitted_immediately(self) -> None:
-        """Only what carries a leak signature enters the buffer; the rest passes at once.
-
-        Holding back legitimate JSON would delay the stream for no reason.
-        """
-        leak = PlanningLeakFilter()
-        assert leak.feed('{"result": ') == '{"result": '
-        assert leak.stripped is False
-
-    def test_empty_feed_is_a_noop(self) -> None:
-        leak = PlanningLeakFilter()
-        assert leak.feed("") == ""
-        assert leak.flush() == ""
+    def test_a_call_to_a_declared_tool_is_a_leak(self) -> None:
+        text = '{"thought": 1, "call": "read"}'
+        assert consume_planning_buffer(text, frozenset({"read"})) == ("leak", "")
+        assert consume_planning_buffer(text) == ("plain", text)

@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Iterable
 from typing import Any, Final
 
+import litellm
 import pytest
 
 from litellm_mysubs import plugin, turns
@@ -192,30 +193,37 @@ class TestDetection:
 class TestNonStreaming:
     async def test_a_retired_model_raises_instead_of_answering(self) -> None:
         install(gemini_events(text=RETIREMENT_NOTICE, usage=DEAD_USAGE))
-        with pytest.raises(ModelRetiredError) as excinfo:
+        with pytest.raises(litellm.NotFoundError) as excinfo:
             await complete()
-        # The message has to quote upstream: it is upstream that says where to migrate.
+        # 404 to the caller, with the retirement as the cause. The message has to quote
+        # upstream: it is upstream that says where to migrate.
+        retired = excinfo.value.__cause__
+        assert isinstance(retired, ModelRetiredError)
         assert "Gemini 3.7" in str(excinfo.value)
-        assert excinfo.value.notice == RETIREMENT_NOTICE
+        assert retired.notice == RETIREMENT_NOTICE
 
     async def test_the_error_is_distinguishable_from_a_transport_failure(self) -> None:
         """A network failure is worth retrying; a retired model never answers again.
         Whoever catches has to be able to separate the two cases."""
         install(gemini_events(text=RETIREMENT_NOTICE, usage=DEAD_USAGE))
-        with pytest.raises(ModelRetiredError) as excinfo:
+        with pytest.raises(litellm.NotFoundError) as excinfo:
             await complete()
-        assert not isinstance(excinfo.value, plugin.StreamError)
-        assert excinfo.value.wire_model
+        retired = excinfo.value.__cause__
+        assert isinstance(retired, ModelRetiredError)
+        assert not isinstance(retired, plugin.StreamError)
+        assert retired.wire_model
 
     async def test_the_same_text_with_tokens_spent_comes_through(self) -> None:
         install(gemini_events(text=RETIREMENT_NOTICE, usage=LIVE_USAGE))
         response = await complete()
         assert content_of(response) == RETIREMENT_NOTICE
 
-    async def test_an_empty_answer_with_zero_usage_comes_through(self) -> None:
+    async def test_an_empty_answer_with_zero_usage_is_not_a_retirement(self) -> None:
+        """It fails as omp's empty response instead, with no model to point at."""
         install(gemini_events(text="", usage=DEAD_USAGE))
-        response = await complete()
-        assert content_of(response) == ""
+        with pytest.raises(plugin.StreamError, match="empty response") as caught:
+            await complete()
+        assert not isinstance(caught.value, ModelRetiredError)
 
     async def test_a_live_model_answers(self) -> None:
         """`gemini-3.5-flash-lite` lives in the same family as the dead ones: if the guard
@@ -238,7 +246,7 @@ class TestStreaming:
             stream=True,
         )
         seen: list[str] = []
-        with pytest.raises(ModelRetiredError, match=r"Gemini 3\.7"):
+        with pytest.raises(litellm.NotFoundError, match=r"Gemini 3\.7"):
             async for chunk in wrapper.completion_stream:
                 seen.append(str(chunk.choices[0].delta.content or ""))
         assert "".join(seen) == "", f"the notice went out before the guard: {seen}"
@@ -257,10 +265,11 @@ class TestStreaming:
             str(chunk.choices[0].delta.content or "") for chunk in chunks
         )
 
-    async def test_an_empty_answer_with_zero_usage_streams(self) -> None:
+    async def test_an_empty_answer_with_zero_usage_is_not_a_retirement(self) -> None:
         install(gemini_events(text="", usage=DEAD_USAGE))
-        chunks = await stream()
-        assert "".join(str(chunk.choices[0].delta.content or "") for chunk in chunks) == ""
+        with pytest.raises(Exception, match="empty response") as caught:
+            await stream()
+        assert not isinstance(caught.value, ModelRetiredError)
 
 
 class TestSplitNotice:
@@ -283,7 +292,7 @@ class TestSplitNotice:
 
     async def test_the_notice_is_caught_even_when_split(self) -> None:
         install(self.split_events())
-        with pytest.raises(ModelRetiredError, match=r"Gemini 3\.7"):
+        with pytest.raises(litellm.NotFoundError, match=r"Gemini 3\.7"):
             await stream()
 
     async def test_it_raises_once_per_response(self) -> None:
@@ -305,7 +314,7 @@ class TestSplitNotice:
 
         turns.antigravity.raise_if_retired = counting  # type: ignore[assignment]
         try:
-            with pytest.raises(ModelRetiredError, match=r"Gemini 3\.7"):
+            with pytest.raises(litellm.NotFoundError, match=r"Gemini 3\.7"):
                 await stream()
         finally:
             turns.antigravity.raise_if_retired = original  # type: ignore[assignment]
