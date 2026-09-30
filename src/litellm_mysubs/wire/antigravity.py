@@ -721,16 +721,15 @@ def _thinking_config(
     budget = info.get("thinkingBudget")
 
     if effort == "none":
-        # Suppressing means zero budget, not the catalog minimum: with
-        # `includeThoughts: False` a positive budget is billed without returning any text.
-        config: dict[str, Any] = {"includeThoughts": False}
+        if isinstance(budget, int) and not refuses_zero_budget(info, claude=claude):
+            # Suppressing means zero budget, not the catalog minimum: with
+            # `includeThoughts: False` a positive budget is billed without returning text.
+            return {"includeThoughts": False, "thinkingBudget": 0}
         if isinstance(budget, int):
-            config["thinkingBudget"] = 0
-        else:
-            config["thinkingLevel"] = SUPPRESSED_THINKING_LEVEL
-        return config
+            return thinking_floor(budget, info)
+        return {"includeThoughts": False, "thinkingLevel": SUPPRESSED_THINKING_LEVEL}
 
-    config = {"includeThoughts": True}
+    config: dict[str, Any] = {"includeThoughts": True}
     if isinstance(budget, int) and budget > 0:
         fitted = _fit_budget(
             budget, max_output_tokens, claude=claude, floor=info.get("minThinkingBudget")
@@ -743,6 +742,54 @@ def _thinking_config(
     elif not isinstance(budget, int):
         config["thinkingLevel"] = THINKING_LEVEL.get(effort, "MEDIUM")
     return config
+
+
+#: The ``minThinkingBudget`` of every model measured to accept a budget of 0.
+ZERO_BUDGET_MIN_THINKING: Final = 32
+
+
+def refuses_zero_budget(info: Mapping[str, Any], *, claude: bool) -> bool:
+    """Whether this model answers ``thinkingBudget: 0`` with 400.
+
+    Live 2026-09-30, ``maxOutputTokens: 64``, ``includeThoughts: false``, budget 0:
+
+    - refused — gemini-3.1-pro-low and gemini-pro-agent ("Budget 0 is invalid. This model
+      only works in thinking mode."), gemini-2.5-flash, gemini-2.5-flash-lite,
+      gemini-3.5-flash-lite and gpt-oss-120b-medium ("Request contains an invalid
+      argument"). Their catalog ``minThinkingBudget`` is 128, or absent (gpt-oss);
+    - accepted — Claude (sonnet-4-6, opus-4-6-thinking) and the gemini-3 / 3.6 / 3.7 / 3.8
+      flash ids, whose catalog minimum is 32.
+
+    The catalog minimum is what separates them, so it is what is read: Claude accepts 0,
+    anything else only with a minimum of at most 32. An id not measured is placed by the
+    same reading of its catalog entry.
+    """
+    if claude:
+        return False
+    floor = info.get("minThinkingBudget")
+    if isinstance(floor, bool) or not isinstance(floor, int) or floor <= 0:
+        return True
+    return floor > ZERO_BUDGET_MIN_THINKING
+
+
+# omp: stream.ts :: normalizeMandatoryReasoningOptions
+def thinking_floor(budget: int, info: Mapping[str, Any]) -> dict[str, Any]:
+    """The least thinking a model that cannot turn it off accepts.
+
+    omp answers "no reasoning" on a model whose thinking is mandatory by raising the request
+    to the model's lowest effort, not by switching thinking off. Here the lowest is the
+    catalog's ``minThinkingBudget`` — measured 200 at 128 on gemini-3.1-pro-low,
+    gemini-pro-agent, gemini-2.5-flash, gemini-2.5-flash-lite and gemini-3.5-flash-lite —
+    or, with no minimum (gpt-oss-120b-medium), the catalog budget itself (8192 measured 200;
+    nothing lower was measured). The thoughts come back: with ``includeThoughts: false`` a
+    positive budget is billed without the text.
+    """
+    floor = info.get("minThinkingBudget")
+    if isinstance(floor, int) and not isinstance(floor, bool) and floor > 0:
+        return {"includeThoughts": True, "thinkingBudget": floor}
+    if budget > 0:
+        return {"includeThoughts": True, "thinkingBudget": budget}
+    return {"includeThoughts": True}
 
 
 # omp: stream.ts :: MIN_OUTPUT_TOKENS
@@ -1330,6 +1377,7 @@ __all__ = [
     "SAMPLING_FIELDS",
     "SESSION_LIMIT",
     "SIGNATURE_SENTINEL",
+    "ZERO_BUDGET_MIN_THINKING",
     "AntigravitySession",
     "FetchedMedia",
     "MediaFetchError",
@@ -1355,8 +1403,10 @@ __all__ = [
     "pair_tool_results",
     "raise_if_retired",
     "refused_sampling",
+    "refuses_zero_budget",
     "request_envelope",
     "text_of",
+    "thinking_floor",
     "tool_result_value",
     "tools_to_declarations",
     "usage_is_zero",

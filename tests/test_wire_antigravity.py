@@ -155,10 +155,11 @@ class TestThinkingConfig:
 
     def test_suppression_is_zero_budget_not_the_catalog_minimum(self) -> None:
         """With `includeThoughts: False`, a positive budget is billed without returning any
-        text at all. The catalog's `minThinkingBudget` is not zero on several variants."""
+        text at all. A model whose catalog minimum is 32 accepts a budget of 0 (measured on
+        the gemini-3 / 3.6-3.8 flash ids), so that is what goes."""
         catalog = ModelCatalog(
             ids=("gemini-3-pro-low",),
-            info={"gemini-3-pro-low": {"thinkingBudget": 1000, "minThinkingBudget": 128}},
+            info={"gemini-3-pro-low": {"thinkingBudget": 1000, "minThinkingBudget": 32}},
             fetched_at=1.0,
         )
         config = payload(

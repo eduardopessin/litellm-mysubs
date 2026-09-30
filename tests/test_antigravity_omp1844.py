@@ -38,6 +38,7 @@ GEMINI_25: Final = "mysubs/antigravity/gemini-2.5-flash"
 CLAUDE: Final = "mysubs/antigravity/claude-sonnet-4-6"
 GPT_OSS: Final = "mysubs/antigravity/gpt-oss-120b-medium"
 GEMINI_31: Final = "mysubs/antigravity/gemini-3.1-pro"
+FLASH_38: Final = "mysubs/antigravity/gemini-3.8-flash"
 
 WEATHER: Final[dict[str, Any]] = {
     "type": "function",
@@ -89,7 +90,7 @@ def proxy(monkeypatch: pytest.MonkeyPatch) -> Iterable[None]:
                 "litellm_params": {"model": f"gemini/{model.rsplit('/', 1)[-1]}"},
                 "model_info": {"id": model, "mysubs_provider": "google-antigravity"},
             }
-            for model in (GEMINI, GEMINI_25, CLAUDE, GPT_OSS, GEMINI_31)
+            for model in (GEMINI, GEMINI_25, CLAUDE, GPT_OSS, GEMINI_31, FLASH_38)
         ]
     )
     assert plugin.bind_messages_route(router)
@@ -103,8 +104,18 @@ def proxy(monkeypatch: pytest.MonkeyPatch) -> Iterable[None]:
         {
             "models": {
                 "gemini-3-pro-low": {},
-                "gemini-2.5-flash": {},
-                "gpt-oss-120b-medium": {},
+                # The catalog entries as the account reports them (measured 2026-09-30).
+                "gemini-2.5-flash": {
+                    "thinkingBudget": -1,
+                    "minThinkingBudget": 128,
+                    "maxOutputTokens": 65535,
+                },
+                "gemini-3.8-flash-low": {
+                    "thinkingBudget": 1000,
+                    "minThinkingBudget": 32,
+                    "maxOutputTokens": 65536,
+                },
+                "gpt-oss-120b-medium": {"thinkingBudget": 8192, "maxOutputTokens": 32768},
                 # As the account's catalog declares it (measured 2026-09-30).
                 "gemini-3.1-pro-low": {
                     "thinkingBudget": 1001,
@@ -823,3 +834,39 @@ class TestTheCallersCeilingBoundsTheAnswer:
             "maxOutputTokens": 64,
             "thinkingConfig": {"includeThoughts": True, "thinkingBudget": 128},
         }
+
+
+class TestNoReasoningOnAModelThatCannotStopThinking:
+    """``reasoning_effort: "none"`` sent ``thinkingBudget: 0`` everywhere. Live
+    (2026-09-30) six ids refuse it with 400 — gemini-3.1-pro-low and gemini-pro-agent
+    ("Budget 0 is invalid. This model only works in thinking mode."), gemini-2.5-flash,
+    gemini-2.5-flash-lite, gemini-3.5-flash-lite and gpt-oss-120b-medium — and each
+    answered 200 at its ``minThinkingBudget`` (128), or gpt-oss at its own budget.
+    Claude and the flash ids with a 32 minimum took the budget of 0."""
+
+    @pytest.mark.parametrize(
+        ("model", "thinking"),
+        [
+            pytest.param(
+                GEMINI_31, {"includeThoughts": True, "thinkingBudget": 128}, id="gemini-3.1-pro"
+            ),
+            pytest.param(
+                GEMINI_25, {"includeThoughts": True, "thinkingBudget": 128}, id="gemini-2.5-flash"
+            ),
+            pytest.param(
+                GPT_OSS, {"includeThoughts": True, "thinkingBudget": 8192}, id="gpt-oss"
+            ),
+            pytest.param(
+                CLAUDE, {"includeThoughts": False, "thinkingBudget": 0}, id="claude"
+            ),
+            pytest.param(
+                FLASH_38, {"includeThoughts": False, "thinkingBudget": 0}, id="gemini-3.8-flash"
+            ),
+        ],
+    )
+    async def test_effort_none_sends_what_the_model_accepts(
+        self, client: openai.AsyncOpenAI, model: str, thinking: dict[str, Any]
+    ) -> None:
+        request = await chat_request(client, model, reasoning_effort="none")
+
+        assert request["generationConfig"]["thinkingConfig"] == thinking
