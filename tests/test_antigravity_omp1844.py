@@ -104,10 +104,14 @@ def proxy(monkeypatch: pytest.MonkeyPatch) -> Iterable[None]:
             "models": {
                 "gemini-3-pro-low": {},
                 "gemini-2.5-flash": {},
-                "claude-sonnet-4-6": {},
                 "gpt-oss-120b-medium": {},
                 # As the account's catalog declares it (measured 2026-09-30).
-                "gemini-3.1-pro-low": {"thinkingBudget": 1001, "maxOutputTokens": 65535},
+                "gemini-3.1-pro-low": {
+                    "thinkingBudget": 1001,
+                    "minThinkingBudget": 128,
+                    "maxOutputTokens": 65535,
+                },
+                "claude-sonnet-4-6": {"thinkingBudget": 1024, "maxOutputTokens": 64000},
             }
         }
     )
@@ -790,17 +794,32 @@ class TestRequestEnvelope:
         assert gemini["request"]["labels"]["model_enum"] == "MODEL_PLACEHOLDER_M36"
 
 
-class TestSmallCeilingOnAThinkingOnlyModel:
-    async def test_the_budget_goes_on_top_of_max_tokens(self, client: openai.AsyncOpenAI) -> None:
-        """Measured on the live backend (2026-09-30): ``gemini-3.1-pro-low`` with
-        ``max_tokens: 64`` went out as ``maxOutputTokens: 64`` and a budget of 0, refused
-        with "Budget 0 is invalid. This model only works in thinking mode." omp reads
-        ``max_tokens`` as the answer and adds the budget on top; sent that way
-        (``maxOutputTokens: 1065``, budget 1001) the same request answered 200."""
+class TestTheCallersCeilingBoundsTheAnswer:
+    """``max_tokens`` is the total ``maxOutputTokens``, and the thinking budget fits under
+    it. Live (2026-09-30): with the budget on top, claude-sonnet-4-6 asked for 64 tokens
+    answered 623 words; with 64 as the total every family stopped ``MAX_TOKENS`` within
+    it, and the thinking-only ones kept a valid budget."""
+
+    @pytest.mark.parametrize("effort", [None, "high"])
+    async def test_claude_thinks_only_when_the_ceiling_has_room(
+        self, client: openai.AsyncOpenAI, effort: str | None
+    ) -> None:
+        extra: dict[str, Any] = {"max_tokens": 64}
+        if effort:
+            extra["reasoning_effort"] = effort
+        request = await chat_request(client, CLAUDE, **extra)
+
+        assert request["generationConfig"] == {
+            "maxOutputTokens": 64,
+            "thinkingConfig": {"includeThoughts": False, "thinkingBudget": 0},
+        }
+
+    async def test_a_thinking_only_model_keeps_a_budget(self, client: openai.AsyncOpenAI) -> None:
+        """gemini-3.1-pro-low refuses a budget of 0 — "Budget 0 is invalid. This model only
+        works in thinking mode." — and takes its ``minThinkingBudget`` above the ceiling."""
         request = await chat_request(client, GEMINI_31, max_tokens=64)
 
-        assert request["generationConfig"]["maxOutputTokens"] == 64 + 1001
-        assert request["generationConfig"]["thinkingConfig"] == {
-            "includeThoughts": True,
-            "thinkingBudget": 1001,
+        assert request["generationConfig"] == {
+            "maxOutputTokens": 64,
+            "thinkingConfig": {"includeThoughts": True, "thinkingBudget": 128},
         }

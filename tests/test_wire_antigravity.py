@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
@@ -461,53 +461,71 @@ class TestToolCalls:
         assert call["id"] == "c1", "Vertex refuses a tool_use without an id"
         assert result["id"] == "c1", "the result has to name the call it answers"
 
-    def _claude_config(
-        self, ceiling: int | None, declared: int | None = None
+    def _config(
+        self, model: str, ceiling: int | None, entry: dict[str, Any], effort: str | None = None
     ) -> dict[str, Any]:
-        entry: dict[str, Any] = {"thinkingBudget": 4000}
-        if declared is not None:
-            entry["maxOutputTokens"] = declared
-        catalog = ModelCatalog(
-            ids=("claude-sonnet-4-6",), info={"claude-sonnet-4-6": entry}, fetched_at=1.0
-        )
+        # The variant each name resolves to with a catalog listing only it.
+        wire = {
+            "gemini-3.1-pro": "gemini-3.1-pro-low",
+            "gemini-3.8-flash": "gemini-3.8-flash-medium",
+        }.get(model, model)
+        catalog = ModelCatalog(ids=(wire,), info={wire: entry}, fetched_at=1.0)
+        extra: dict[str, Any] = {} if ceiling is None else {"max_tokens": ceiling}
+        if effort:
+            extra["reasoning_effort"] = effort
         body = payload(
-            [{"role": "user", "content": "x"}],
-            model="claude-sonnet-4-6",
-            catalog=catalog,
-            extra={} if ceiling is None else {"max_tokens": ceiling},
+            [{"role": "user", "content": "x"}], model=model, catalog=catalog, extra=extra
         )
         return body["request"]["generationConfig"]
 
-    @pytest.mark.parametrize("ceiling", [64, 512, 1024, 2048])
-    def test_the_budget_rides_on_top_of_the_callers_ceiling(self, ceiling: int) -> None:
-        """omp's ``maxTokensWithThinkingBudget``: ``max_tokens`` is the visible answer and the
-        budget goes on top, so both of Anthropic's bounds — ``max_tokens >
-        budget_tokens`` and ``budget_tokens >= 1024`` — hold for any ceiling. Fitting the
-        budget under the caller's ceiling instead drove it to 0 for small ones, which a
-        thinking-only model refuses (measured: gemini-3.1-pro-low, ``max_tokens: 64`` —
-        "Budget 0 is invalid. This model only works in thinking mode.")."""
-        config = self._claude_config(ceiling)
-        assert config["maxOutputTokens"] == ceiling + 4000
-        assert config["thinkingConfig"] == {"includeThoughts": True, "thinkingBudget": 4000}
+    CLAUDE: Final = {"thinkingBudget": 1024, "maxOutputTokens": 64000}
+    PRO_LOW: Final = {"thinkingBudget": 1001, "minThinkingBudget": 128, "maxOutputTokens": 65535}
+    FLASH: Final = {"thinkingBudget": 4000, "minThinkingBudget": 32, "maxOutputTokens": 65536}
+    GPT_OSS: Final = {"thinkingBudget": 8192, "maxOutputTokens": 32768}
 
-    def test_the_declared_ceiling_still_caps_the_sum(self) -> None:
-        config = self._claude_config(64000, declared=64000)
+    @pytest.mark.parametrize("effort", [None, "low", "high"])
+    def test_the_callers_ceiling_is_the_total(self, effort: str | None) -> None:
+        """The budget is not added on top of ``max_tokens``: with 1024 on top of 64,
+        claude-sonnet-4-6 thought 61 characters and answered 623 words (live,
+        2026-09-30). Anthropic needs a budget of at least 1024 under the ceiling, so a small
+        one turns thinking off — measured ``MAX_TOKENS`` within the 64 for every effort."""
+        config = self._config("claude-sonnet-4-6", 64, self.CLAUDE, effort)
+        assert config == {
+            "maxOutputTokens": 64,
+            "thinkingConfig": {"includeThoughts": False, "thinkingBudget": 0},
+        }
+
+    def test_a_roomy_ceiling_keeps_the_catalog_budget(self) -> None:
+        config = self._config("claude-sonnet-4-6", 64000, self.CLAUDE)
         assert config["maxOutputTokens"] == 64000
-        assert config["thinkingConfig"]["thinkingBudget"] == 4000
+        assert config["thinkingConfig"] == {"includeThoughts": True, "thinkingBudget": 1024}
 
-    def test_a_declared_ceiling_under_the_budget_shrinks_it(self) -> None:
-        """Where the model's own ceiling cuts the sum to the budget or below, omp keeps
-        ``MIN_OUTPUT_TOKENS`` for the answer and gives the rest to thinking."""
-        config = self._claude_config(100, declared=3000)
-        assert config["maxOutputTokens"] == 3000
-        assert config["thinkingConfig"]["thinkingBudget"] == 3000 - ag.MIN_OUTPUT_TOKENS
+    def test_a_tight_ceiling_leaves_omps_room_for_the_answer(self) -> None:
+        """omp: the budget becomes ``ceiling - MIN_OUTPUT_TOKENS`` when it does not fit."""
+        config = self._config("gpt-oss-120b-medium", 5000, self.GPT_OSS)
+        assert config["maxOutputTokens"] == 5000
+        assert config["thinkingConfig"]["thinkingBudget"] == 5000 - ag.MIN_OUTPUT_TOKENS
 
-    def test_a_declared_ceiling_too_small_for_any_budget_drops_thinking(self) -> None:
-        """Anthropic's own minimum of 1024 leaves Claude no budget under this ceiling:
-        the turn goes out without thinking, omp's thinking-off path."""
-        config = self._claude_config(100, declared=1500)
-        assert config["maxOutputTokens"] == 1500
-        assert config["thinkingConfig"] == {"includeThoughts": False, "thinkingBudget": 0}
+    def test_a_thinking_only_model_keeps_its_minimum_budget(self) -> None:
+        """gemini-3.1-pro-low refuses a budget of 0 ("This model only works in thinking
+        mode") and accepts a budget above the ceiling; with ``minThinkingBudget`` it
+        answered 200 ``MAX_TOKENS`` within 64 (live, 2026-09-30)."""
+        config = self._config("gemini-3.1-pro", 64, self.PRO_LOW)
+        assert config == {
+            "maxOutputTokens": 64,
+            "thinkingConfig": {"includeThoughts": True, "thinkingBudget": 128},
+        }
+
+    def test_a_flash_model_thinks_at_its_minimum_under_a_small_ceiling(self) -> None:
+        """Its own 4000 took all 64 tokens and left no answer; at 32 it answered ~50 words."""
+        config = self._config("gemini-3.8-flash", 64, self.FLASH, "medium")
+        assert config["thinkingConfig"] == {"includeThoughts": True, "thinkingBudget": 32}
+
+    def test_without_a_minimum_the_budget_stays(self) -> None:
+        """gpt-oss refuses a budget of 0 and declares no minimum; 8192 over a 64 ceiling
+        answered 200 ``MAX_TOKENS`` within the 64."""
+        config = self._config("gpt-oss-120b-medium", 64, self.GPT_OSS)
+        assert config["thinkingConfig"] == {"includeThoughts": True, "thinkingBudget": 8192}
 
     def test_sentinel_is_per_turn_not_per_request(self) -> None:
         """The CCA requires the sentinel on the first call of **every** assistant turn.
