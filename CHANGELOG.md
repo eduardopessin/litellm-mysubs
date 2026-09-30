@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 omp 18.4.4, and the rest of the upstream protocol inherited from it: the transport and its
 retries, the stream readers and error mapping, and credential refresh are now omp ports too.
-606 anchors (342 in 0.1.16). Validated against the three live subscriptions from a
+607 anchors (342 in 0.1.16). Validated against the three live subscriptions from a
 throwaway proxy before release; every divergence from omp that remains is a live
 measurement, recorded in `docs/OMP.md`.
 
