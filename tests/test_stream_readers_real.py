@@ -496,3 +496,72 @@ class TestAntigravity:
         turn = await answer(GEMINI_FLASH, stream=stream)
 
         assert turn.content == text
+
+
+def finished(reason: str) -> dict[str, Any]:
+    """A Cloud Code event that ends the turn with ``reason`` and nothing else."""
+    return {
+        "response": {
+            "candidates": [{"content": {"parts": []}, "finishReason": reason}],
+            "usageMetadata": {"totalTokenCount": 9},
+        }
+    }
+
+
+class TestResampling:
+    """A non-streamed Cloud Code turn that failed to sample is asked again (nothing reached
+    the client). Measured live on gemini-3.1-pro-low with a forced tool: 3-4 in 25 ended
+    reasoning-only or MALFORMED_FUNCTION_CALL. Before: those reached the client as 502."""
+
+    @pytest.mark.parametrize(
+        "failed",
+        [
+            pytest.param([thought("Planning.", finish="STOP")], id="thought-only"),
+            pytest.param([thought("Planning.")], id="thought-no-finish"),
+            pytest.param([finished("MALFORMED_FUNCTION_CALL")], id="malformed-call"),
+        ],
+    )
+    async def test_a_whole_turn_that_did_not_sample_is_asked_again(
+        self, failed: list[dict[str, Any]]
+    ) -> None:
+        transport = install_transport(Attempts([failed, gemini_events(text="fresh answer")]))
+
+        turn = await answer(GEMINI_PRO, stream=False)
+
+        assert turn.content == "fresh answer"
+        assert len(transport.specs) == 2
+
+    async def test_a_refusal_is_not_asked_again(self) -> None:
+        """SAFETY is the model declining, not a sampling accident: asking again would bill
+        the same refusal."""
+        transport = install_transport(
+            Attempts([[finished("SAFETY")], gemini_events(text="fresh answer")])
+        )
+
+        with pytest.raises(openai.APIError, match="finish reason: SAFETY"):
+            await answer(GEMINI_PRO, stream=False)
+
+        assert len(transport.specs) == 1
+
+    async def test_a_streamed_turn_is_not_asked_again(self) -> None:
+        """Its reasoning already went out; a second attempt would be a second answer."""
+        transport = install_transport(
+            Attempts([[thought("Planning.", finish="STOP")], gemini_events(text="fresh answer")])
+        )
+
+        with pytest.raises(openai.APIError, match="thought-only response"):
+            await answer(GEMINI_PRO, stream=True)
+
+        assert len(transport.specs) == 1
+
+
+@pytest.mark.parametrize("stream", STREAMING)
+async def test_a_retired_model_is_not_found(stream: bool) -> None:
+    """The model is gone for good: 404, which neither a client nor LiteLLM's Router retries.
+    Measured live: gemini-3.5-flash-low and two siblings answered 500."""
+    from tests.test_antigravity_retired import DEAD_USAGE, RETIREMENT_NOTICE
+
+    install_transport(FakeTransport(gemini_events(text=RETIREMENT_NOTICE, usage=DEAD_USAGE)))
+
+    with pytest.raises(openai.NotFoundError, match="has been retired"):
+        await answer(GEMINI_PRO, stream=stream)

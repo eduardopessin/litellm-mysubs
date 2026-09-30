@@ -31,7 +31,12 @@ measurement, recorded in `docs/OMP.md`.
   class omp's gateway gives it on every route (a Cloud Code 503 "No capacity" was a 500);
   an upstream 401 is a 401 `AuthenticationError`; a Codex stream cut before its terminal
   event is a 502 (was 500); a Cloud Code stream that ends without a finish reason fails
-  with 502 instead of passing as a success.
+  with 502 instead of passing as a success; a model the upstream retired is a 404 (was
+  500), which neither the client nor LiteLLM's Router retries.
+- **A non-streamed Cloud Code turn that failed to sample is asked again**, up to three
+  attempts: reasoning with no answer, or `MALFORMED_FUNCTION_CALL`. Measured on
+  gemini-3.1-pro-low with a forced tool, 3-4 in 25 attempts ended that way, independently.
+  A streamed turn (its reasoning already went out) and a refusal such as SAFETY still fail.
 - **Failed turns are billed what the upstream reported**, at the wire rate, and a failed
   Messages or Responses stream no longer also logs a zero-token success.
 - **Antigravity sampling reaches the backend.** `temperature`, `top_p` and `top_k` were

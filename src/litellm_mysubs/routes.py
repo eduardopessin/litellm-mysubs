@@ -26,6 +26,7 @@ from litellm.types.utils import ModelResponse, ModelResponseStream
 
 from .credentials.store import ProviderId
 from .observability import (
+    TRANSLATED_ERRORS,
     _as_litellm_error,
     _logged,
     _logged_messages,
@@ -36,10 +37,11 @@ from .observability import (
 )
 from .observability import _wrap_stream as _wrap_stream
 from .specs import _antigravity_spec, _codex_spec, _transport
-from .transport.client import RequestSpec, UpstreamError
+from .transport.client import RequestSpec
 from .turns import (
-    StreamError,
+    MalformedCallError,
     ThinkingLoopError,
+    UnansweredTurnError,
     WhitespaceLoopError,
     _AntigravityReader,
     _CodexReader,
@@ -215,11 +217,16 @@ async def _resampling_loops(attempt: Callable[[], Awaitable[_T]]) -> _T:
     re-samples a thinking-loop stall; nothing of the failed attempt has reached the client
     yet, so the retry is invisible to it. A streamed turn is not retried, there or here:
     its reasoning already went out.
+
+    Diverges from omp by also re-sampling a Cloud Code turn that stopped unanswered or with
+    a malformed call (`UnansweredTurnError`, `MalformedCallError`): the same reasoning holds
+    — nothing reached the client — and the live measurement in `UnansweredTurnError` shows
+    these are sampling failures a fresh attempt usually avoids.
     """
     for number in range(1, THINKING_LOOP_MAX_ATTEMPTS + 1):
         try:
             return await attempt()
-        except ThinkingLoopError:
+        except (ThinkingLoopError, UnansweredTurnError, MalformedCallError):
             if number >= THINKING_LOOP_MAX_ATTEMPTS:
                 raise
         await asyncio.sleep(
@@ -370,7 +377,7 @@ async def dispatch_responses(*, provider: ProviderId | None = None, **kwargs: An
             ),
             kwargs,
         )
-    except (UpstreamError, StreamError) as error:
+    except TRANSLATED_ERRORS as error:
         _raise_translated(error, model, kwargs)
 
 
@@ -509,7 +516,7 @@ async def dispatch_messages(*, provider: ProviderId | None = None, **kwargs: Any
             else _codex_turn(model, converted["messages"], converted)
         )
         response = await _logged(turn, kwargs)
-    except (UpstreamError, StreamError) as error:
+    except TRANSLATED_ERRORS as error:
         _raise_translated(error, model, kwargs)
     return messages.encode_response(response, model)
 
@@ -666,7 +673,7 @@ async def dispatch(*, provider: ProviderId | None = None, **kwargs: Any) -> Any:
                     kwargs,
                 )
             return await _logged(_codex_turn(model, messages, kwargs), kwargs)
-    except (UpstreamError, StreamError) as error:
+    except TRANSLATED_ERRORS as error:
         _raise_translated(error, model, kwargs)
 
     # `anthropic` has no branch of its own: it is served by LiteLLM's native path with the

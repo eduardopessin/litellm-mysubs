@@ -35,6 +35,12 @@ from litellm.types.utils import ModelResponseStream
 
 from .transport.client import RedeemRequired, RemapRequired, UpstreamError
 from .turns import StreamError
+from .wire.antigravity import ModelRetiredError
+
+#: Failures that leave as the exception LiteLLM answers the client with
+#: (`_as_litellm_error`). A retired model is neither an upstream nor a stream error — it
+#: must stay distinguishable from a transport failure — but it too needs a status.
+TRANSLATED_ERRORS: Final = (UpstreamError, StreamError, ModelRetiredError)
 
 #: Operator-facing log. `litellm_mysubs.*` loggers are silent inside the proxy: the root
 #: logger has no handlers, so a plain `getLogger(__name__)` emits nowhere — measured, and
@@ -59,7 +65,7 @@ async def _translate_errors(
     try:
         async for chunk in chunks:
             yield chunk
-    except (UpstreamError, StreamError) as error:
+    except TRANSLATED_ERRORS as error:
         translated = _as_litellm_error(error, model, kwargs)
         if translated is error:
             raise
@@ -150,6 +156,12 @@ def _as_litellm_error(error: Exception, model: str, kwargs: dict[str, Any]) -> E
     """
     if isinstance(error, RemapRequired | RedeemRequired):
         return error
+    if isinstance(error, ModelRetiredError):
+        # No omp counterpart (the notice is CCA-specific). The model is gone for good:
+        # 404 tells the client and LiteLLM's Router not to try again, where the 500 it
+        # used to be told them the proxy broke.
+        _, family = _cost_identity(model, kwargs)
+        return _litellm_status_error(404, str(error), family, model)
     status, kind = classify_gateway_error(error)
     _, family = _cost_identity(model, kwargs)
     if isinstance(error, UpstreamError) or status in (401, 429):
@@ -801,6 +813,8 @@ async def _openai_errors(
     try:
         async for chunk in chunks:
             yield chunk
+    except ModelRetiredError as error:
+        raise _as_litellm_error(error, model, kwargs) from error
     except StreamError as error:
         _, family = _cost_identity(model, kwargs)
         if error.status_code == 502:

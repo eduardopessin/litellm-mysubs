@@ -125,6 +125,26 @@ class GenerationFailedError(StreamError):
     """The upstream ended the turn with a finish reason omp counts as an error."""
 
 
+class MalformedCallError(GenerationFailedError):
+    """The model ended a Cloud Code turn with ``MALFORMED_FUNCTION_CALL``.
+
+    A sampling failure, not a refusal: unlike SAFETY or RECITATION, asking again usually
+    works. See `UnansweredTurnError`.
+    """
+
+
+class UnansweredTurnError(StreamError):
+    """A Cloud Code turn that stopped with nothing to deliver: empty, or reasoning only.
+
+    omp fails it and replays it only while nothing has been emitted — a turn that
+    reasoned is never replayed, because its thinking already streamed. A non-streamed
+    turn has emitted nothing, so `routes._resampling_loops` asks again. Measured on the
+    live backend (gemini-3.1-pro-low, named tool_choice, 25 requests each): 3-4 of 25 ended
+    reasoning-only or `MALFORMED_FUNCTION_CALL`, with omp's forced-tool directive and
+    without it alike; each attempt fails independently, so asking again closes most.
+    """
+
+
 class ThinkingLoopError(StreamError):
     """omp's loop guard tripped: the turn is ended before the rest of it is billed."""
 
@@ -843,6 +863,7 @@ class _AntigravityReader:
     __slots__ = (
         "_block",
         "_buffering",
+        "_error_finish",
         "_error_message",
         "_guard",
         "_healing",
@@ -880,6 +901,7 @@ class _AntigravityReader:
         self._text_buffer = ""
         self._saw_finish = False
         self._error_message = ""
+        self._error_finish = ""
         self._tool_count = 0
         self.done = False
 
@@ -955,7 +977,12 @@ class _AntigravityReader:
         self._guard_retired()
         turn = self._turn
         if turn.stop_reason == "error":
-            raise GenerationFailedError(self._error_message)
+            failure = (
+                MalformedCallError
+                if self._error_finish == "MALFORMED_FUNCTION_CALL"
+                else GenerationFailedError
+            )
+            raise failure(self._error_message)
         # Deliberate divergence: omp fails any turn without content, a MAX_TOKENS one
         # included. A client that set the output ceiling asked for the cut; measured live
         # on gemini-3-flash, "Write a 600-word essay about bridges." with max_tokens=64
@@ -965,7 +992,7 @@ class _AntigravityReader:
             thought_only = any(
                 block["type"] == "thinking" and block["thinking"].strip() for block in turn.content
             )
-            raise StreamError(
+            raise UnansweredTurnError(
                 "Cloud Code Assist API returned a thought-only response without final output"
                 if thought_only
                 else "Cloud Code Assist API returned an empty response"
@@ -1111,6 +1138,7 @@ class _AntigravityReader:
             return
         self._turn.stop_reason = mapped
         if mapped == "error":
+            self._error_finish = str(finish)
             self._error_message = f"Generation failed with finish reason: {finish}"
 
 
