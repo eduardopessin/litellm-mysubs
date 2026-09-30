@@ -37,6 +37,15 @@ measurement, recorded in `docs/OMP.md`.
   attempts: reasoning with no answer, or `MALFORMED_FUNCTION_CALL`. Measured on
   gemini-3.1-pro-low with a forced tool, 3-4 in 25 attempts ended that way, independently.
   A streamed turn (its reasoning already went out) and a refusal such as SAFETY still fail.
+- **After a restart the selection screen showed nothing ticked**, and applying it as shown
+  removed every model: the restored selection carried the public `mysubs/<provider>/` names
+  while the page compares the bare ones.
+- **Antigravity discovery no longer calls an advertised model verified.** The catalog kept
+  listing retired models, and an unprobed discovery marked them verified, so three dead
+  models stayed selected. Discovery now probes the models already selected (all of them
+  when nothing is selected yet; one short billed turn each), lists the rest as unverified
+  with the reason, and a selected model the upstream refuses or retired starts unticked,
+  marked "not served".
 - **Failed turns are billed what the upstream reported**, at the wire rate, and a failed
   Messages or Responses stream no longer also logs a zero-token success.
 - **Antigravity sampling reaches the backend.** `temperature`, `top_p` and `top_k` were

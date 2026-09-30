@@ -14,7 +14,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from ..catalog.deployments import to_deployments
+from ..catalog.deployments import PUBLIC_PREFIX, to_deployments
 from ..catalog.discovery import DiscoveredModel, discover
 from ..catalog.selection import SelectionStore
 from ..catalog.usage import (
@@ -446,12 +446,30 @@ class MySubsService:
                 await self.fetch_usage(provider)
 
     async def discover(self, provider: ProviderId) -> list[DiscoveredModel]:
-        """Step 6: lists what the subscription serves."""
+        """Step 6: lists what the subscription serves.
+
+        On Google, what is already selected is probed — what serves traffic is what must be
+        true, and a model the catalog still advertises may be dead (measured on 2026-09-30:
+        three retired models stayed selected because an unprobed discovery called them
+        verified). With nothing selected yet, every name is probed: the first choice is
+        the one made with the least information. Each probe is one short billed turn.
+        """
         credential = self._require(provider)
+        wires = self._selected_wires(provider)
         async with self.client_factory() as client:
-            found = await discover(credential, client=client)
+            found = await discover(credential, client=client, probe=wires or True)
         self.discovered[provider] = found
         return found
+
+    def _selected_wires(self, provider: ProviderId) -> frozenset[str]:
+        """Wire names of what is stored for ``provider``: ``gemini/gemini-3-flash`` ->
+        ``gemini-3-flash``."""
+        return frozenset(
+            str((d.get("litellm_params") or {}).get("model") or "").split("/", 1)[-1]
+            for saved in self.selections.all()
+            if saved.provider == provider
+            for d in saved.deployments
+        )
 
     def apply(self, provider: ProviderId, chosen: list[str]) -> ApplyResult:
         """Step 6: injects the chosen models into the Router.
@@ -568,8 +586,12 @@ class MySubsService:
         deployments: list[dict[str, Any]] = []
         for saved in self.selections.all():
             deployments += saved.deployments
+            # The names `apply` takes and the page ticks: without the subscription prefix
+            # `public_name` adds. Restoring `model_name` left every checkbox unticked after a
+            # restart, and applying that page removed every model.
+            prefix = PUBLIC_PREFIX[saved.provider]
             self.selected[saved.provider] = [
-                str(d.get("model_name") or "") for d in saved.deployments
+                str(d.get("model_name") or "").removeprefix(prefix) for d in saved.deployments
             ]
         if not deployments:
             return 0

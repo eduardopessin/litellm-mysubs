@@ -311,8 +311,10 @@ Dashboard shows, and for those it is the only source.
 Anthropic and Codex have no catalog endpoint for subscription tokens, so their model lists
 come from a curated set of measured names, each one probed live against your account before
 it is offered. Antigravity has a real catalog (`:fetchAvailableModels`); its names are read
-from there and then probed the same way, because a name in the catalog is not a promise
-that the account serves it.
+from there, and a name in the catalog is not a promise that the account serves it (retired
+models stay listed). Each probe is a billed turn, so discovery probes the models already
+selected — all of them the first time, when nothing is — and lists the rest as unverified;
+a selected model the upstream refuses or retired comes back unticked, marked "not served".
 
 ## Development
 

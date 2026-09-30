@@ -862,3 +862,151 @@ class TestApplyFeedback:
         assert len(actions) == 2, "the actions block disappeared"
         block = actions[1].split("</div>", 1)[0]
         assert "Apply" in block and "Rediscover" in block, block
+
+
+class TestSelectionPageAfterRestart:
+    """The selection screen has to show what is applied, restart or not."""
+
+    @staticmethod
+    def ticked(body: str) -> dict[str, bool]:
+        return {
+            name: bool(mark)
+            for name, mark in re.findall(r'name="chosen" value="([^"]+)"( checked)?', body)
+        }
+
+    @staticmethod
+    def page(service: MySubsService) -> str:
+        app = FastAPI()
+        mount(app, service, guard=None)
+        return TestClient(app).get("/mysubs/").text
+
+    def test_the_saved_selection_is_ticked_after_a_restart(self, tmp_path: Path) -> None:
+        """Measured on the gateway: after a restart every box came back unticked, because
+        the restored selection carried the public `mysubs/codex/` names and the page
+        compares the bare ones; applying that page as shown removed every model."""
+        from litellm_mysubs.catalog.discovery import DiscoveredModel
+        from litellm_mysubs.catalog.selection import SelectionStore
+
+        models = [
+            DiscoveredModel(wire_name=n, suggested_name=n, verified=True)
+            for n in ("gpt-6", "gpt-7", "gpt-8")
+        ]
+        store = Store()
+        store.creds["openai-codex"] = Credential(provider="openai-codex", access_token="a")
+        router = Router()
+        before = MySubsService(
+            store=store,
+            router_source=lambda: router,
+            selections=SelectionStore(tmp_path / "models.json"),
+        )
+        before.discovered["openai-codex"] = models
+        before.apply("openai-codex", ["gpt-6", "gpt-7"])
+
+        new_router = Router()
+        after = MySubsService(
+            store=store,
+            router_source=lambda: new_router,
+            selections=SelectionStore(tmp_path / "models.json"),
+        )
+        after.reapply()
+        after.discovered["openai-codex"] = models
+
+        assert self.ticked(self.page(after)) == {"gpt-6": True, "gpt-7": True, "gpt-8": False}
+
+    def test_a_model_the_upstream_refused_starts_unticked(self, tmp_path: Path) -> None:
+        """Selected, probed, retired: shown with the reason and unticked, so applying the
+        page as it stands drops it."""
+        from litellm_mysubs.catalog.discovery import DiscoveredModel
+
+        store = Store()
+        store.creds["google-antigravity"] = Credential(
+            provider="google-antigravity", access_token="a", project_id="p"
+        )
+        service = MySubsService(store=store, router_source=Router)
+        service.selected["google-antigravity"] = ["gemini-3.5-flash-low", "gemini-3-flash"]
+        service.discovered["google-antigravity"] = [
+            DiscoveredModel(
+                wire_name="gemini-3.5-flash-low",
+                suggested_name="gemini-3.5-flash-low",
+                verified=False,
+                note="model retired by upstream",
+                refused=True,
+            ),
+            DiscoveredModel(
+                wire_name="gemini-3-flash", suggested_name="gemini-3-flash", verified=True
+            ),
+        ]
+
+        body = self.page(service)
+
+        assert self.ticked(body) == {"gemini-3.5-flash-low": False, "gemini-3-flash": True}
+        assert "not served: model retired by upstream" in body
+
+
+class TestDiscoveryProbesTheSelection:
+    """Antigravity: probing costs one billed turn per name, so the UI probes what is
+    selected — and everything only when nothing is selected yet."""
+
+    @staticmethod
+    def service(tmp_path: Path, probed: list[str]) -> MySubsService:
+        import httpx
+
+        from litellm_mysubs.catalog.selection import SelectionStore
+
+        def upstream(request: httpx.Request) -> httpx.Response:
+            if "fetchAvailableModels" in str(request.url):
+                return httpx.Response(
+                    200,
+                    json={"models": {n: {} for n in ("gemini-3-flash", "gemini-3.1-pro-low", "x")}},
+                )
+            probed.append(__import__("json").loads(request.read())["model"])
+            event = {
+                "response": {
+                    "candidates": [{"content": {"parts": [{"text": "4"}]}, "finishReason": "STOP"}],
+                    "usageMetadata": {"totalTokenCount": 9},
+                }
+            }
+            return httpx.Response(200, text=f"data: {__import__('json').dumps(event)}\n\n")
+
+        store = Store()
+        store.creds["google-antigravity"] = Credential(
+            provider="google-antigravity", access_token="a", project_id="p"
+        )
+        return MySubsService(
+            store=store,
+            router_source=Router,
+            selections=SelectionStore(tmp_path / "models.json"),
+            client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(upstream)),
+        )
+
+    async def test_only_the_selected_models_are_probed(self, tmp_path: Path) -> None:
+        from litellm_mysubs.catalog.deployments import to_deployments
+        from litellm_mysubs.catalog.discovery import DiscoveredModel
+
+        probed: list[str] = []
+        service = self.service(tmp_path, probed)
+        service.selections.save(
+            "google-antigravity",
+            to_deployments(
+                [
+                    DiscoveredModel(
+                        wire_name="gemini-3-flash", suggested_name="gemini-3-flash", verified=True
+                    )
+                ],
+                "google-antigravity",
+            ),
+        )
+
+        found = {m.wire_name: m for m in await service.discover("google-antigravity")}
+
+        assert probed == ["gemini-3-flash"]
+        assert found["gemini-3-flash"].verified is True
+        assert found["gemini-3.1-pro-low"].verified is False
+
+    async def test_with_nothing_selected_everything_is_probed(self, tmp_path: Path) -> None:
+        probed: list[str] = []
+        service = self.service(tmp_path, probed)
+
+        await service.discover("google-antigravity")
+
+        assert sorted(probed) == ["gemini-3-flash", "gemini-3.1-pro-low", "x"]
