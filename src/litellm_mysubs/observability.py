@@ -23,8 +23,9 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Coroutine, Mapping
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, cast
 
+import httpx
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.litellm_core_utils.litellm_logging import Logging
@@ -151,18 +152,51 @@ def _as_litellm_error(error: Exception, model: str, kwargs: dict[str, Any]) -> E
         return error
     status, kind = classify_gateway_error(error)
     _, family = _cost_identity(model, kwargs)
-    if status == 401:
-        return litellm.exceptions.AuthenticationError(
-            message=str(error), llm_provider=family, model=model
-        )
-    if status == 429:
-        return litellm.exceptions.RateLimitError(
-            message=str(error), llm_provider=family, model=model
-        )
+    if isinstance(error, UpstreamError) or status in (401, 429):
+        return _litellm_status_error(status, str(error), family, model)
     if isinstance(error, StreamError):
         error.status_code = status
         error.type = kind
     return error
+
+
+def _litellm_status_error(status: int, message: str, provider: str, model: str) -> Exception:
+    """LiteLLM's exception for an upstream status, so the proxy answers with that status.
+
+    The proxy answers ``status_code`` off the exception, and 500 for one without it —
+    which is how an upstream HTTP error that is not a 401 or a 429 still reached the
+    client. Measured live on 0.1.16 and the 0.1.17 candidate alike: Cloud Code's 503 "No
+    capacity available for model gemini-2.5-pro" went out as 500
+    ``internal_server_error``, telling the client the proxy broke and not to come back
+    later. omp's gateway answers with the upstream's own status (``bucketStatus``).
+    """
+    exceptions = litellm.exceptions
+    named: dict[int, Any] = {
+        400: exceptions.BadRequestError,
+        401: exceptions.AuthenticationError,
+        404: exceptions.NotFoundError,
+        429: exceptions.RateLimitError,
+        500: exceptions.InternalServerError,
+        502: exceptions.BadGatewayError,
+        503: exceptions.ServiceUnavailableError,
+    }
+    if status in named:
+        return cast(Exception, named[status](message=message, llm_provider=provider, model=model))
+    if status in (403, 422):
+        # Both require the response they would normally be built from.
+        response = httpx.Response(status, request=httpx.Request("POST", "https://upstream"))
+        refusal = (
+            exceptions.PermissionDeniedError
+            if status == 403
+            else exceptions.UnprocessableEntityError
+        )
+        return cast(
+            Exception,
+            refusal(message=message, llm_provider=provider, model=model, response=response),
+        )
+    return exceptions.APIError(
+        status_code=status, message=message, llm_provider=provider, model=model
+    )
 
 
 def _record_failed_usage(usage: litellm.Usage, model: str, kwargs: dict[str, Any]) -> None:
