@@ -345,13 +345,14 @@ package does not pretend to have discovered any of it. **If you want the wire lo
 itself, go there — it is the source of truth, and when a provider changes, the fix appears
 there first.**
 
-Concretely, 13 of the 45 modules carry `# omp:` anchors and are ported — everything under
-`wire/`, plus `credentials/oauth.py`, `catalog/discovery.py`, `catalog/usage.py`,
-`catalog/usage_probe.py` and `transport/hosts.py`. That is roughly half the source by line
-count. The other half is what makes it a LiteLLM plugin rather than a library: the
-streaming patch and dispatch (`plugin.py`), the mounted UI and its OAuth pairing (`ui/`),
-credential storage and cross-process refresh (`credentials/`, minus `oauth.py`), Router
-injection and persistence, and the installer.
+Concretely, 28 of the 54 modules carry `# omp:` anchors and are ported — everything under
+`wire/` and `transport/`, the stream readers and error mapping (`turns.py`,
+`observability.py`, `routes.py`, `specs.py`), credential refresh (`credentials/oauth.py`,
+`refresher.py`, `store.py`, `file_store.py`) and the catalog's discovery and usage. That
+is about three quarters of the source by line count. The rest is what makes it a LiteLLM
+plugin rather than a library: the streaming patch and dispatch (`plugin.py`), the mounted
+UI and its OAuth pairing (`ui/`), credential storage backends and locks, Router injection
+and persistence, and the installer.
 
 What the port adds is traceability. Every borrowed constant carries an anchor naming its
 source:
