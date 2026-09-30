@@ -13,6 +13,9 @@ over ``normalizeSchemaForGoogle(toolWireSchema(tool))`` for Gemini, over
 
 from __future__ import annotations
 
+import contextlib
+import re
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Iterable
 from typing import Any, Final
 
@@ -24,6 +27,7 @@ import openai
 import pytest
 
 from litellm_mysubs import plugin, specs
+from litellm_mysubs.wire import antigravity as ag
 from litellm_mysubs.wire import antigravity_models
 from litellm_mysubs.wire.antigravity import FORCED_TOOL_DIRECTIVE, SIGNATURE_SENTINEL
 from tests.test_messages_stream_real import sdk_client
@@ -33,6 +37,7 @@ GEMINI: Final = "mysubs/antigravity/gemini-3-pro"
 GEMINI_25: Final = "mysubs/antigravity/gemini-2.5-flash"
 CLAUDE: Final = "mysubs/antigravity/claude-sonnet-4-6"
 GPT_OSS: Final = "mysubs/antigravity/gpt-oss-120b-medium"
+GEMINI_31: Final = "mysubs/antigravity/gemini-3.1-pro"
 
 WEATHER: Final[dict[str, Any]] = {
     "type": "function",
@@ -84,7 +89,7 @@ def proxy(monkeypatch: pytest.MonkeyPatch) -> Iterable[None]:
                 "litellm_params": {"model": f"gemini/{model.rsplit('/', 1)[-1]}"},
                 "model_info": {"id": model, "mysubs_provider": "google-antigravity"},
             }
-            for model in (GEMINI, GEMINI_25, CLAUDE, GPT_OSS)
+            for model in (GEMINI, GEMINI_25, CLAUDE, GPT_OSS, GEMINI_31)
         ]
     )
     assert plugin.bind_messages_route(router)
@@ -101,10 +106,14 @@ def proxy(monkeypatch: pytest.MonkeyPatch) -> Iterable[None]:
                 "gemini-2.5-flash": {},
                 "claude-sonnet-4-6": {},
                 "gpt-oss-120b-medium": {},
+                # As the account's catalog declares it (measured 2026-09-30).
+                "gemini-3.1-pro-low": {"thinkingBudget": 1001, "maxOutputTokens": 65535},
             }
         }
     )
     monkeypatch.setattr(specs._state, "catalog", catalog)
+    # Conversation state is process-wide: each test starts with none.
+    monkeypatch.setattr(ag, "_sessions", OrderedDict(), raising=False)
     plugin.install()
     yield
     plugin.uninstall()
@@ -194,10 +203,18 @@ class TestToolSchemas:
         self, client: openai.AsyncOpenAI
     ) -> None:
         """OpenAI lets a function omit ``parameters``; omp's ``buildTools`` reads that as
-        ``{}`` and every pass keeps it ``{}``."""
+        ``{}`` and every pass keeps it ``{}``. Claude gets an object schema instead: the
+        backend hands it to Anthropic as ``input_schema``, and measured on the live backend
+        (2026-09-30) ``{}`` answered 400 "tools.0.custom.input_schema.type: Field required"
+        while ``{"type": "object", "properties": {}}`` answered 200."""
         ping = {"type": "function", "function": {"name": "ping", "description": "Ping."}}
-        for model in (GEMINI, CLAUDE):
-            assert declared(await chat_request(client, model, tools=[ping])) == {"ping": {}}
+        gemini = declared(await chat_request(client, GEMINI, tools=[ping]))
+        claude = declared(
+            await chat_request(client, CLAUDE, tools=[ping], tool_choice="required")
+        )
+
+        assert gemini == {"ping": {}}
+        assert claude == {"ping": {"type": "object", "properties": {}}}
 
 
 class TestToolChoice:
@@ -449,7 +466,7 @@ class TestSystemAndSampling:
         """omp carries temperature, top-p and presence penalty into ``generationConfig``;
         dropping them served every request at the backend's defaults."""
         request = await chat_request(
-            client, GEMINI, temperature=0.3, top_p=0.9, presence_penalty=0.5, max_tokens=900
+            client, GPT_OSS, temperature=0.3, top_p=0.9, presence_penalty=0.5, max_tokens=900
         )
         generation = request["generationConfig"]
 
@@ -462,6 +479,24 @@ class TestSystemAndSampling:
         ]
         assert (generation["temperature"], generation["topP"]) == (0.3, 0.9)
         assert generation["presencePenalty"] == 0.5
+
+    async def test_a_field_the_model_refuses_is_left_out(
+        self, client: openai.AsyncOpenAI
+    ) -> None:
+        """Measured on the live backend (2026-09-30): every Gemini answers a penalty with
+        400 "Penalty is not enabled for this model", and a thinking Claude answers ``top_p``
+        under 0.95 with 400. Sent as-is — omp's way — the whole turn failed; the rest of
+        the caller's sampling still goes."""
+        sampling = {"temperature": 0.3, "top_p": 0.9, "presence_penalty": 0.5}
+        gemini = (await chat_request(client, GEMINI, **sampling))["generationConfig"]
+        claude = (await chat_request(client, CLAUDE, **sampling))["generationConfig"]
+        claude_high = (await chat_request(client, CLAUDE, top_p=0.97))["generationConfig"]
+
+        assert (gemini["temperature"], gemini["topP"]) == (0.3, 0.9)
+        assert "presencePenalty" not in gemini
+        assert (claude["temperature"], claude["presencePenalty"]) == (0.3, 0.5)
+        assert "topP" not in claude
+        assert claude_high["topP"] == 0.97
 
     async def test_top_k_arrives_from_the_messages_route(self) -> None:
         _, sdk = sdk_client()
@@ -656,3 +691,116 @@ class TestAssistantText:
         )
 
         assert request["contents"][1] == {"role": "model", "parts": [{"text": "Sunny."}]}
+
+
+def answered(response_id: str, *, finish: str = "STOP") -> list[dict[str, Any]]:
+    """A Cloud Code answer whose events carry ``responseId``, as the backend's do."""
+    events = gemini_events(finish=finish)
+    for event in events:
+        event["response"]["responseId"] = response_id
+    return events
+
+
+REQUEST_ID = re.compile(
+    r"^agent/(?P<agent>[0-9a-f-]{36})/\d+/(?P<trajectory>[0-9a-f-]{36})/(?P<step>\d+)$"
+)
+
+
+class TestRequestEnvelope:
+    """omp's ``buildAntigravityRequestEnvelope``: ``sessionId`` and ``labels`` inside
+    ``request``, and a ``requestId`` that walks one conversation's steps. Measured on the
+    live backend (2026-09-30): accepted with HTTP 200 on gemini-3-flash and
+    claude-sonnet-4-6, a second turn carrying ``labels.last_execution_id`` included."""
+
+    async def turn(
+        self, client: openai.AsyncOpenAI, model: str, messages: list[Any], events: Any
+    ) -> dict[str, Any]:
+        transport = install_transport(FakeTransport(events))
+        with contextlib.suppress(openai.APIError):
+            await client.chat.completions.create(model=model, messages=messages)
+        (spec,) = transport.specs
+        return dict(spec.body)
+
+    async def test_one_conversation_walks_its_steps(self, client: openai.AsyncOpenAI) -> None:
+        first = [{"role": "user", "content": "weather?"}]
+        second = [
+            *first,
+            {"role": "assistant", "content": "Sunny."},
+            {"role": "user", "content": "sure?"},
+        ]
+        one = await self.turn(client, GEMINI, first, answered("resp-1"))
+        two = await self.turn(client, GEMINI, second, answered("resp-2"))
+
+        ids = [REQUEST_ID.match(body["requestId"]) for body in (one, two)]
+        assert all(ids), (one["requestId"], two["requestId"])
+        assert ids[0]["agent"] == ids[1]["agent"]
+        assert ids[0]["trajectory"] == ids[1]["trajectory"]
+        assert (ids[0]["step"], ids[1]["step"]) == ("2", "3")
+        assert one["request"]["sessionId"] == two["request"]["sessionId"]
+        assert re.fullmatch(r"-\d+", one["request"]["sessionId"])
+        assert one["request"]["labels"] == {
+            "last_step_index": "1",
+            "trajectory_id": ids[0]["trajectory"],
+            "used_claude": "false",
+            "used_claude_conservative": "false",
+        }
+        assert two["request"]["labels"] == {
+            "last_execution_id": "resp-1",
+            "last_step_index": "2",
+            "trajectory_id": ids[0]["trajectory"],
+            "used_claude": "false",
+            "used_claude_conservative": "false",
+        }
+
+    async def test_two_conversations_do_not_share_a_session(
+        self, client: openai.AsyncOpenAI
+    ) -> None:
+        one = await self.turn(client, GEMINI, [{"role": "user", "content": "a"}], answered("r"))
+        two = await self.turn(client, GEMINI, [{"role": "user", "content": "b"}], answered("r"))
+
+        assert one["request"]["sessionId"] != two["request"]["sessionId"]
+        assert "last_execution_id" not in two["request"]["labels"]
+        assert two["requestId"].endswith("/2")
+
+    async def test_a_failed_turn_does_not_become_the_last_execution(
+        self, client: openai.AsyncOpenAI
+    ) -> None:
+        """omp commits ``lastExecutionId`` only after a fully successful attempt."""
+        first = [{"role": "user", "content": "weather?"}]
+        await self.turn(client, GEMINI, first, answered("resp-ok"))
+        await self.turn(client, GEMINI, first, answered("resp-blocked", finish="SAFETY"))
+        third = await self.turn(client, GEMINI, first, answered("resp-3"))
+
+        assert third["request"]["labels"]["last_execution_id"] == "resp-ok"
+        assert third["requestId"].endswith("/4")
+
+    async def test_claude_and_profiled_ids_are_labelled_as_omp_labels_them(
+        self, client: openai.AsyncOpenAI
+    ) -> None:
+        """``used_claude`` from the model class; ``model_enum`` from omp's per-wire-id
+        profiles, which name ``gemini-3.1-pro-low``."""
+        messages = [{"role": "user", "content": "hi"}]
+        claude = await self.turn(client, CLAUDE, messages, answered("r"))
+        gemini = await self.turn(client, GEMINI_31, messages, answered("r"))
+
+        assert claude["request"]["labels"]["used_claude"] == "true"
+        assert claude["request"]["labels"]["used_claude_conservative"] == "true"
+        assert "model_enum" not in claude["request"]["labels"]
+        assert gemini["model"] == "gemini-3.1-pro-low"
+        assert gemini["request"]["labels"]["model_enum"] == "MODEL_PLACEHOLDER_M36"
+
+
+class TestSmallCeilingOnAThinkingOnlyModel:
+    async def test_the_budget_goes_on_top_of_max_tokens(self, client: openai.AsyncOpenAI) -> None:
+        """Measured on the live backend (2026-09-30): ``gemini-3.1-pro-low`` with
+        ``max_tokens: 64`` went out as ``maxOutputTokens: 64`` and a budget of 0, refused
+        with "Budget 0 is invalid. This model only works in thinking mode." omp reads
+        ``max_tokens`` as the answer and adds the budget on top; sent that way
+        (``maxOutputTokens: 1065``, budget 1001) the same request answered 200."""
+        request = await chat_request(client, GEMINI_31, max_tokens=64)
+
+        assert request["generationConfig"]["maxOutputTokens"] == 64 + 1001
+        assert request["generationConfig"]["thinkingConfig"] == {
+            "includeThoughts": True,
+            "thinkingBudget": 1001,
+        }

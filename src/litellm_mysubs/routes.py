@@ -51,6 +51,7 @@ from .turns import (
     finish_reason,
 )
 from .wire import anthropic, codex, messages, responses
+from .wire.antigravity import AntigravitySession
 from .wire.usage import Usage
 
 _T = TypeVar("_T")
@@ -187,11 +188,14 @@ def _codex_reader(spec: RequestSpec, model: str, turn: _Turn) -> _CodexReader:
     return _CodexReader(turn, wire_model=str(spec.body.get("model") or model))
 
 
-def _antigravity_reader(spec: RequestSpec, model: str, turn: _Turn) -> _AntigravityReader:
+def _antigravity_reader(
+    spec: RequestSpec, model: str, turn: _Turn, session: AntigravitySession
+) -> _AntigravityReader:
     return _AntigravityReader(
         turn,
         wire_model=str(spec.body.get("model") or model),
         tool_names=_antigravity_tool_names(spec),
+        session=session,
     )
 
 
@@ -262,9 +266,9 @@ async def _antigravity_turn(
     model: str, messages: list[Any], extra: dict[str, Any]
 ) -> ModelResponse:
     async def attempt() -> ModelResponse:
-        spec = await _antigravity_spec(model, messages, extra)
+        spec, session = await _antigravity_spec(model, messages, extra)
         turn = _Turn()
-        reader = _antigravity_reader(spec, model, turn)
+        reader = _antigravity_reader(spec, model, turn, session)
         return await _served_turn(spec, reader, turn, model, extra)
 
     return await _resampling_loops(attempt)
@@ -282,9 +286,9 @@ async def _codex_stream(
 async def _antigravity_stream(
     model: str, messages: list[Any], extra: dict[str, Any]
 ) -> AsyncIterator[ModelResponseStream]:
-    spec = await _antigravity_spec(model, messages, extra)
+    spec, session = await _antigravity_spec(model, messages, extra)
     turn = _Turn()
-    reader = _antigravity_reader(spec, model, turn)
+    reader = _antigravity_reader(spec, model, turn, session)
     async for chunk in _served_stream(spec, reader, turn, model, extra):
         yield chunk
 

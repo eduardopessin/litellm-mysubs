@@ -12,8 +12,6 @@ every request; `plugin.py` only writes the patch bookkeeping into it. One object
 from __future__ import annotations
 
 import contextlib
-import time
-import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from typing import Any, Final
@@ -39,12 +37,6 @@ ANTIGRAVITY_USER_AGENT: Final = (
 #: ends.
 _SIGNATURE_LIMIT: Final = 512
 
-#: This instance's transport identity (Antigravity's request ids). Codex's thread and
-#: window ids are per conversation, not per process: see `codex.request_context`.
-_AGENT_ID: Final = uuid.uuid4().hex[:16]
-_TRAJECTORY_ID: Final = uuid.uuid4().hex[:16]
-
-
 class _State:
     """Module state, in a single object so that `uninstall` leaves no loose ends."""
 
@@ -56,7 +48,6 @@ class _State:
         "rebound_messages_routers",
         "rebound_routers",
         "signatures",
-        "step",
         "store",
         "transport",
     )
@@ -76,7 +67,6 @@ class _State:
         self.store: CredentialStore | None = None
         self.transport: Transport | None = None
         self.signatures: OrderedDict[str, str] = OrderedDict()
-        self.step = 0
         #: The Antigravity catalog, with `ModelCatalog`'s own TTL. Without it `map_model`
         #: falls back to the curated static map, which only knows the Gemini family —
         #: measured: `claude-sonnet-4-6`, `gpt-oss-120b-medium`, `chat_23310` and eight
@@ -188,12 +178,6 @@ def _remember_signature(call_id: str, signature: str) -> None:
 set_signature_sink(_remember_signature)
 
 
-def _request_id() -> str:
-    """``agent/<id>/<ts>/<traj>/<step>`` — the format the CCA expects."""
-    _state.step += 1
-    return f"agent/{_AGENT_ID}/{int(time.time() * 1000)}/{_TRAJECTORY_ID}/{_state.step}"
-
-
 def _observe_codex_usage(headers: Mapping[str, str]) -> None:
     """Hands the response's `x-codex-*` quota headers to the usage the UI shows.
 
@@ -282,7 +266,21 @@ async def _refresh_catalog(token: str, project_id: str) -> antigravity_models.Mo
     return catalog
 
 
-async def _antigravity_spec(model: str, messages: list[Any], extra: dict[str, Any]) -> RequestSpec:
+# omp: auth-gateway/session-state.ts :: sessionKeys
+def _antigravity_session(
+    model: str, messages: list[Any], extra: dict[str, Any]
+) -> antigravity.AntigravitySession:
+    """The conversation's Antigravity state, keyed like omp's gateway keys provider state:
+    the model, then the client's session key or the one derived from the conversation (the
+    same derivation Codex uses, `codex.session_key`)."""
+    session = codex.session_key(model, messages, extra.get("tools"), extra)
+    return antigravity.antigravity_session(f"{model}\x00{session}")
+
+
+async def _antigravity_spec(
+    model: str, messages: list[Any], extra: dict[str, Any]
+) -> tuple[RequestSpec, antigravity.AntigravitySession]:
+    """The request, and the conversation state its reader commits the response id to."""
     token = await _access_token("antigravity")
     store = _state.store
     credential = store.get("google-antigravity") if store else None
@@ -291,11 +289,11 @@ async def _antigravity_spec(model: str, messages: list[Any], extra: dict[str, An
         model,
         messages,
         project_id=project_id,
-        request_id=_request_id(),
         tools=extra.get("tools"),
         extra=extra,
         thought_signatures=_state.signatures,
         catalog=await _refresh_catalog(token, project_id),
+        session=(session := _antigravity_session(model, messages, extra)),
     )
     headers = {
         "Authorization": f"Bearer {token}",
@@ -303,13 +301,14 @@ async def _antigravity_spec(model: str, messages: list[Any], extra: dict[str, An
         "Accept": "text/event-stream",
         "User-Agent": ANTIGRAVITY_USER_AGENT,
     }
-    return RequestSpec(
+    spec = RequestSpec(
         url=hosts.HOSTS[0] + hosts.STREAM_PATH,
         headers=headers,
         body=body,
         provider="antigravity",
         model=model,
     )
+    return spec, session
 
 
 # -- event interpretation, chunk shaping: see `turns.py` -----------------------
