@@ -1183,9 +1183,10 @@ def tools_to_codex_tools(tools: list[Any] | None) -> list[dict[str, Any]] | None
     the backend rejects ``oneOf`` and an object node without ``properties`` even outside
     strict mode. A tool with no parameters, or ``{}``, keeps sending the empty object
     schema this package has always sent. omp's gateway would send ``{}``, which its
-    normalization turns into ``parameters: true``; nothing here has measured the backend
-    accepting ``true``, and omitting ``parameters`` was measured to give 400 — the
-    divergence stays until a live request settles it.
+    normalization turns into ``parameters: true``. Measured on the live Codex backend on
+    2026-09-30: ``true`` answers 400 ``invalid_type`` ("Invalid type for
+    'tools[0].parameters': expected an object, but got a boolean instead"), while the
+    empty object schema answers 200 — so the object schema stays (docs/OMP.md).
     """
     if not tools:
         return None
