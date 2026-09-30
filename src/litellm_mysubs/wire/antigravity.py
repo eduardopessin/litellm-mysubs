@@ -715,33 +715,81 @@ def _thinking_config(
     -medium 4000, -high -1 = dynamic, pro-agent 10001) plus ``minThinkingBudget`` to turn it
     off. Without a catalog it falls back to ``thinkingLevel``, which is also accepted.
 
-    ``max_output_tokens`` is the request's total ceiling (`output_ceiling`), which already
-    carries the budget on top of the caller's visible output; the budget gives way only
-    where the model's own ceiling cuts that total below it (`_fit_budget`).
+    ``max_output_tokens`` is the request's total ceiling (`output_ceiling`) — the caller's
+    own; a budget that does not fit under it gives way as `_fit_budget` decides.
     """
     budget = info.get("thinkingBudget")
 
     if effort == "none":
-        # Suppressing means zero budget, not the catalog minimum: with
-        # `includeThoughts: False` a positive budget is billed without returning any text.
-        config: dict[str, Any] = {"includeThoughts": False}
+        if isinstance(budget, int) and not refuses_zero_budget(info, claude=claude):
+            # Suppressing means zero budget, not the catalog minimum: with
+            # `includeThoughts: False` a positive budget is billed without returning text.
+            return {"includeThoughts": False, "thinkingBudget": 0}
         if isinstance(budget, int):
-            config["thinkingBudget"] = 0
-        else:
-            config["thinkingLevel"] = SUPPRESSED_THINKING_LEVEL
-        return config
+            return thinking_floor(budget, info)
+        return {"includeThoughts": False, "thinkingLevel": SUPPRESSED_THINKING_LEVEL}
 
-    config = {"includeThoughts": True}
+    config: dict[str, Any] = {"includeThoughts": True}
     if isinstance(budget, int) and budget > 0:
-        fitted = _fit_budget(budget, max_output_tokens, claude=claude)
+        fitted = _fit_budget(
+            budget, max_output_tokens, claude=claude, floor=info.get("minThinkingBudget")
+        )
         if fitted is None:
-            # No budget fits under the model's ceiling: serve the turn without reasoning,
-            # omp's "budget clamped to zero — fall through to the thinking-off path".
+            # No budget fits under the ceiling: serve the turn without reasoning, omp's
+            # "budget clamped to zero — fall through to the thinking-off path".
             return {"includeThoughts": False, "thinkingBudget": 0}
         config["thinkingBudget"] = fitted
     elif not isinstance(budget, int):
         config["thinkingLevel"] = THINKING_LEVEL.get(effort, "MEDIUM")
     return config
+
+
+#: The ``minThinkingBudget`` of every model measured to accept a budget of 0.
+ZERO_BUDGET_MIN_THINKING: Final = 32
+
+
+def refuses_zero_budget(info: Mapping[str, Any], *, claude: bool) -> bool:
+    """Whether this model answers ``thinkingBudget: 0`` with 400.
+
+    Live 2026-09-30, ``maxOutputTokens: 64``, ``includeThoughts: false``, budget 0:
+
+    - refused — gemini-3.1-pro-low and gemini-pro-agent ("Budget 0 is invalid. This model
+      only works in thinking mode."), gemini-2.5-flash, gemini-2.5-flash-lite,
+      gemini-3.5-flash-lite and gpt-oss-120b-medium ("Request contains an invalid
+      argument"). Their catalog ``minThinkingBudget`` is 128, or absent (gpt-oss);
+    - accepted — Claude (sonnet-4-6, opus-4-6-thinking) and the gemini-3 / 3.6 / 3.7 / 3.8
+      flash ids, whose catalog minimum is 32.
+
+    The catalog minimum is what separates them, so it is what is read: Claude accepts 0,
+    anything else only with a minimum of at most 32. An id not measured is placed by the
+    same reading of its catalog entry.
+    """
+    if claude:
+        return False
+    floor = info.get("minThinkingBudget")
+    if isinstance(floor, bool) or not isinstance(floor, int) or floor <= 0:
+        return True
+    return floor > ZERO_BUDGET_MIN_THINKING
+
+
+# omp: stream.ts :: normalizeMandatoryReasoningOptions
+def thinking_floor(budget: int, info: Mapping[str, Any]) -> dict[str, Any]:
+    """The least thinking a model that cannot turn it off accepts.
+
+    omp answers "no reasoning" on a model whose thinking is mandatory by raising the request
+    to the model's lowest effort, not by switching thinking off. Here the lowest is the
+    catalog's ``minThinkingBudget`` — measured 200 at 128 on gemini-3.1-pro-low,
+    gemini-pro-agent, gemini-2.5-flash, gemini-2.5-flash-lite and gemini-3.5-flash-lite —
+    or, with no minimum (gpt-oss-120b-medium), the catalog budget itself (8192 measured 200;
+    nothing lower was measured). The thoughts come back: with ``includeThoughts: false`` a
+    positive budget is billed without the text.
+    """
+    floor = info.get("minThinkingBudget")
+    if isinstance(floor, int) and not isinstance(floor, bool) and floor > 0:
+        return {"includeThoughts": True, "thinkingBudget": floor}
+    if budget > 0:
+        return {"includeThoughts": True, "thinkingBudget": budget}
+    return {"includeThoughts": True}
 
 
 # omp: stream.ts :: MIN_OUTPUT_TOKENS
@@ -753,30 +801,43 @@ MIN_OUTPUT_TOKENS: Final = 1024
 MIN_THINKING_BUDGET: Final = 1024
 
 
-def thinking_budget(effort: str, info: Mapping[str, Any]) -> int | None:
-    """The catalog's positive budget when the request thinks by budget, else ``None``."""
-    budget = info.get("thinkingBudget")
-    if effort == "none" or isinstance(budget, bool) or not isinstance(budget, int):
-        return None
-    return budget if budget > 0 else None
+# omp: stream.ts :: mapOptionsForApi
+def _fit_budget(
+    budget: int, max_output_tokens: int | None, *, claude: bool, floor: object = None
+) -> int | None:
+    """The budget for a total ceiling that does not exceed it, or ``None`` for no thinking.
 
+    omp's rule (``stream.ts``, the ``google-gemini-cli`` case) is kept where it holds: the
+    budget becomes ``ceiling - MIN_OUTPUT_TOKENS``. Where that leaves nothing, omp turns
+    thinking off with a budget of 0 — and that is only right on Claude, whose own minimum
+    is 1024 and whose budget must stay under the ceiling. Everything else keeps thinking,
+    at the catalog's ``minThinkingBudget`` (or the budget itself when there is none): on
+    this backend ``maxOutputTokens`` bounds thoughts and answer together and a budget above
+    it is accepted, while a budget of 0 is refused by the thinking-only models.
 
-# omp: providers/google-gemini-cli.ts :: streamGoogleGeminiCli
-def _fit_budget(budget: int, max_output_tokens: int | None, *, claude: bool) -> int | None:
-    """The budget under the request's total ceiling, or ``None`` when none fits.
+    Measured on the live backend (2026-09-30), ``maxOutputTokens: 64``, an essay prompt:
 
-    omp's rule (``stream.ts``, the ``google-gemini-cli`` case): when the ceiling does not
-    exceed the budget, the budget becomes ``ceiling - MIN_OUTPUT_TOKENS``, and at zero the
-    turn goes out without thinking. Since the ceiling is the caller's output plus the
-    budget, that only happens where the model's own ceiling cuts the sum. On Claude a
-    budget under 1024 is refused, so it is no budget at all.
+    - budget 0 refused — gemini-3.1-pro-low and gemini-pro-agent ("Budget 0 is invalid.
+      This model only works in thinking mode."), gemini-2.5-flash, gemini-2.5-flash-lite,
+      gemini-3.5-flash-lite and gpt-oss-120b-medium ("Request contains an invalid
+      argument"); accepted by the gemini-3 / 3.6 / 3.7 / 3.8 flash and 3.1-flash-lite ids;
+    - a budget above the ceiling accepted everywhere but Claude — 1001 and 128 on
+      gemini-3.1-pro-low, 10001 on gemini-pro-agent, 4000 on gemini-3.8-flash-medium, 8192
+      on gpt-oss — each ending ``MAX_TOKENS`` within the 64;
+    - at ``minThinkingBudget`` (32) the flash ids answered 47-53 words, where their own
+      4000 left no answer at all (every token went to thinking).
     """
     if max_output_tokens is None or budget < max_output_tokens:
         return budget
-    fitted = max(0, max_output_tokens - MIN_OUTPUT_TOKENS)
-    if fitted <= 0 or (claude and fitted < MIN_THINKING_BUDGET):
-        return None
-    return fitted
+    fitted = max_output_tokens - MIN_OUTPUT_TOKENS
+    if claude:
+        return fitted if fitted >= MIN_THINKING_BUDGET else None
+    minimum = 0
+    if isinstance(floor, int) and not isinstance(floor, bool) and floor > 0:
+        minimum = floor
+    if fitted > 0 and fitted >= minimum:
+        return fitted
+    return minimum or budget
 
 
 # omp: wire/gemini-headers.ts :: ANTIGRAVITY_MODEL_WIRE_PROFILES
@@ -797,20 +858,20 @@ def declared_output_tokens(entry: Any) -> int | None:
     return value
 
 
-# omp: stream.ts :: maxTokensWithThinkingBudget
-def output_ceiling(requested: Any, entry: Any, budget: int | None = None) -> int | None:
-    """``maxOutputTokens`` for one request, never above what the model accepts.
+# omp: providers/google-gemini-cli.ts :: buildRequest
+def output_ceiling(requested: Any, entry: Any) -> int | None:
+    """``maxOutputTokens`` for one request: the caller's, never above what the model accepts.
 
-    omp reads the caller's ``max_tokens`` as the visible answer it wants and puts the
-    thinking budget on top ("Caller's maxTokens is desired output, so add thinking budget on
-    top"). Sending the caller's value alone as the total starved a budget model: measured
-    on the live backend (2026-09-30), ``gemini-3.1-pro-low`` with ``max_tokens: 64`` went out
-    as ``maxOutputTokens: 64`` with the budget fitted down to 0 and was refused —
-    "Budget 0 is invalid. This model only works in thinking mode."
+    The caller's ``max_tokens`` is the total — omp's "add thinking budget on top" is not
+    followed. Measured on the live backend (2026-09-30): claude-sonnet-4-6 with no reasoning
+    asked, ``max_tokens: 64`` and the 1024 budget on top went out as 1088, thought for 61
+    characters and answered 623 words (844 completion tokens), ``STOP``; with 64 as the
+    total it stopped at ``MAX_TOKENS`` within 64. The budget only bounds thinking, so the
+    answer takes whatever thinking leaves of the sum.
 
-    - the caller asked for a ceiling: it is sent plus ``budget``, lowered only to the
-      declared one — Claude on this backend answers ``maxOutputTokens > 64000`` with 400
-      (omp, ``ANTIGRAVITY_MODEL_WIRE_PROFILES``);
+    - the caller asked for a ceiling: it is sent, lowered only to the declared one — Claude
+      on this backend answers ``maxOutputTokens > 64000`` with 400 (omp,
+      ``ANTIGRAVITY_MODEL_WIRE_PROFILES``);
     - the caller asked for none and the catalog declares one: the declared one is sent;
     - neither: the field is omitted and the backend applies its own. A flat 64000 used to
       fill that gap: below the 65536 the gemini 3.x variants accept, and above the 4096 and
@@ -823,8 +884,7 @@ def output_ceiling(requested: Any, entry: Any, budget: int | None = None) -> int
         asked = None
     if asked is None or asked <= 0:
         return declared
-    total = asked + (budget or 0)
-    return total if declared is None else min(total, declared)
+    return asked if declared is None else min(asked, declared)
 
 
 # omp: providers/transform-messages.ts :: transformMessages
@@ -1274,9 +1334,7 @@ def build_payload(
     # output ceiling the client asked for is silently replaced.
     info = (catalog.info.get(mapped_model) if catalog else None) or {}
     max_tokens = output_ceiling(
-        extra.get("max_tokens") or extra.get("max_completion_tokens"),
-        info,
-        thinking_budget(effort, info),
+        extra.get("max_tokens") or extra.get("max_completion_tokens"), info
     )
     # The caller's sampling knobs, in the slots omp gives them: `temperature` ahead of the
     # ceiling, which keeps its place ahead of `thinkingConfig`.
@@ -1319,6 +1377,7 @@ __all__ = [
     "SAMPLING_FIELDS",
     "SESSION_LIMIT",
     "SIGNATURE_SENTINEL",
+    "ZERO_BUDGET_MIN_THINKING",
     "AntigravitySession",
     "FetchedMedia",
     "MediaFetchError",
@@ -1344,9 +1403,10 @@ __all__ = [
     "pair_tool_results",
     "raise_if_retired",
     "refused_sampling",
+    "refuses_zero_budget",
     "request_envelope",
     "text_of",
-    "thinking_budget",
+    "thinking_floor",
     "tool_result_value",
     "tools_to_declarations",
     "usage_is_zero",
