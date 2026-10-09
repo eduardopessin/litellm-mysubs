@@ -32,6 +32,8 @@ JsonObject = dict[str, Any]
 UNSUPPORTED_SCHEMA_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "$schema",
+        "$id",
+        "$anchor",
         "$ref",
         "$defs",
         "$dynamicRef",
@@ -45,6 +47,11 @@ UNSUPPORTED_SCHEMA_FIELDS: Final[frozenset[str]] = frozenset(
         "propertyNames",
         "minItems",
         "maxItems",
+        "uniqueItems",
+        "contains",
+        "minContains",
+        "maxContains",
+        "additionalItems",
         "minLength",
         "maxLength",
         "minimum",
@@ -54,6 +61,9 @@ UNSUPPORTED_SCHEMA_FIELDS: Final[frozenset[str]] = frozenset(
         "multipleOf",
         "pattern",
         "format",
+        "contentEncoding",
+        "contentMediaType",
+        "contentSchema",
         "dependencies",
         "dependentSchemas",
         "dependentRequired",
@@ -1100,15 +1110,7 @@ def _collapse_mixed_type_combiner_variants(schema: JsonObject, combiner: str) ->
 
     # An `items` inherited from the parent on a node now typed `string` is a field the proto
     # does not accept in that position — protojson 400s even though it is valid in itself.
-    for key in list(next_schema):
-        if key == "type":
-            continue
-        if (
-            key in ALL_CCA_TYPE_SPECIFIC_KEYS
-            and key not in chosen_allowed
-            and key not in CLOUD_CODE_ASSIST_SHARED_SCHEMA_KEYS
-        ):
-            del next_schema[key]
+    _drop_foreign_type_keywords(next_schema, chosen_type)
 
     for key, value in merged_variant_fields.items():
         if key not in chosen_allowed and key not in CLOUD_CODE_ASSIST_SHARED_SCHEMA_KEYS:
@@ -1450,7 +1452,9 @@ class _NormalizeOptions:
 
     What both share stays fixed in the walk: ``standard`` boolean coercion, Google's
     unsupported fields spilled into the description, snake_case renames, type arrays
-    reduced to one type, bare enums typed, and ``type: object`` given ``properties``.
+    scalarized (omp's ``scalarizeTypeArrays``: ``["T", "null"]`` becomes ``T``, a multi-type
+    array becomes one ``anyOf`` branch per type), bare enums typed, and ``type: object``
+    given ``properties``.
     ``collapse_combiners`` stands for omp's three combiner flags (merge object variants,
     collapse same-type and mixed-type variants), which neither preset sets apart.
     """
@@ -1491,6 +1495,54 @@ _CCA: Final = _NormalizeOptions(
     reject_residual_incompatibilities=True,
     fallback=CCA_FALLBACK_SCHEMA,
 )
+
+
+# omp: utils/schema/normalize.ts :: splitTypeArrayIntoAnyOf
+def _split_type_array_into_any_of(obj: JsonObject) -> JsonObject:
+    """``type: ["string", "array"]`` becomes one ``anyOf`` branch per non-null type, each
+    carrying only the keywords that constrain its type.
+
+    Collapsing to the first type instead narrows what the tool accepts and strands the
+    other types' keywords: Gemini rejects ``items`` beside ``type: "string"`` with HTTP 400.
+    A ``null`` member becomes ``nullable: true``. Returns ``obj`` itself when it has fewer
+    than two non-null types or already carries ``anyOf``.
+    """
+    type_value = obj.get("type")
+    if not isinstance(type_value, list) or isinstance(obj.get("anyOf"), list):
+        return obj
+    types: list[str] = []
+    for entry in type_value:
+        if isinstance(entry, str) and entry != "null" and entry not in types:
+            types.append(entry)
+    if len(types) < 2:
+        return obj
+    branches = [
+        ({"type": t}, CLOUD_CODE_ASSIST_TYPE_SPECIFIC_KEYS.get(t, frozenset())) for t in types
+    ]
+    out: JsonObject = {}
+    for key, value in obj.items():
+        if key == "type":
+            continue
+        if key not in ALL_CCA_TYPE_SPECIFIC_KEYS:
+            out[key] = value
+            continue
+        for branch, keys in branches:
+            if key in keys:
+                branch[key] = value
+    if "null" in type_value:
+        out["nullable"] = True
+    out["anyOf"] = [branch for branch, _ in branches]
+    return out
+
+
+# omp: utils/schema/normalize.ts :: dropForeignTypeKeywords
+def _drop_foreign_type_keywords(schema: JsonObject, type_name: str) -> None:
+    """Deletes keywords that constrain a JSON type other than ``type_name`` — ``items`` on
+    a string node is a field the proto rejects in that position."""
+    allowed = CLOUD_CODE_ASSIST_TYPE_SPECIFIC_KEYS.get(type_name, frozenset())
+    for key in [k for k in schema if k in ALL_CCA_TYPE_SPECIFIC_KEYS and k not in allowed]:
+        del schema[key]
+
 
 
 # omp: utils/schema/normalize.ts :: preHandleNullFields
@@ -1639,6 +1691,8 @@ def _normalize_schema_object_node(
     options: _NormalizeOptions,
 ) -> object:
     obj = value if inside_schema_map else _apply_snake_case_renames(value)
+    if not inside_schema_map:
+        obj = _split_type_array_into_any_of(obj)
     if options.collapse_null_fields and not inside_schema_map:
         obj = _pre_handle_null_fields(obj)
     result: JsonObject = {}
@@ -1712,6 +1766,8 @@ def _normalize_schema_object_node(
         if "null" in types and not options.strip_nullable_keyword:
             result["nullable"] = True
         result["type"] = non_null[0] if non_null else (types[0] if types else None)
+        if isinstance(result["type"], str):
+            _drop_foreign_type_keywords(result, result["type"])
 
     if has_const:
         existing_enum = result["enum"] if isinstance(result.get("enum"), list) else []

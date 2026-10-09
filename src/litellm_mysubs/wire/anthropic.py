@@ -288,16 +288,19 @@ def is_adaptive(model: str) -> bool:
     return not any(marker in lowered for marker in BUDGET_ONLY_MODELS)
 
 
+# omp: compat/resolve.ts :: IdentityFacts.anthropicAdaptiveGenAtLeast
 #: Models that accept ``thinking.display``, in order of specificity.
 #:
-#: The rule in the source is generational, not a list: opus from 4.7 up, and
-#: sonnet/fable/mythos from 5 up. It does not coincide with ``is_adaptive`` — opus-4-6 and
-#: sonnet-4-6 are adaptive but do **not** accept ``display``, and sending it gives 400.
+#: The rule in the source is generational, not a list: opus from 4.7 up, sonnet/fable/mythos
+#: from 5 up and, since omp 18.8.6, haiku from 5.5 (the first adaptive Haiku). It does not
+#: coincide with ``is_adaptive`` — opus-4-6 and sonnet-4-6 are adaptive but do **not**
+#: accept ``display``, and sending it gives 400.
 _DISPLAY_FLOORS: Final[tuple[tuple[str, float], ...]] = (
     ("opus", 4.7),
     ("sonnet", 5.0),
     ("fable", 5.0),
     ("mythos", 5.0),
+    ("haiku", 5.5),
 )
 
 
@@ -375,13 +378,43 @@ def binds_thinking_prefix(model: str) -> bool:
     """Whether signed thinking is bound to the exact preceding conversation, and the model
     takes ``thinking.block_binding`` to say what happens when a replay no longer matches.
 
-    omp's catalog: Fable from 5.1 and, since 18.4.4, Sonnet 5.5 (`thinking-prefix-binding`
-    with `supports-thinking-binding-controls` on the Claude API). omp then asks for
+    omp's catalog: Fable from 5.1, Sonnet 5.5 (18.4.4) and, since 18.8.6, Opus 5.5 and
+    Haiku 5.5 (`thinking-prefix-binding` with `supports-thinking-binding-controls` on the
+    Claude API; Mythos is not bound). omp then asks for
     ``prefix_mismatch_behavior: "drop_block"``: a stale signed block is dropped instead of
-    failing the turn with 400 "Invalid `signature` in `thinking` block".
+    failing the turn with 400 "Invalid `signature` in `thinking` block". The 5.5 rules stop
+    below 6, like the forced-tool-choice ones.
     """
-    return _is_revision(model, "fable", (5, 1), (99, 0)) or _is_revision(
-        model, "sonnet", (5, 5), (6, 0)
+    return _is_revision(model, "fable", (5, 1), (99, 0)) or any(
+        _is_revision(model, family, (5, 5), (6, 0)) for family in ("sonnet", "opus", "haiku")
+    )
+
+
+#: Where each family stops taking sampling parameters (omp 18.8.6, `anthropic.kdl`).
+_NO_SAMPLING_FLOORS: Final[tuple[tuple[str, tuple[int, int]], ...]] = (
+    ("opus", (4, 7)),
+    ("sonnet", (5, 0)),
+    ("fable", (5, 0)),
+    ("mythos", (5, 0)),
+    ("haiku", (5, 5)),
+)
+
+
+# omp: compat/resolve.ts :: resolveAnthropicPolicy
+# omp: compat/rules/classes/anthropic.kdl :: family
+def supports_sampling_params(model: str) -> bool:
+    """Whether the model takes ``temperature``, ``top_p`` and ``top_k`` at all.
+
+    omp's catalog: adaptive Claude — Opus from 4.7, Sonnet, Fable and Mythos from 5 and,
+    since 18.8.6, Haiku from 5.5 — "rejects explicit sampling params with a 400 on every
+    serving host", so omp never sends them there. 18.4.4 derived this in
+    `resolveAnthropicPolicy` (`anthropicAdaptiveGenAtLeast("4.7")`); 18.8.6 moved it to
+    `supports-sampling-params #false` rules bounded below 10, so a separator-collapsed id
+    (`claude-opus-45`, Opus 4.5) is not read as a later revision. A preview with no
+    revision (`claude-mythos-preview`) keeps them.
+    """
+    return not any(
+        _is_revision(model, family, low, (10, 0)) for family, low in _NO_SAMPLING_FLOORS
     )
 
 
@@ -1015,10 +1048,17 @@ def _thinking_kind(kwargs: dict[str, Any]) -> object:
     return thinking.get("type") if isinstance(thinking, dict) else None
 
 
+def _bound_off_thinking() -> dict[str, Any]:
+    """omp's off turn on a prefix-bound adaptive model: adaptive thinking runs anyway, so it
+    is named, to carry the binding — no ``display``, and the effort is ``_thinking_off``'s."""
+    return {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
+
+
 #: Efforts at which Sonnet 5.5 answers `between_tools` with 400 (omp 18.4.4).
 BETWEEN_TOOLS_REFUSED_EFFORTS: Final = ("xhigh", "max")
 
-#: Sent only when ``thinking`` is absent or disabled: omp's ``allowSamplingParams``.
+#: Sent only when ``thinking`` is absent or disabled (omp's ``allowSamplingParams``), and
+#: never to a model that refuses them (`supports_sampling_params`).
 _SAMPLING_PARAMS: Final = ("temperature", "top_p", "top_k")
 
 
@@ -1062,6 +1102,7 @@ def _thinking_budget(thinking: object, reasoning: str | None) -> int:
 # omp: providers/anthropic.ts :: disableThinkingIfToolChoiceForced
 # omp: providers/anthropic.ts :: buildParams
 # omp: stream.ts :: mapOptionsForApi
+# omp: stream.ts :: withSupportedSamplingParams
 def apply_thinking_params(
     kwargs: dict[str, Any], model: str, *, ceiling: int | None = None
 ) -> dict[str, Any]:
@@ -1077,6 +1118,12 @@ def apply_thinking_params(
     for — ``reasoning_effort``, a ``thinking`` object, its own ``output_config.effort`` —
     is not replaced by that branch.
     """
+    if not supports_sampling_params(model):
+        # omp drops them before any provider builds its payload (`withSupportedSamplingParams`):
+        # these models answer them with 400. Done first, so that a temperature that will not
+        # be sent cannot turn the request's reasoning off below.
+        for key in _SAMPLING_PARAMS:
+            kwargs.pop(key, None)
     reasoning, _summary = normalize_effort(kwargs.get("reasoning_effort"))
     thinking = kwargs.get("thinking")
     kind = thinking.get("type") if isinstance(thinking, dict) else None
@@ -1087,8 +1134,10 @@ def apply_thinking_params(
         kwargs.pop("reasoning_effort", None)
         kwargs.pop("thinking", None)
         reasoning = None
-    if turned_off or kind == "between_tools":
-        # A caller's `between_tools` is Sonnet 5.5's lowest setting, not a request to reason.
+    if turned_off or kind == "between_tools" or thinking == _bound_off_thinking():
+        # A caller's `between_tools` is Sonnet 5.5's lowest setting, not a request to reason;
+        # the bound off turn is what the first of LiteLLM's two passes over a chat request
+        # left here, and reading it as reasoning raised `max_tokens` and added `display`.
         thinking = None
     effort = _client_effort(kwargs)
 
@@ -1153,6 +1202,17 @@ def apply_thinking_params(
         # reasoning at that effort: omp's Messages server reads it as `reasoning`.
         if turned_off or effort is None:
             _thinking_off(kwargs, model, effort)
+        if (
+            binds_thinking_prefix(model)
+            and is_adaptive(model)
+            and not supports_between_tools_thinking(model)
+            and not kwargs.get("thinking")
+        ):
+            # omp's `prefixMismatchBehavior` without thinking asked for (`buildParams`).
+            # Opus 5.5 (omp 18.8.6) is the first served model this reaches. Not Sonnet 5.5:
+            # its off turn is `between_tools`, which takes no binding, and at `xhigh`/`max`
+            # omp drops `thinking` after the binding is applied.
+            kwargs["thinking"] = _bound_off_thinking()
         if forced:
             # omp deletes `thinking` of any type beside a forced tool.
             kwargs.pop("thinking", None)

@@ -16,7 +16,8 @@ Three forms of runaway, with distinct purposes:
    concrete reference.
 
 The last two are semantic heuristics, armed only for the families that run away
-(`is_loop_guarded_model`). `LoopGuard` is omp's `guardThinkingLoopStream` on the reasoning
+(`is_loop_guarded_model`), and they judge prose only: code-shaped lines are dropped first
+(`_CODE_LINE`). `LoopGuard` is omp's `guardThinkingLoopStream` on the reasoning
 channel: which deltas the detector sees, when it is flushed, and when visible text latches
 it off. omp also judges the visible text; that half is a measured divergence.
 """
@@ -89,6 +90,24 @@ CONCRETE_ANCHOR: Final = re.compile(
 # removed before analysis.
 _HEADING = re.compile(r"^[ \t]*#{1,6}[ \t].*$", re.M)
 _BOLD_TITLE = re.compile(r"^[ \t]*\*{2,3}.+?\*{2,3}[ \t]*$", re.M)
+
+# omp: utils/thinking-loop.ts :: CODE_LINE
+# A whole line shaped like code rather than prose: a fence marker, an indented line that is
+# not a nested list item, or a line ending in a block, statement or markup delimiter. Code
+# repeats one keyword skeleton with different literals, and normalization drops the
+# numbers, so a drafted SVG/VRML/JSON read as a near-duplicate cluster (omp 18.8: "false
+# thinking-loop detections ... repetitive code or markup"). Per line, not by fence state:
+# Gemini thought summaries routinely end inside an unclosed fence, and tracking fences
+# would hide every later prose paragraph. Spelled for JavaScript semantics: its `.`, and its
+# multiline `^`/`$`, treat \r, U+2028 and U+2029 as line ends too (a CRLF draft's `foo;\r`
+# is a code line there), and its `\d` is ASCII-only.
+_CODE_LINE = re.compile(
+    r"(?:(?<=[\n\r\u2028\u2029])|\A)"
+    r"(?:[ \t]*```[^\n\r\u2028\u2029]*"
+    r"|(?: {2,}|\t)(?![ \t]*(?:[-*+]|[0-9]+[.)])[ \t])[^\n\r\u2028\u2029]*"
+    r"|[^\n\r\u2028\u2029]*[{}\[\](;,>][ \t]*)"
+    r"(?=[\n\r\u2028\u2029]|\Z)"
+)
 
 _PARAGRAPH_BOUNDARY = re.compile(r"\n\s*\n")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
@@ -262,7 +281,9 @@ class ThinkingLoopDetector:
         return None
 
     def _consume_segment(self, raw: str) -> str | None:
-        segment = _BOLD_TITLE.sub("", _HEADING.sub("", raw))
+        # Code lines first, then titles: a code- or title-only segment falls below the
+        # length gate, and anchors are collected from the prose that is left.
+        segment = _BOLD_TITLE.sub("", _HEADING.sub("", _CODE_LINE.sub("", raw)))
         normalized = normalize_segment(segment)
         if len(normalized) < SEGMENT_MIN_NORM_CHARS:
             return None

@@ -21,16 +21,12 @@ import litellm
 
 from .credentials import refresher
 from .credentials.store import CredentialStore, ProviderId
-from .transport import hosts
+from .transport import antigravity_version, hosts
 from .transport.client import RequestSpec, Transport
 from .turns import set_native_turn_sink, set_signature_sink
 from .wire import antigravity, antigravity_models, codex
 
 CODEX_URL: Final = "https://chatgpt.com/backend-api/codex/responses"
-
-ANTIGRAVITY_USER_AGENT: Final = (
-    "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
-)
 
 #: Reasoning signatures from Gemini tool calls, to send back on the next turn. The cap
 #: exists because a long session would accumulate one entry per call until the process
@@ -276,7 +272,7 @@ async def _refresh_catalog(token: str, project_id: str) -> antigravity_models.Mo
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",
-                    "User-Agent": ANTIGRAVITY_USER_AGENT,
+                    "User-Agent": antigravity_version.user_agent(),
                 },
             )
             if response.status_code == 200:
@@ -295,10 +291,17 @@ def _antigravity_session(
     return antigravity.antigravity_session(f"{model}\x00{session}")
 
 
+# omp: providers/google-gemini-cli.ts :: streamGoogleGeminiCli
 async def _antigravity_spec(
     model: str, messages: list[Any], extra: dict[str, Any]
 ) -> tuple[RequestSpec, antigravity.AntigravitySession]:
-    """The request, and the conversation state its reader commits the response id to."""
+    """The request, and the conversation state its reader commits the response id to.
+
+    The client version is resolved first, as omp does before each Antigravity request: the
+    backend gates the catalog and the models on it, and a process that never ran discovery
+    must still send the current one.
+    """
+    await antigravity_version.ensure_version()
     token = await _access_token("antigravity")
     store = _state.store
     credential = store.get("google-antigravity") if store else None
@@ -317,7 +320,7 @@ async def _antigravity_spec(
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
-        "User-Agent": ANTIGRAVITY_USER_AGENT,
+        "User-Agent": antigravity_version.user_agent(),
     }
     spec = RequestSpec(
         url=hosts.HOSTS[0] + hosts.STREAM_PATH,

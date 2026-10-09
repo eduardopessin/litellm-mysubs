@@ -24,6 +24,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, NamedTuple
 
+from .anthropic import supports_sampling_params
 from .antigravity_models import (
     ModelCatalog,
     base_family,
@@ -621,13 +622,23 @@ SAMPLING_FIELDS: Final[tuple[tuple[str, str], ...]] = (
 CLAUDE_THINKING_MIN_TOP_P: Final = 0.95
 
 
+# omp: stream.ts :: withSupportedSamplingParams
 def refused_sampling(model: str, field: str, value: object, *, thinking: bool) -> bool:
     """A sampling field the backend refuses for this model — left out instead of failing
-    the turn. omp sends them all as given; each case below is a measured 400.
+    the turn. ``field`` is the wire name (``temperature``, ``topP``, ``topK``,
+    ``presencePenalty``).
 
-    Measured on the live backend on 2026-09-30, one field at a time over a request that
-    otherwise answered 200 (``temperature 0.2``, ``topP 0.9``, ``topK 40``,
-    ``presencePenalty 0.5``, ``frequencyPenalty 0.5``):
+    omp 18.8.6 drops every sampling field before any provider builds its payload when the
+    model's compat says ``supportsSamplingParams: false`` (`withSupportedSamplingParams`;
+    the axis now covers the ``google`` APIs). On Antigravity that resolves false only for
+    adaptive Claude — ``claude-opus-5-5`` and ``claude-sonnet-5-5`` in pi-catalog 18.8.6's
+    ``models.json`` — the same rule `anthropic.supports_sampling_params` ports. Not
+    measured here: the account does not serve Claude 5.5 through Antigravity; leaving a
+    field out cannot cause a 400, sending one is what omp's catalog records as a 400.
+
+    The rest are measured on the live backend on 2026-09-30, one field at a time over a
+    request that otherwise answered 200 (``temperature 0.2``, ``topP 0.9``, ``topK 40``,
+    ``presencePenalty 0.5``, ``frequencyPenalty 0.5``) — omp sends them all as given:
 
     - every Gemini (gemini-3-flash, gemini-3.1-pro-low, gemini-3.8-flash-medium,
       gemini-2.5-flash) refused both penalties — "Penalty is not enabled for this model" —
@@ -638,6 +649,8 @@ def refused_sampling(model: str, field: str, value: object, *, thinking: bool) -
     ``frequencyPenalty`` is not in the list at all: omp never sends it.
     """
     name = str(model).split("/")[-1].lower()
+    if is_claude(name) and not supports_sampling_params(name):
+        return True
     if field == "presencePenalty":
         return name.startswith("gemini-")
     if field == "topP" and thinking and is_claude(name):
@@ -1341,7 +1354,10 @@ def build_payload(
     thinking_config = _thinking_config(effort, info, max_tokens, claude=claude)
     thinking = bool(thinking_config.get("includeThoughts"))
     generation: dict[str, Any] = {}
-    if (temperature := extra.get("temperature")) is not None:
+    temperature = extra.get("temperature")
+    if temperature is not None and not refused_sampling(
+        mapped_model, "temperature", temperature, thinking=thinking
+    ):
         generation["temperature"] = temperature
     if max_tokens is not None:
         generation["maxOutputTokens"] = max_tokens

@@ -32,7 +32,7 @@ from typing import Any, Final, Literal
 import litellm
 from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices
 
-from .wire import antigravity, codex, planning_leak, thinking_loop, thinking_markup
+from .wire import antigravity, codex, planning_leak, thinking_loop, thinking_markup, tool_arguments
 from .wire.usage import Usage, codex_usage, google_stop_reason, google_usage
 
 #: omp's `StopReason`, as far as a stream that did not fail can end.
@@ -187,19 +187,23 @@ def _stringify_args(arguments: object) -> str:
 
 # omp: providers/openai-shared.ts :: finalizeToolCallArgumentsDone
 def _final_arguments(raw: str) -> str:
-    """The authoritative arguments of a finished call, as a chat client receives them.
+    """The authoritative arguments of a finished call, as a chat client receives them."""
+    return _client_arguments(tool_arguments.parse_tool_call_arguments(raw), raw)
 
-    omp parses them (``parseStreamingJson``) and re-serializes the object. What will not
-    parse is kept verbatim here: omp's relaxed repair parser is not ported, and handing
-    the client the upstream's own text beats replacing it with ``{}``.
+
+def _client_arguments(parsed: object, raw: str) -> str:
+    """Parsed final arguments (``parseToolCallArguments``) re-serialized, as omp's chat
+    server writes them: blank text is ``{}``, text its repair parser fixes (single quotes,
+    unquoted keys, trailing commas, Python literals) goes out repaired.
+
+    Text nothing can repair is kept verbatim. omp hands its client its own diagnostic
+    object instead (``{"__parseError": ..., "__rawJson": ...}``, meant for its tool
+    validator); the upstream's own text tells a chat client the same without inventing
+    arguments.
     """
-    stripped = raw.lstrip()
-    if not stripped:
-        return "{}"
-    try:
-        return _stringify_args(json.loads(stripped))
-    except ValueError:
+    if isinstance(parsed, tool_arguments.InvalidArguments):
         return raw
+    return _stringify_args(parsed)
 
 
 # -- Codex -----------------------------------------------------------------------
@@ -740,6 +744,16 @@ class _CodexReader:
         else:
             self._unclaimed.append(item)
         self._close_item(entry)
+        if kind == "function_call":
+            raw_arguments = item.get("arguments")
+            arguments = tool_arguments.parse_tool_call_arguments(
+                raw_arguments if isinstance(raw_arguments, str) else None
+            )
+            # The kept item replays with the arguments the call ran with: replay drops a
+            # call whose stored text does not parse, and the client answers it anyway.
+            item["arguments"] = tool_arguments.replayable_tool_call_arguments(
+                raw_arguments, arguments
+            )
         if block is None:
             return []
         if kind == "reasoning" and block["type"] == "thinking":
@@ -753,7 +767,7 @@ class _CodexReader:
         if block["type"] != "toolCall" or entry is None or entry.tool_index is None:
             return []
         if kind == "function_call":
-            block["arguments"] = _final_arguments(str(item.get("arguments") or "{}"))
+            block["arguments"] = _client_arguments(arguments, str(raw_arguments or ""))
         elif kind == "computer_call":
             block["arguments"] = "{}"
         elif kind == "custom_tool_call":

@@ -6,11 +6,12 @@ The request goes through the real proxy app with the `openai` SDK as client, a r
 
 The schema corpus is differential, like `test_schema_differential.py`: the expected
 outputs are what omp's own TypeScript produced for the same inputs, run with Bun over the
-18.4.4 `utils/schema/*` sources (``adaptSchemaForStrict(sanitizeSchemaForOpenAIResponses(
+18.8.6 `utils/schema/*` sources (``adaptSchemaForStrict(sanitizeSchemaForOpenAIResponses(
 toolWireSchema({parameters: case})), false).schema``, the Codex path of
 `convertOpenAICodexResponsesTools`) — not what the Python produces. Regenerate both files
 when the pinned omp version goes up; `codex_schema_expected.json` holds one output per case
-of ``[*cca_schema_cases.json, *codex_schema_cases.json]``, ``null`` where omp throws.
+of ``[*cca_schema_cases.json, *codex_schema_cases.json]``, ``null`` where omp throws. The
+18.4.4 → 18.8.6 move left the Codex output of every pre-existing case unchanged.
 """
 
 from __future__ import annotations

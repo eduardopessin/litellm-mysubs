@@ -347,7 +347,7 @@ package does not pretend to have discovered any of it. **If you want the wire lo
 itself, go there — it is the source of truth, and when a provider changes, the fix appears
 there first.**
 
-Concretely, 28 of the 54 modules carry `# omp:` anchors and are ported — everything under
+Concretely, 30 of the 56 modules carry `# omp:` anchors and are ported — everything under
 `wire/` and `transport/`, the stream readers and error mapping (`turns.py`,
 `observability.py`, `routes.py`, `specs.py`), credential refresh (`credentials/oauth.py`,
 `refresher.py`, `store.py`, `file_store.py`) and the catalog's discovery and usage. That

@@ -53,8 +53,16 @@ def _first(*values: str | None) -> str | None:
 
 # -- Codex ---------------------------------------------------------------------------
 
+# omp: error/flags.ts :: CODEX_NATIVE_LANE_STEER_REJECTED_CODE
+# omp= CODEX_NATIVE_LANE_STEER_REJECTED_CODE = "unsupported_native_inflight_message"
+_CODEX_NATIVE_LANE_STEER_REJECTED: Final = "unsupported_native_inflight_message"
 # omp: providers/openai-codex-responses.ts :: CODEX_RETRYABLE_EVENT_CODES
-CODEX_RETRYABLE_EVENT_CODES: Final = frozenset({"model_error", "server_error", "internal_error"})
+#: The native-lane code is how the backend drops a response it was steered into (omp
+#: steers over its websocket only); this transport never steers, so it only arrives if the
+#: backend sends it for a reason of its own, and omp replays it like the others.
+CODEX_RETRYABLE_EVENT_CODES: Final = frozenset(
+    {"model_error", "server_error", "internal_error", _CODEX_NATIVE_LANE_STEER_REJECTED}
+)
 # omp: providers/openai-codex-responses.ts :: CODEX_RETRYABLE_EVENT_MESSAGE
 CODEX_RETRYABLE_EVENT_MESSAGE: Final = re.compile(
     r"processing your request|retry your request|temporar(?:y|ily)|overloaded"
