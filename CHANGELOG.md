@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-10-09
+
+omp 18.8.6. Of the 39 upstream declarations that changed since 18.4.4, 18 are ported and
+21 change nothing here: websocket steering, clone helpers, consumer-side local-work timers,
+Factory Droid and compaction paths. 642 anchors, against 615. Validated from a throwaway
+proxy in the production pod against the three live subscriptions: 82 of 92 battery cases
+passed, against 80 of 91 for 0.1.18. The other ten fail on 0.1.18 as well, for account
+reasons listed below.
+
+### Changed
+
+- **Antigravity sends the current client version, as omp does.** The version comes from the
+  Antigravity updater manifest (`PI_AI_ANTIGRAVITY_VERSION` overrides it; the fallback is
+  `2.19.1`, up from `2.8.0`). It is resolved once per process and used for inference,
+  discovery, usage and onboarding alike. Before this, the plugin sent a fixed `2.8.0`. The
+  manifest said `2.21.1` on 2026-10-09; the account's catalog is the same at both versions
+  today, but omp sends the current one because the backend gates newer models on it.
+- **Tool call arguments are repaired the way omp repairs them** (`parseToolCallArguments`):
+  relaxed JSON (single quotes, unquoted keys and values, trailing commas, comments, `True`/
+  `None`, hex and binary numbers) is turned into valid JSON, and empty arguments become `{}`.
+  Arguments that cannot be repaired still reach the client exactly as the model wrote them.
+  The Codex response kept for replay stores the repaired arguments, so a repaired step still
+  goes back with its reasoning. A call whose name is malformed is never replayed.
+- **Anthropic follows the 18.8.6 catalog.** Opus 5.5 gets thinking prefix binding (with
+  the binding-controls beta, including on turns that ask for no reasoning), and Haiku 5.5
+  is adaptive with `display`. `temperature`, `top_p` and `top_k` are no longer sent to Opus
+  4.7+, Sonnet, Fable and Mythos 5+, or Haiku 5.5+. They are removed before the temperature
+  logic runs, so a dropped temperature no longer turns reasoning off.
+- **Antigravity drops sampling parameters for Claude 5.5**, as omp does. Measured on
+  2026-10-09: `claude-opus-5-5` and `claude-sonnet-5-5` on Antigravity answer 200 with or
+  without them. This is parity with omp, not a fix for an error.
+- **Tool schemas for Gemini and Cloud Code:** a multi-type `type` array becomes one `anyOf`
+  branch per type, with keywords that belong to another type removed. `$id`, `$anchor`,
+  `uniqueItems`, `contains`, `minContains`/`maxContains`, `additionalItems`,
+  `contentEncoding`, `contentMediaType` and `contentSchema` are stripped. The differential
+  fixtures were regenerated from omp 18.8.6's own TypeScript and gained 14 cases. Codex
+  output is unchanged on every case.
+- **The reasoning-loop guard ignores code lines.** Reasoning that drafts SVG, VRML or JSON,
+  or ends inside an unclosed fence, repeats its structure by design and used to trip
+  "8 near-identical segments". Prose loops, alone or between code, still trip.
+- Antigravity discovery names a rejected credential (HTTP 401/403) instead of reporting
+  that the endpoint did not respond. The credential file is not rewritten when a refresh
+  returns the credential it already holds. `unsupported_native_inflight_message` is a
+  retryable Codex event. The Codex `User-Agent` is `omp/18.8.6`.
+
+### Known
+
+- **The Antigravity account no longer serves Claude 4.6.** Its catalog lists
+  `claude-opus-5-5` and `claude-sonnet-5-5` (low/medium/high) instead. A selection made
+  before this answers "not served by this account" for `claude-sonnet-4-6` and
+  `claude-opus-4-6-thinking`: run discovery again in `/mysubs` and apply. These
+  account-side failures are 8 of the 10 failing battery cases, on 0.1.18 and 0.1.19 alike.
+  The other two are `gemini-2.5-pro` (503, transient) and `gemini-3.1-flash-image`, which
+  answers 400 to a text-only prompt.
+
 ## [0.1.18] - 2026-10-09
 
 ### Fixed
@@ -1058,7 +1113,9 @@ First release.
   a contract test against the LiteLLM internal symbols the plugin depends on, and a
   drift check over the source anchors.
 
-[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.17...HEAD
+[Unreleased]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.18...v0.1.19
+[0.1.18]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/eduardopessin/litellm-mysubs/compare/v0.1.14...v0.1.15

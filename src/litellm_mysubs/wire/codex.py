@@ -30,6 +30,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final, NamedTuple
 
+from . import tool_arguments
 from .openai_schema import codex_tool_parameters
 
 # The ChatGPT account rejects the 5.4 family with "The 'gpt-5.4' model is not supported
@@ -165,7 +166,7 @@ BETA_RESPONSES: Final = "responses=experimental"
 #: `claude-cli/…` on the Anthropic path, where the CLI *is* the client; here it is not. The
 #: constant lives in a third package (`@oh-my-pi/pi-utils`), which neither `pi-ai` nor
 #: `pi-catalog` contained.
-OMP_VERSION: Final = "18.4.4"
+OMP_VERSION: Final = "18.8.6"
 USER_AGENT: Final = f"omp/{OMP_VERSION}"
 
 # omp: providers/openai-codex-responses.ts :: OpenAICodexRequestKind
@@ -1023,12 +1024,14 @@ def _tool_call_arguments(arguments: object) -> str:
 
 
 def _is_malformed_tool_call(tool_call: Mapping[str, Any]) -> bool:
+    """A blank id, or a name no declared tool can have (`tool_arguments`'s
+    ``is_malformed_tool_call_name``: whitespace, control characters, over 128 units)."""
     function = tool_call.get("function")
     name = function.get("name") if isinstance(function, Mapping) else None
     call_id = tool_call.get("id")
-    return not (isinstance(call_id, str) and call_id.strip()) or not (
-        isinstance(name, str) and name.strip()
-    )
+    return not (
+        isinstance(call_id, str) and call_id.strip()
+    ) or tool_arguments.is_malformed_tool_call_name(name)
 
 
 # -- native turn replay ---------------------------------------------------------
@@ -1073,12 +1076,13 @@ def replay_scope(account: str | None, wire_model: str) -> str:
 
 
 def _parsed_arguments(arguments: object) -> object:
-    """Arguments compared by value: the client may reserialize the JSON it received."""
+    """Arguments compared by value: the client may reserialize the JSON it received, and a
+    streaming client holds the text as it streamed, before omp's repair parser fixed it."""
     if not isinstance(arguments, str):
         return arguments
     try:
-        return json.loads(arguments)
-    except ValueError:
+        return tool_arguments.parse_json_with_repair(arguments)
+    except (ValueError, RecursionError):
         return arguments
 
 
@@ -1110,17 +1114,24 @@ def _replay_reasoning_item(item: Mapping[str, Any]) -> dict[str, Any]:
 
 # omp: utils.ts :: sanitizeOpenAIResponsesHistoryItemForReplay
 # omp: utils.ts :: stripOpenAIResponsesOutputOnlyStatusesForReplay
+# omp: utils.ts :: isMalformedOpenAIResponsesToolCall
+# omp: utils.ts :: hasValidReplayArguments
 def _replay_item(item: Mapping[str, Any]) -> dict[str, Any] | None:
     """One output item as replay input: no id, and no ``status`` where the backend refuses
-    an output-only status on input. A call whose arguments are not JSON is not replayable."""
+    an output-only status on input. A call with a malformed name, or whose arguments are
+    not JSON, is not replayable."""
     kind = item.get("type")
+    if kind in _NATIVE_CALL_TYPES and tool_arguments.is_malformed_tool_call_name(
+        item.get("name")
+    ):
+        return None
     if kind == "function_call":
         arguments = item.get("arguments")
         if not isinstance(arguments, str) or not arguments.strip():
             return None
         try:
-            json.loads(arguments)
-        except ValueError:
+            tool_arguments.json_parse(arguments)
+        except (ValueError, RecursionError):
             return None
     if kind == "reasoning":
         return _replay_reasoning_item(item)

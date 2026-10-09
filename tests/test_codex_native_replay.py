@@ -294,6 +294,105 @@ class TestNativeReplay:
         ]
 
 
+def _tool_step(**call: str) -> list[dict[str, Any]]:
+    """`TOOL_STEP` with the call's fields replaced."""
+    reasoning = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": _summary("look it up"),
+        "encrypted_content": "enc-1",
+    }
+    message = _message("msg_1", "Checking the weather.", "commentary")
+    function_call = {
+        "type": "function_call",
+        "id": "fc_1",
+        "status": "completed",
+        "call_id": "call_1",
+        "name": "get_weather",
+        "arguments": '{"city":"Paris"}',
+        **call,
+    }
+    return _response(reasoning, message, function_call)
+
+
+@pytest.mark.usefixtures("router")
+class TestFinalArguments:
+    """omp 18.8.6 finalizes a call with its repair parser (`parseToolCallArguments`) and
+    keeps the native call replayable with the arguments it ran with
+    (`replayableToolCallArguments`)."""
+
+    @pytest.mark.parametrize("stream", STREAMING)
+    async def test_repaired_arguments_reach_the_client_and_the_turn_still_replays(
+        self, stream: bool
+    ) -> None:
+        """JSON5-ish arguments go out repaired, and the step replays with its reasoning:
+        a streaming client holds the text as it streamed, which repairs to the same."""
+        backend = Backend(_tool_step(arguments="{'city': 'Paris',}"))
+        serve(backend)
+
+        step = await ask([USER], stream=stream)
+        await ask([USER, step, _result(step, "sun")], stream=stream)
+
+        sent = step["tool_calls"][0]["function"]["arguments"]
+        assert sent == ("{'city': 'Paris',}" if stream else '{"city":"Paris"}')
+        assert _assistant_input(backend.bodies[1]) == REPLAYED_TOOL_STEP
+
+    async def test_a_call_with_blank_arguments_replays_as_an_empty_object(self) -> None:
+        """A zero-argument call the backend finished with `arguments: ""` used to make the
+        whole step unreplayable; it is kept as `{}`, as omp keeps it."""
+        backend = Backend(_tool_step(arguments=""))
+        serve(backend)
+
+        step = await ask([USER], stream=False)
+        await ask([USER, step, _result(step, "sun")], stream=False)
+
+        assert step["tool_calls"][0]["function"]["arguments"] == "{}"
+        assert _assistant_input(backend.bodies[1]) == [
+            *REPLAYED_TOOL_STEP[:2],
+            {**REPLAYED_TOOL_STEP[2], "arguments": "{}"},
+        ]
+
+    async def test_unrepairable_arguments_reach_the_client_verbatim(self) -> None:
+        backend = Backend(_tool_step(arguments='{"city": "Par'))
+        serve(backend)
+
+        step = await ask([USER], stream=False)
+
+        assert step["tool_calls"][0]["function"]["arguments"] == '{"city": "Par'
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            pytest.param('get_weather {"city": "Paris"}', id="invocation-text"),
+            pytest.param("get_weather\u0000", id="control-character"),
+            pytest.param("f" * 129, id="over-128"),
+        ],
+    )
+    async def test_a_malformed_tool_name_is_not_replayed(self, name: str) -> None:
+        """omp 18.8.6 (`isMalformedToolCallName`): a name no declared tool can have is
+        dropped from replay with the result that answers it, not just a blank one."""
+        backend = Backend(_tool_step(name=name))
+        serve(backend)
+
+        step = await ask([USER], stream=False)
+        assert step["tool_calls"][0]["function"]["name"] == name
+        await ask([USER, step, _result(step, "sun")], stream=False)
+
+        follow_up = backend.bodies[1]["input"]
+        assert not [item for item in follow_up if "call_id" in item]
+        assert _assistant_input(backend.bodies[1]) == [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "Checking the weather.", "annotations": []}
+                ],
+                "status": "completed",
+            }
+        ]
+
+
+
 class TestScope:
     """Native items are model-bound: the reasoning is encrypted for the model and account
     that produced it (omp replays them only for the same model)."""

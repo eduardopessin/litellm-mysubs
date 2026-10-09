@@ -171,11 +171,17 @@ class FileCredentialStore(CredentialStore):
         A renewal that finishes after a login, or after a peer's renewal, must not bring
         the credential it started from back over theirs. ``False`` means someone else wrote
         first; nothing was written.
+
+        A ``credential`` equal to what the file holds matches but is not written: the same
+        bytes again would only move the file's mtime and inode, and every other worker's
+        `_sync` would re-read it for nothing.
         """
         with file_lock(self.path, timeout_s=_WRITE_LOCK_TIMEOUT_S):
             self._load()
             if self._cache.get(provider) != expected:
                 return False
+            if credential == expected:
+                return True
             self._cache[provider] = credential
             self._write()
             return True

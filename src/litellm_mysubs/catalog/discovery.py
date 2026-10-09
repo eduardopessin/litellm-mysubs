@@ -46,7 +46,7 @@ from typing import Any, Final
 import httpx
 
 from ..credentials.store import Credential
-from ..transport import hosts, sse
+from ..transport import antigravity_version, hosts, sse
 from ..transport.retry import is_unsupported_model
 from ..wire import anthropic, codex
 from ..wire.antigravity import declared_output_tokens, is_retired_response, usage_is_zero
@@ -91,13 +91,6 @@ ANTHROPIC_API_VERSION: Final = "2023-06-01"
 #: Responses API served by the ChatGPT subscription. Same reason for the duplication as
 #: above: `plugin.py` has the twin constant and imports LiteLLM.
 CODEX_RESPONSES_URL: Final = "https://chatgpt.com/backend-api/codex/responses"
-
-# omp: wire/gemini-headers.ts :: getAntigravityUserAgent
-#: The Cloud Code Assist backend gates model availability on the client version; `cl` is
-#: not validated.
-ANTIGRAVITY_USER_AGENT: Final = (
-    "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
-)
 
 #: Textual marker of Anthropic refusing a name. The status alone is not enough: the OAuth
 #: route returns 404 for wrong paths too, and it is the body that names the model.
@@ -442,7 +435,8 @@ async def _discover_google(
     measured; hiding an advertised model would be deciding for them.
     """
     moment = time.time() if now is None else now
-    payload = await _fetch_catalog(credential, client=client)
+    fetched = await _fetch_catalog(credential, client=client)
+    payload = fetched if isinstance(fetched, dict) else None
 
     # What counts is whether the catalog *absorbed* anything, not whether there was a
     # response: a payload whose models are all in ``deprecatedModelIds`` is a 200 that adds
@@ -458,9 +452,14 @@ async def _discover_google(
     absorbed = payload is not None and (catalog.ids, catalog.fetched_at) != before
 
     if not catalog.ids:
+        why = (
+            _rejection(fetched.status)
+            if isinstance(fetched, _Rejected)
+            else "the catalog did not respond"
+        )
         raise DiscoveryError(
-            "Google Antigravity: the catalog did not respond and there is no earlier "
-            "snapshot; listing models here would mean inventing them"
+            f"Google Antigravity: {why} and there is no earlier snapshot; listing models "
+            "here would mean inventing them"
         )
 
     age = ""
@@ -469,11 +468,12 @@ async def _discover_google(
         # is legitimate — it was measured — but without the age it would pass for current,
         # which is exactly the plausible number this package does not invent.
         seconds = int(max(0.0, moment - catalog.fetched_at))
-        reason = (
-            "the endpoint did not respond"
-            if payload is None
-            else "the endpoint responded with no usable models"
-        )
+        if isinstance(fetched, _Rejected):
+            reason = _rejection(fetched.status)
+        elif payload is None:
+            reason = "the endpoint did not respond"
+        else:
+            reason = "the endpoint responded with no usable models"
         age = f"catalog snapshot {seconds} s old; {reason} now"
 
     targets = (
@@ -535,35 +535,64 @@ def _catalog_family(entry: Any) -> str:
     return MODEL_FAMILY_BY_PROVIDER.get(str(entry.get("modelProvider") or ""), "")
 
 
+@dataclass(frozen=True, slots=True)
+class _Rejected:
+    """Every host refused the credential: 401 or 403, with no transient failure beside it."""
+
+    status: int
+
+
+def _rejection(status: int) -> str:
+    return f"the endpoint rejected the credential (HTTP {status})"
+
+
+# omp: discovery/antigravity.ts :: fetchAntigravityDiscoveryResponse
 # omp: discovery/antigravity.ts :: FETCH_AVAILABLE_MODELS_PATH
 # omp= discovery/antigravity.ts :: FETCH_AVAILABLE_MODELS_PATH = "/v1internal:fetchAvailableModels"
 async def _fetch_catalog(
     credential: Credential, *, client: httpx.AsyncClient
-) -> dict[str, Any] | None:
-    """The ``:fetchAvailableModels`` payload, or ``None`` if no endpoint answered.
+) -> dict[str, Any] | _Rejected | None:
+    """The ``:fetchAvailableModels`` payload; `_Rejected` when every host answered 401/403;
+    ``None`` when any host failed otherwise.
 
     It walks both hosts like the rest of the package: a host being down is not an account
-    with no models.
+    with no models. A rejection is kept apart from "did not respond" (omp's
+    ``rejectedStatus``): the upstream saying no to the credential is a fact about the
+    account, a host that could not be asked is not — so a 401 on one host and a 503 on the
+    other stays ``None``.
+
+    The client version is resolved first, as omp's discovery does: the backend gates the
+    catalog on it, so listing with a stale one hides models the account serves.
     """
+    await antigravity_version.ensure_version(client)
     headers = {
         "Authorization": f"Bearer {credential.access_token}",
         "Content-Type": "application/json",
-        "User-Agent": ANTIGRAVITY_USER_AGENT,
+        "User-Agent": antigravity_version.user_agent(),
     }
+    rejected: int | None = None
+    transient = False
     for host in hosts.HOSTS:
         try:
             response = await client.post(host + hosts.MODELS_PATH, json={}, headers=headers)
         except httpx.HTTPError:
+            transient = True
             continue
         if response.status_code != 200:
+            if response.status_code in (401, 403):
+                rejected = response.status_code
+            else:
+                transient = True
             continue
         try:
             payload = response.json()
         except ValueError:
+            transient = True
             continue
         if isinstance(payload, dict):
             return payload
-    return None
+        transient = True
+    return _Rejected(rejected) if rejected is not None and not transient else None
 
 
 async def _probe_catalog(
@@ -625,7 +654,7 @@ async def _probe_antigravity(
     headers = {
         "Authorization": f"Bearer {credential.access_token}",
         "Content-Type": "application/json",
-        "User-Agent": ANTIGRAVITY_USER_AGENT,
+        "User-Agent": antigravity_version.user_agent(),
         "accept": "text/event-stream",
     }
     url = hosts.HOSTS[0] + hosts.STREAM_PATH

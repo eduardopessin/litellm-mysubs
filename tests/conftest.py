@@ -10,7 +10,9 @@ Redirecting `HOME` covers the three things that land there — credentials, sele
 the refresher's locks — without every test having to remember to pass a `tmp_path`.
 
 LiteLLM's callback lists are the other process-wide state: see `_isolate_callbacks`. The
-Codex responses kept for replay are a third: see `_isolate_native_turns`.
+Codex responses kept for replay are a third: see `_isolate_native_turns`. The Antigravity
+client version looked up from the update manifest is a fourth: see
+`_isolate_antigravity_version`.
 """
 
 from __future__ import annotations
@@ -95,3 +97,26 @@ def _isolate_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         refresher, "DEFAULT_PATH", home / ".litellm" / "mysubs" / "credentials.json"
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_antigravity_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with the version already resolved to the pinned fallback.
+
+    Otherwise the first Antigravity request of the suite fetches the real update manifest
+    (a network call), and the handlers of `httpx.MockTransport` tests see a ``GET`` they
+    did not expect ahead of ``:fetchAvailableModels``. Tests of the lookup itself replace
+    this state with an empty one.
+    """
+    from litellm_mysubs.transport import antigravity_version
+
+    resolved = antigravity_version._Lookup()
+    resolved.discovered = antigravity_version.DEFAULT_VERSION
+    monkeypatch.setattr(antigravity_version, "_lookup", resolved)
+    for name in (
+        "PI_AI_ANTIGRAVITY_VERSION",
+        "PI_AI_ANTIGRAVITY_CL",
+        "PI_AI_ANTIGRAVITY_OS",
+        "PI_AI_ANTIGRAVITY_ARCH",
+    ):
+        monkeypatch.delenv(name, raising=False)

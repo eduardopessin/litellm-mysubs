@@ -383,13 +383,13 @@ class MySubsService:
                 return snapshot
             return self.usage.get(provider) or UsageSnapshot()
 
-        from ..catalog.discovery import ANTIGRAVITY_USER_AGENT
+        from ..transport import antigravity_version
         from ..transport.hosts import HOSTS, MODELS_PATH
 
         headers = {
             "Authorization": f"Bearer {credential.access_token}",
             "Content-Type": "application/json",
-            "User-Agent": ANTIGRAVITY_USER_AGENT,
+            "User-Agent": antigravity_version.user_agent(),
         }
         body = {"project": credential.project_id}
 

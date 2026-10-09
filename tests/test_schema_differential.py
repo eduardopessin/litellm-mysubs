@@ -4,16 +4,26 @@ The targeted tests in ``test_schema.py`` assert named rules — what must happen
 `anyOf`, a `$ref`, a `not`. This one asserts something else: that for **any** schema the
 result is byte-for-byte the one OMP produces.
 
-The 400 entries were generated with a deterministic generator and passed through the real
-``normalizeSchemaForCCA``, run in Node from the ``@oh-my-pi/pi-ai`` 18.2.6 tarball. The
-recorded outputs are what the TypeScript produced, not what the Python produces —
-regenerating them from the Python would make the test circular and useless.
+``cca_schema_cases.json`` starts with entries from a deterministic generator; its last 14
+(appended to both case files) exercise what 18.8.6 changed: multi-type ``type`` arrays split into
+typed ``anyOf`` branches (``{"type": ["string", "array"], "items": …}``), a ``["T", "null"]``
+collapse that drops the other types' keywords, the newly unsupported ``uniqueItems`` /
+``contains`` / ``contentEncoding`` / ``$id`` / ``$anchor`` family, and mixed-type
+combiners carrying foreign sibling keywords. Every expected output is what omp's own
+TypeScript produced, not what the Python produces — regenerating them from the Python would
+make the test circular and useless.
 
-Regenerate when the pinned OMP version goes up::
+All three expected files (``cca_schema_expected.json``, ``tool_schema_expected.json``,
+``codex_schema_expected.json``) are regenerated together when the pinned OMP version goes
+up. They are now from 18.8.6: a Bun project with ``@oh-my-pi/pi-ai@18.8.6`` installed and a
+``run.ts`` that imports ``pi-ai/src/utils/schema/index.ts`` directly (no stubs) and maps
+each pipeline over the case files::
 
-    cd /tmp/ccaharness
-    cp tests/fixtures/cca_schema_cases.json cases.json
-    node --experimental-strip-types run.ts > tests/fixtures/cca_schema_expected.json
+    bun run.ts tests/fixtures <pi-ai>/src/utils/schema 18.8.6 tests/fixtures
+
+Moving from 18.4.4 to 18.8.6 changed the Google output of 9 of the 600 pre-existing
+``cca_schema_cases.json`` entries (the multi-type arrays) and nothing else; the CCA,
+wire, Gemini, Claude and Codex outputs of every pre-existing case stayed identical.
 
 A test like this pays for itself where the targeted ones do not reach: it caught a cycle
 guard that used ``id()`` as identity and truncated distinct nodes that reused the same
@@ -25,14 +35,9 @@ it (``convertTools`` + ``normalizeAntigravityTools``): ``toolWireSchema`` first,
 ``normalizeSchemaForCCA`` alone for Claude. ``tool_schema_cases.json`` is every object case
 above plus pydantic/ArkType shapes the generator does not produce (``T | None`` unions,
 described ``const`` unions, bare enums, ``name /** doc */`` keys). The expectations in
-``tool_schema_expected.json`` were produced by the TypeScript of 18.4.4, run under Bun with
-two stubs — ``@oh-my-pi/pi-utils`` (``logger``, ``isRecord``, ``structuredCloneJSON``) and
-``../../error`` (``ValidationError``) — around ``pi-ai/src/utils/schema/*.ts``::
-
-    bun run.ts tests/fixtures 18.4.4 > tests/fixtures/tool_schema_expected.json
-
-where ``run.ts`` maps ``normalizeSchemaForGoogle`` over ``cca_schema_cases.json`` and
-``toolWireSchema`` / the two pipelines over ``tool_schema_cases.json``.
+``tool_schema_expected.json`` hold, per case, ``normalizeSchemaForGoogle`` over
+``cca_schema_cases.json`` and ``toolWireSchema`` / the two pipelines over
+``tool_schema_cases.json``, from the same ``run.ts``.
 """
 
 from __future__ import annotations
@@ -94,7 +99,7 @@ def test_matches_the_typescript_output(index: int) -> None:
 
 
 def test_tool_corpus_is_paired() -> None:
-    assert TOOL_EXPECTED["omp_version"] == "18.4.4"
+    assert TOOL_EXPECTED["omp_version"] == "18.8.6"
     assert len(TOOL_EXPECTED["google"]) == len(CASES)
     for path in ("wire", "gemini", "claude"):
         assert len(TOOL_EXPECTED[path]) == len(TOOL_CASES), path

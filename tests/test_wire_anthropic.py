@@ -339,20 +339,20 @@ class TestCacheRetention:
     def test_temperature_forced_to_one_when_thinking(self) -> None:
         """400 "may only be set to 1 when thinking is enabled"."""
         out = ant.apply_thinking_params(
-            {"reasoning_effort": "medium", "temperature": 0.7}, "claude-opus-5"
+            {"reasoning_effort": "medium", "temperature": 0.7}, "claude-sonnet-4-6"
         )
         assert out["temperature"] == 1.0
 
     def test_low_top_p_dropped_when_thinking(self) -> None:
         """400 "`top_p` must be greater than or equal to 0.95 or unset"."""
         out = ant.apply_thinking_params(
-            {"reasoning_effort": "medium", "top_p": 0.5}, "claude-opus-5"
+            {"reasoning_effort": "medium", "top_p": 0.5}, "claude-sonnet-4-6"
         )
         assert "top_p" not in out
 
     def test_high_top_p_survives(self) -> None:
         out = ant.apply_thinking_params(
-            {"reasoning_effort": "medium", "top_p": 0.99}, "claude-opus-5"
+            {"reasoning_effort": "medium", "top_p": 0.99}, "claude-sonnet-4-6"
         )
         assert out["top_p"] == 0.99
 

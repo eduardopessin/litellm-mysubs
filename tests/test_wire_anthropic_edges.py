@@ -220,7 +220,7 @@ class TestThinkingEdges:
 
     def test_temperature_without_thinking_drops_reasoning(self) -> None:
         """Without thinking active, a custom temperature belongs to the client and wins."""
-        out = ant.apply_thinking_params({"temperature": 0.3}, "claude-opus-5")
+        out = ant.apply_thinking_params({"temperature": 0.3}, "claude-opus-4-6")
         assert out["temperature"] == 0.3
         assert "thinking" not in out
 
@@ -284,10 +284,13 @@ class TestThinkingEdges:
 
 
 class TestThinkingPrefixBinding:
-    """Fable 5.1+ and Sonnet 5.5 bind signed thinking to the exact preceding conversation;
-    omp asks them to drop a stale block (`drop_block`) instead of failing the turn."""
+    """Fable 5.1+, Sonnet 5.5 and (omp 18.8.6) Opus 5.5 and Haiku 5.5 bind signed thinking
+    to the exact preceding conversation; omp asks them to drop a stale block (`drop_block`)
+    instead of failing the turn."""
 
-    @pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-fable-5-1"])
+    @pytest.mark.parametrize(
+        "model", ["claude-sonnet-5-5", "claude-fable-5-1", "claude-opus-5-5", "claude-haiku-5-5"]
+    )
     def test_a_bound_model_drops_a_stale_block_with_its_beta(self, model: str) -> None:
         out = ant.build_request({"messages": [], "reasoning_effort": "high"}, model, "tok")
 
@@ -310,6 +313,112 @@ class TestThinkingPrefixBinding:
 
         assert "block_binding" not in out["thinking"]
         assert ant.THINKING_BINDING_BETA not in out["extra_headers"]["anthropic-beta"]
+
+    @pytest.mark.parametrize("params", [{}, {"reasoning_effort": "none"}], ids=["plain", "none"])
+    @pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-haiku-5-5"])
+    def test_an_off_turn_names_adaptive_to_carry_the_binding(
+        self, model: str, params: dict[str, Any]
+    ) -> None:
+        """omp 18.8.6 sends this for an Opus 5.5 / Haiku 5.5 turn that does not reason (read
+        off its `onPayload`): adaptive thinking runs anyway on these models, so it is named
+        to carry the binding — no `display`, the lowest effort, and the caller's
+        `max_tokens` untouched."""
+        out = ant.apply_thinking_params({"max_tokens": 100, **params}, model, ceiling=128000)
+
+        assert out["thinking"] == {
+            "type": "adaptive",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert out["output_config"] == {"effort": "low"}
+        assert out["max_tokens"] == 100
+
+    def test_the_off_turn_survives_litellms_second_pass(self) -> None:
+        """LiteLLM runs a chat request through the wire twice. Read as reasoning, the off
+        turn's adaptive block gained `display` and a thinking budget's `max_tokens`."""
+        first = ant.apply_thinking_params({"max_tokens": 100}, "claude-opus-5-5", ceiling=128000)
+        second = ant.apply_thinking_params(
+            {**first, "thinking": dict(first["thinking"])}, "claude-opus-5-5", ceiling=128000
+        )
+
+        assert second == first
+
+    def test_sonnet_5_5_keeps_between_tools(self) -> None:
+        """Its off turn is `between_tools`, which takes no binding."""
+        out = ant.apply_thinking_params({}, "claude-sonnet-5-5")
+
+        assert out["thinking"] == {"type": "between_tools"}
+
+
+class TestSamplingParams:
+    """omp 18.8.6 (`anthropic.kdl`, `supports-sampling-params #false`): adaptive Claude —
+    Opus 4.7+, Sonnet/Fable/Mythos 5+, Haiku 5.5+ — answers `temperature`, `top_p` and
+    `top_k` with 400, and omp never sends them there."""
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-haiku-5-5",
+        ],
+    )
+    @pytest.mark.parametrize("params", [{}, {"reasoning_effort": "high"}], ids=["off", "thinking"])
+    def test_a_model_that_refuses_them_never_gets_them(
+        self, model: str, params: dict[str, Any]
+    ) -> None:
+        out = ant.apply_thinking_params(
+            {"temperature": 0.3, "top_p": 0.99, "top_k": 5, **params}, model
+        )
+
+        assert not {"temperature", "top_p", "top_k"} & out.keys()
+
+    def test_a_dropped_temperature_does_not_turn_reasoning_off(self) -> None:
+        """A custom temperature turns reasoning off only where it is sent."""
+        out = ant.apply_thinking_params(
+            {"temperature": 0.3, "reasoning_effort": "high"}, "claude-opus-5"
+        )
+
+        assert out["thinking"]["type"] == "adaptive"
+        assert out["output_config"] == {"effort": "high"}
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-opus-45",
+            "claude-mythos-preview",
+        ],
+    )
+    def test_the_rest_keep_them(self, model: str) -> None:
+        """Below the floors, and a separator-collapsed (`claude-opus-45` is Opus 4.5) or
+        revision-less id, which the `<10` bound keeps out."""
+        out = ant.apply_thinking_params({"temperature": 0.3, "top_k": 5}, model)
+
+        assert out["temperature"] == 0.3
+        assert out["top_k"] == 5
+
+
+class TestHaiku55:
+    def test_it_is_adaptive_and_shows_its_thinking(self) -> None:
+        """omp 18.8.6: the first adaptive Haiku (`budget_tokens` is a 400), and it takes
+        `display` like the rest of its generation."""
+        out = ant.apply_thinking_params({"reasoning_effort": "low"}, "claude-haiku-5-5")
+
+        assert out["thinking"]["type"] == "adaptive"
+        assert out["thinking"]["display"] == "summarized"
+        assert out["output_config"] == {"effort": "low"}
+
+    def test_it_keeps_a_forced_tool_choice(self) -> None:
+        """Unlike Opus/Sonnet 5.5, omp keeps forced tool selection on Haiku 5.5."""
+        out = ant.apply_thinking_params({"tool_choice": "required"}, "claude-haiku-5-5")
+
+        assert out["tool_choice"] == "required"
+        assert "thinking" not in out
 
 
 class TestModelRevisions:

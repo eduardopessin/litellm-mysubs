@@ -62,7 +62,6 @@ from .routes import (
 )
 from .specs import (
     _PROVIDER_IDS,
-    ANTIGRAVITY_USER_AGENT,
     CODEX_URL,
     _access_token,
     _normalize,
@@ -705,7 +704,6 @@ def uninstall() -> None:
 
 
 __all__ = [
-    "ANTIGRAVITY_USER_AGENT",
     "CODEX_URL",
     "StreamError",
     "bind_messages_route",

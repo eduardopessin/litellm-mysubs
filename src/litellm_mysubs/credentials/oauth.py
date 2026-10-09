@@ -40,6 +40,7 @@ from typing import Any, Final, Literal
 
 import httpx
 
+from ..transport import antigravity_version
 from .store import Credential, CredentialStore, ProviderId
 
 __all__ = [
@@ -131,15 +132,6 @@ ANTHROPIC_GRANT_TTL_S: Final = 30 * 24 * 60 * 60.0
 #: Goes in the ``User-Agent`` of the Anthropic renewal. Claude Code sends these headers on
 #: the renewal but not on the initial code exchange.
 CLAUDE_CODE_SDK_VERSION: Final = "0.112.1"
-
-# omp: wire/gemini-headers.ts :: getAntigravityUserAgent
-#: ``User-Agent`` for the Antigravity control plane (``loadCodeAssist``/``onboardUser``).
-#: The backend does not validate ``cl``; only the version gates. Repeated here instead of
-#: imported from ``plugin.py`` because that module drags in the whole of LiteLLM, and
-#: discovering a project does not need it.
-ANTIGRAVITY_USER_AGENT: Final = (
-    "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
-)
 
 # omp: registry/oauth/google-antigravity.ts :: ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA
 _ANTIGRAVITY_METADATA: Final[dict[str, str]] = {"ideType": "ANTIGRAVITY"}
@@ -716,7 +708,7 @@ async def _discover_project(access_token: str, *, client: httpx.AsyncClient) -> 
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
-        "User-Agent": ANTIGRAVITY_USER_AGENT,
+        "User-Agent": antigravity_version.user_agent(),
     }
 
     initial = await _load_code_assist(headers, client=client)
