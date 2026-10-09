@@ -15,8 +15,8 @@ writes for the same provider events. Both run every reasoning delta through omp'
 thinking-loop guard (`thinking_loop.LoopGuard`), which omp's ``stream()`` wraps around
 every provider; the visible text is not judged (see `LoopGuard` for why).
 
-`remember_signature` is injected rather than imported: the signature cache lives in
-`plugin.py`'s process state, and importing it back would close a cycle.
+`remember_signature` and `remember_native_turn` are injected rather than imported: the
+caches live in `specs.py`'s process state, and importing it back would close a cycle.
 """
 
 from __future__ import annotations
@@ -51,6 +51,20 @@ def set_signature_sink(sink: Callable[[str, str], None]) -> None:
     """Points `remember_signature` at the process-wide cache."""
     global remember_signature
     remember_signature = sink
+
+
+def _discard_native_turn(key: str, turn: codex.NativeTurn) -> None:
+    """No-op sink: a reader used without `specs.py` has nowhere to keep native turns."""
+
+
+#: Replaced by `set_native_turn_sink`; see the module docstring.
+remember_native_turn: Callable[[str, codex.NativeTurn], None] = _discard_native_turn
+
+
+def set_native_turn_sink(sink: Callable[[str, codex.NativeTurn], None]) -> None:
+    """Points `remember_native_turn` at the process-wide cache."""
+    global remember_native_turn
+    remember_native_turn = sink
 
 
 # -- the turn --------------------------------------------------------------------
@@ -352,6 +366,8 @@ class _OpenItem:
     tool_index: int | None = None
     #: Whether any argument bytes left in a delta; omp's ``hasArgumentBytes``.
     sent_arguments: bool = False
+    #: The item as ``output_item.done`` delivered it; omp's ``nativeOutputItem``.
+    native: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -383,17 +399,22 @@ class _CodexReader:
 
     __slots__ = (
         "_current",
+        "_entries",
         "_finished_call",
         "_guard",
         "_open_by_id",
         "_open_by_index",
+        "_replay_scope",
         "_tool_count",
         "_turn",
+        "_unclaimed",
         "_whitespace",
         "done",
     )
 
-    def __init__(self, turn: _Turn, *, wire_model: str = "") -> None:
+    def __init__(
+        self, turn: _Turn, *, wire_model: str = "", replay_scope: str | None = None
+    ) -> None:
         self._turn = turn
         self._guard = thinking_loop.LoopGuard(wire_model)
         self._open_by_id: dict[str, _OpenItem] = {}
@@ -403,6 +424,12 @@ class _CodexReader:
         self._tool_count = 0
         #: A call reached ``output_item.done``: omp's ``canSafelyReplayWebsocketOverSse``.
         self._finished_call = False
+        #: Every item in the order it was added, and finished items no added item claimed:
+        #: omp's ``nativeOutputEntries`` and ``nativeOutputItems``.
+        self._entries: list[_OpenItem] = []
+        self._unclaimed: list[dict[str, Any]] = []
+        #: Where the finished response is kept for replay; ``None`` keeps nothing.
+        self._replay_scope = replay_scope
         self.done = False
 
     # omp: providers/openai-codex-responses.ts :: CodexStreamProcessor.handleStreamEvent
@@ -486,7 +513,24 @@ class _CodexReader:
             raise StreamError("Codex response failed")
         if detail := self._guard.done():
             raise ThinkingLoopError(thinking_loop.loop_error_message(detail))
+        if self._replay_scope is not None:
+            self._remember_native_turn(self._replay_scope)
         return []
+
+    # omp: providers/openai-codex-responses.ts :: CodexStreamRuntime.finalizeNativeOutputItems
+    def _remember_native_turn(self, scope: str) -> None:
+        """Keeps the finished response for replay, in omp's order: the finished items of
+        every added item in the order they were added, then the ones no item claimed."""
+        native = [entry.native for entry in self._entries if entry.native is not None]
+        native.extend(self._unclaimed)
+        calls = [
+            (str(block["id"]), str(block["arguments"]))
+            for block in self._turn.content
+            if block["type"] == "toolCall"
+        ]
+        kept = codex.native_turn(scope, native, self._turn.text(), calls)
+        if kept is not None:
+            remember_native_turn(*kept)
 
     # -- routing -----------------------------------------------------------------
 
@@ -525,6 +569,7 @@ class _CodexReader:
             output_index=_integer(event.get("output_index")),
         )
         self._current = entry
+        self._entries.append(entry)
         if entry.item_id:
             self._open_by_id[entry.item_id] = entry
         if entry.output_index is not None:
@@ -690,6 +735,10 @@ class _CodexReader:
         entry = (self._open_by_id.get(item_id) if item_id else None) or self._open_item_for(event)
         block = entry.block if entry is not None else None
         kind = item.get("type")
+        if entry is not None:
+            entry.native = item
+        else:
+            self._unclaimed.append(item)
         self._close_item(entry)
         if block is None:
             return []

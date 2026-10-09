@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-10-09
+
+### Fixed
+
+- **Codex tool loops keep their reasoning between steps.** omp sends each Codex response's
+  own output items back on the next request (`convertMessages`, from the message's
+  `providerPayload`): the encrypted reasoning, and every message's `phase` (`commentary`
+  for a progress note, `final_answer` for the answer). A chat completions client can carry
+  neither, so the plugin re-encoded its history from text and tool calls: every step reached
+  the model with its earlier reasoning gone and its progress notes looking like final
+  answers. OpenAI's own type for `phase` warns that dropping it on gpt-5.3-codex and later
+  "can degrade performance". Compared request by request against omp 18.8.6 driving
+  gpt-6-luna: instructions, tools, reasoning and `include` were identical; only those two
+  were missing. Each finished Codex response is now kept in the process, keyed by the tool
+  call ids the client answers with (or by the answer text), and replayed, sanitized as omp
+  sanitizes it, when the client's message still matches what was sent: same account and
+  wire model, same text, same calls and arguments. Anything else — an edited history,
+  another model, an evicted or restarted cache — gets the re-encoded turn, as before. See
+  `docs/DECISIONS.md` (D12).
+
 ## [0.1.17] - 2026-09-30
 
 omp 18.4.4, and the rest of the upstream protocol inherited from it: the transport and its

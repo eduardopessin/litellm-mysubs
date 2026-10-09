@@ -9,11 +9,13 @@ restart.
 Redirecting `HOME` covers the three things that land there — credentials, selection and
 the refresher's locks — without every test having to remember to pass a `tmp_path`.
 
-LiteLLM's callback lists are the other process-wide state: see `_isolate_callbacks`.
+LiteLLM's callback lists are the other process-wide state: see `_isolate_callbacks`. The
+Codex responses kept for replay are a third: see `_isolate_native_turns`.
 """
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 
 import litellm
@@ -45,6 +47,18 @@ def _isolate_callbacks(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in _CALLBACK_LISTS:
         if isinstance(getattr(litellm, name, None), list):
             monkeypatch.setattr(litellm, name, list(getattr(litellm, name)))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_native_turns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every test an empty cache of kept Codex responses.
+
+    The suite reuses tool call ids (``call_1``) across tests; a response one test left in
+    the process-wide cache would be replayed into another test's request body.
+    """
+    from litellm_mysubs import specs
+
+    monkeypatch.setattr(specs._state, "native_turns", OrderedDict())
 
 
 @pytest.fixture(autouse=True)

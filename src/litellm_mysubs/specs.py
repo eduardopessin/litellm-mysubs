@@ -23,7 +23,7 @@ from .credentials import refresher
 from .credentials.store import CredentialStore, ProviderId
 from .transport import hosts
 from .transport.client import RequestSpec, Transport
-from .turns import set_signature_sink
+from .turns import set_native_turn_sink, set_signature_sink
 from .wire import antigravity, antigravity_models, codex
 
 CODEX_URL: Final = "https://chatgpt.com/backend-api/codex/responses"
@@ -37,11 +37,16 @@ ANTIGRAVITY_USER_AGENT: Final = (
 #: ends.
 _SIGNATURE_LIMIT: Final = 512
 
+#: Codex responses kept for replay (`codex.NativeTurn`), one per assistant turn. The cap
+#: bounds a long-lived process the same way; an evicted turn is re-encoded as before.
+_NATIVE_TURN_LIMIT: Final = 2048
+
 class _State:
     """Module state, in a single object so that `uninstall` leaves no loose ends."""
 
     __slots__ = (
         "catalog",
+        "native_turns",
         "original_acompletion",
         "original_completion",
         "original_router_acompletion",
@@ -67,6 +72,7 @@ class _State:
         self.store: CredentialStore | None = None
         self.transport: Transport | None = None
         self.signatures: OrderedDict[str, str] = OrderedDict()
+        self.native_turns: OrderedDict[str, codex.NativeTurn] = OrderedDict()
         #: The Antigravity catalog, with `ModelCatalog`'s own TTL. Without it `map_model`
         #: falls back to the curated static map, which only knows the Gemini family —
         #: measured: `claude-sonnet-4-6`, `gpt-oss-120b-medium`, `chat_23310` and eight
@@ -174,8 +180,18 @@ def _remember_signature(call_id: str, signature: str) -> None:
         signatures.popitem(last=False)
 
 
-# `turns.py` writes thought signatures through this rather than importing the state back.
+def _remember_native_turn(key: str, turn: codex.NativeTurn) -> None:
+    native_turns = _state.native_turns
+    native_turns[key] = turn
+    native_turns.move_to_end(key)
+    while len(native_turns) > _NATIVE_TURN_LIMIT:
+        native_turns.popitem(last=False)
+
+
+# `turns.py` writes thought signatures and native turns through these rather than
+# importing the state back.
 set_signature_sink(_remember_signature)
+set_native_turn_sink(_remember_native_turn)
 
 
 def _observe_codex_usage(headers: Mapping[str, str]) -> None:
@@ -214,6 +230,8 @@ async def _codex_spec(model: str, messages: list[Any], extra: dict[str, Any]) ->
         extra=extra,
         session_id=session_id,
         metadata=context.metadata,
+        native_turns=_state.native_turns,
+        account=codex.account_id(token),
     )
     headers = codex.build_headers(
         token,

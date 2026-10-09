@@ -672,3 +672,53 @@ the caveat stops being zero, and persisting through `POST /model/new` becomes wo
 revisiting. `registry.py` rejected that path because `supported_db_objects` without
 `"models"` makes the endpoint a silent no-op — but that is a property of the installation,
 not a universal one, and an installation without that restriction could use it.
+
+---
+
+## D12 — Codex responses are kept in the process and replayed by call id
+
+**Date:** 2026-10-09 · **Against:** `litellm[proxy]` 1.101.0, omp 18.4.4 / 18.8.6 · **Status:** verified
+
+### The question
+
+omp sends each Codex response back verbatim on the next request: the encrypted reasoning
+and each message's `phase`. A chat completions client sends back text and tool calls only.
+Should the plugin give the model its own reasoning back, and where does it keep it?
+
+### What was measured
+
+The same two-step gpt-6-luna tool loop, run through omp 18.8.6's own Codex provider and
+through the plugin's body builder from the equivalent chat history. Instructions, tools,
+`reasoning`, `include` and every call's arguments were identical. Two things differed:
+omp's input carried the step's `reasoning` item (`encrypted_content` and summary) and
+`phase: "commentary"` on the assistant message; the plugin's carried neither. The
+trigger was a Hermes session on gpt-6-luna that kept stopping mid-task over 40+ steps at
+70-92k tokens of context, each step reasoning from scratch.
+
+Live, with the candidate in the production pod, 26 streamed steps through the plugin's
+Codex route (gpt-6-luna and gpt-6-astra): every response kept, the replayed reasoning
+grew with the loop (0 → 5 items by the seventh luna step), `phase` went back on every
+assistant message, and the backend accepted all of it. Kept responses measured 1.2 KB on
+average, 3.6 KB at most; the 2048-turn cap bounds the process at a few MB.
+
+### Decision
+
+Keep each finished Codex response in process memory (`specs._State.native_turns`,
+LRU-capped like the Gemini thought signatures), keyed by the tool call ids the client will
+answer with, or by the answer text when the turn made no calls. On the next request, an
+assistant message whose text, call ids and arguments still match — for the same account
+and wire model — goes back as the kept items, sanitized as omp sanitizes its own replay
+(no ids, no output-only statuses, no empty `final_answer` or the reasoning that introduced
+it). Anything that does not match is re-encoded as before, so the worst case is the old
+behaviour.
+
+Not chosen: echoing the reasoning to the client (as `reasoning_content` or a signature in
+the tool call id) and reading it back. Clients do not round-trip unknown fields, and the
+encrypted blob is not the client's to hold.
+
+### What would reopen this
+
+More than one worker serving the same conversation: each process keeps its own responses,
+so a step answered by another worker is re-encoded (correct, just without the reasoning).
+At that point a shared store would be worth its I/O. Also, a backend that starts refusing
+replayed encrypted reasoning — today it is what omp sends on every request.

@@ -19,13 +19,14 @@ chat completions shape.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import re
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final, NamedTuple
 
@@ -1030,10 +1031,227 @@ def _is_malformed_tool_call(tool_call: Mapping[str, Any]) -> bool:
     )
 
 
+# -- native turn replay ---------------------------------------------------------
+#
+# omp keeps every Codex response's output items on the assistant message
+# (`providerPayload`) and replays them verbatim on the next request: the encrypted
+# reasoning the model produced, and each message's `phase` (`commentary` for a progress
+# note, `final_answer` for the answer). A chat completions client cannot carry either, so
+# without this every step of a tool loop reached the model with its earlier reasoning gone
+# and its progress notes looking like final answers. The response is kept here instead,
+# keyed by what the client does send back — the tool call ids, or the answer text — and
+# replayed only when the client's message still says exactly what the response said.
+
+#: Output item types a native turn may hold. Anything else (computer calls, generated
+#: images) is not kept: its replay needs sanitization this port does not carry, and the
+#: re-encoded turn is what was sent before.
+_NATIVE_ITEM_TYPES: Final = frozenset(
+    {"reasoning", "message", "function_call", "custom_tool_call", "web_search_call"}
+)
+_NATIVE_CALL_TYPES: Final = frozenset({"function_call", "custom_tool_call"})
+
+
+@dataclass(frozen=True, slots=True)
+class NativeTurn:
+    """One Codex response, ready to go back on the wire in place of its re-encoding.
+
+    ``scope`` binds it to the account and wire model that minted the encrypted reasoning
+    (omp replays native items only for the same model). ``text`` and ``calls`` are what the
+    chat client received — the visible text, and each tool call's id and parsed
+    arguments — and are what a replayed message must still match.
+    """
+
+    scope: str
+    text: str
+    calls: tuple[tuple[str, object], ...]
+    items: tuple[dict[str, Any], ...]
+
+
+def replay_scope(account: str | None, wire_model: str) -> str:
+    """The account + wire model a native turn belongs to."""
+    return f"{account or ''}\x00{wire_model}"
+
+
+def _parsed_arguments(arguments: object) -> object:
+    """Arguments compared by value: the client may reserialize the JSON it received."""
+    if not isinstance(arguments, str):
+        return arguments
+    try:
+        return json.loads(arguments)
+    except ValueError:
+        return arguments
+
+
+def native_turn_key(call_ids: Sequence[str], text: str, scope: str) -> str | None:
+    """Where a turn is kept: its tool call ids, else its answer text; ``None`` when it has
+    neither, since nothing the client sends back could name it."""
+    if call_ids:
+        return "calls\x00" + "\x00".join(call_ids)
+    if not text:
+        return None
+    return "text\x00" + hashlib.sha256(f"{scope}\x00{text}".encode()).hexdigest()
+
+
+# omp: utils.ts :: sanitizeOpenAIResponsesReasoningItemForReplay
+def _replay_reasoning_item(item: Mapping[str, Any]) -> dict[str, Any]:
+    """The reasoning item without its id: under ``store: false`` the backend holds no item
+    to resolve it against."""
+    sanitized: dict[str, Any] = {"type": "reasoning"}
+    if isinstance(item.get("summary"), list):
+        sanitized["summary"] = item["summary"]
+    if isinstance(item.get("content"), list):
+        sanitized["content"] = item["content"]
+    if "encrypted_content" in item and (
+        isinstance(item["encrypted_content"], str) or item["encrypted_content"] is None
+    ):
+        sanitized["encrypted_content"] = item["encrypted_content"]
+    return sanitized
+
+
+# omp: utils.ts :: sanitizeOpenAIResponsesHistoryItemForReplay
+# omp: utils.ts :: stripOpenAIResponsesOutputOnlyStatusesForReplay
+def _replay_item(item: Mapping[str, Any]) -> dict[str, Any] | None:
+    """One output item as replay input: no id, and no ``status`` where the backend refuses
+    an output-only status on input. A call whose arguments are not JSON is not replayable."""
+    kind = item.get("type")
+    if kind == "function_call":
+        arguments = item.get("arguments")
+        if not isinstance(arguments, str) or not arguments.strip():
+            return None
+        try:
+            json.loads(arguments)
+        except ValueError:
+            return None
+    if kind == "reasoning":
+        return _replay_reasoning_item(item)
+    sanitized = {key: value for key, value in item.items() if key != "id"}
+    if kind in ("message", "function_call", "custom_tool_call"):
+        sanitized.pop("status", None)
+    return sanitized
+
+
+def _is_empty_assistant_message(item: Mapping[str, Any]) -> bool:
+    if item.get("type") != "message" or item.get("role") != "assistant":
+        return False
+    content = item.get("content")
+    if isinstance(content, str):
+        return not content.strip()
+    for part in content if isinstance(content, list) else []:
+        if not isinstance(part, Mapping):
+            continue
+        if part.get("type") == "output_text" and str(part.get("text") or "").strip():
+            return False
+        if part.get("type") == "refusal" and str(part.get("refusal") or "").strip():
+            return False
+    return True
+
+
+# omp: utils.ts :: sanitizeOpenAIResponsesAssistantHistoryItemsForReplay
+# omp: utils.ts :: dropEmptyAssistantMessagesForReplay
+def _replay_items(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]] | None:
+    """A response's output items as replay input, or ``None`` when nothing in it is worth
+    replaying (reasoning and an empty message only) or an item cannot be replayed.
+
+    A whitespace-only assistant message is dropped with the reasoning that introduces it:
+    gpt-5.6 ends a turn whose text all went to ``commentary`` with an empty
+    ``final_answer``, and replaying that empty slot makes the model fill it, turn after
+    turn (omp's note on the function, openai/codex#32389).
+    """
+    kept: list[dict[str, Any]] = []
+    pending_reasoning: list[dict[str, Any]] = []
+    removed_message = False
+    has_output = False
+    for item in items:
+        if item.get("type") not in _NATIVE_ITEM_TYPES:
+            return None
+        sanitized = _replay_item(item)
+        if sanitized is None:
+            return None
+        if sanitized["type"] == "reasoning":
+            if removed_message:
+                pending_reasoning = []
+            removed_message = False
+            pending_reasoning.append(sanitized)
+            continue
+        if _is_empty_assistant_message(sanitized):
+            removed_message = True
+            continue
+        kept.extend(pending_reasoning)
+        pending_reasoning = []
+        removed_message = False
+        has_output = True
+        kept.append(sanitized)
+    return kept if has_output else None
+
+
+# omp: providers/openai-codex-responses.ts :: CodexStreamProcessor.finalize
+def native_turn(
+    scope: str,
+    native_items: Sequence[Mapping[str, Any]],
+    text: str,
+    calls: Sequence[tuple[str, str]],
+) -> tuple[str, NativeTurn] | None:
+    """The key and native turn of a finished response, or ``None`` if it is not replayable.
+
+    ``text`` and ``calls`` (client id, arguments as sent) are what the client received.
+    The output's calls must pair one to one, in order, with the client's: the replay
+    swaps each native ``call_id`` for the one the client will answer with.
+    """
+    items = _replay_items(native_items)
+    if items is None:
+        return None
+    if sum(item["type"] in _NATIVE_CALL_TYPES for item in items) != len(calls):
+        return None
+    stripped = text.strip()
+    key = native_turn_key([call_id for call_id, _ in calls], stripped, scope)
+    if key is None:
+        return None
+    parsed = tuple((call_id, _parsed_arguments(arguments)) for call_id, arguments in calls)
+    return key, NativeTurn(scope=scope, text=stripped, calls=parsed, items=tuple(items))
+
+
+# omp: providers/openai-codex-responses.ts :: convertMessages
+def _native_items(
+    message: Mapping[str, Any], native_turns: Mapping[str, NativeTurn], scope: str
+) -> list[dict[str, Any]] | None:
+    """The kept response behind an assistant message, when the message still matches it.
+
+    The scope must match (native items are model-bound: the reasoning carries encrypted
+    content minted by the producing model), and so must the text and every call's id and
+    arguments: a client that edited its history gets the re-encoded turn, as before.
+    """
+    calls: list[tuple[str, object]] = []
+    for tool_call in message.get("tool_calls") or []:
+        if not isinstance(tool_call, Mapping) or _is_malformed_tool_call(tool_call):
+            return None
+        function = tool_call["function"]
+        calls.append((str(tool_call["id"]), _parsed_arguments(function.get("arguments"))))
+    text = content_to_text(message.get("content")).strip()
+    key = native_turn_key([call_id for call_id, _ in calls], text, scope)
+    kept = native_turns.get(key) if key is not None else None
+    if kept is None or kept.scope != scope or kept.text != text or kept.calls != tuple(calls):
+        return None
+    items = copy.deepcopy(list(kept.items))
+    call_ids = iter(call_id for call_id, _ in calls)
+    for item in items:
+        if item["type"] in _NATIVE_CALL_TYPES:
+            item["call_id"] = split_call_id(next(call_ids))
+    return items
+
+
 # omp: providers/openai-codex-responses.ts :: convertMessages
 # omp: providers/openai-shared.ts :: convertResponsesAssistantMessage
-def _assistant_items(message: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """An assistant turn: its text as one completed message, then its function calls."""
+def _assistant_items(
+    message: Mapping[str, Any],
+    native_turns: Mapping[str, NativeTurn] | None = None,
+    scope: str | None = None,
+) -> list[dict[str, Any]]:
+    """An assistant turn: the response it came from when that is kept and still matches,
+    else its text as one completed message, then its function calls."""
+    if native_turns and scope is not None:
+        native = _native_items(message, native_turns, scope)
+        if native is not None:
+            return native
     items: list[dict[str, Any]] = []
     text = content_to_text(message.get("content"))
     if text:
@@ -1114,13 +1332,20 @@ def _final_instruction(items: list[dict[str, Any]], instructions: str | None) ->
 # omp: providers/openai-codex-responses.ts :: convertMessages
 # omp: providers/openai-codex/request-transformer.ts :: transformRequestBody
 # omp: providers/transform-messages.ts :: sanitizeMalformedToolCalls
-def messages_to_input(messages: list[Any], *, supports_detail_original: bool = True) -> CodexInput:
+def messages_to_input(
+    messages: list[Any],
+    *,
+    supports_detail_original: bool = True,
+    native_turns: Mapping[str, NativeTurn] | None = None,
+    scope: str | None = None,
+) -> CodexInput:
     """Translate chat completions messages into ``instructions`` + ``input`` items.
 
     The system messages become ``instructions``, which the backend treats as a cacheable
     base prompt. User and developer turns are plain ``{role, content}`` items, as omp
     sends them. A tool call with a blank id or name is dropped together with its result:
-    replaying it is a 400 on every provider.
+    replaying it is a 400 on every provider. An assistant turn whose response is kept in
+    ``native_turns`` for ``scope`` goes back as that response (see `NativeTurn`).
     """
     items: list[dict[str, Any]] = []
     #: Per tool-call id, whether each occurrence since the last assistant turn was dropped.
@@ -1139,7 +1364,7 @@ def messages_to_input(messages: list[Any], *, supports_detail_original: bool = T
                     dropped.setdefault(str(tool_call.get("id")), []).append(
                         _is_malformed_tool_call(tool_call)
                     )
-            items.extend(_assistant_items(message))
+            items.extend(_assistant_items(message, native_turns, scope))
             continue
         if role == "tool":
             queue = dropped.get(str(message.get("tool_call_id")))
@@ -1349,18 +1574,25 @@ def build_request_body(
     session_id: str | None = None,
     metadata: RequestMetadata | None = None,
     supports_detail_original: bool = True,
+    native_turns: Mapping[str, NativeTurn] | None = None,
+    account: str | None = None,
 ) -> dict[str, Any]:
     """Body of a request to the Responses API.
 
     No sampling controls and no output caps: the Codex backend rejects every one of them
     with 400 ``Unsupported parameter``, so they are never read from ``extra``.
+    ``native_turns`` are the kept responses of ``account``; see `NativeTurn`.
     """
     extra = extra or {}
+    wire_model = resolve_model(model, unsupported)
     instructions, items = messages_to_input(
-        messages, supports_detail_original=supports_detail_original
+        messages,
+        supports_detail_original=supports_detail_original,
+        native_turns=native_turns,
+        scope=replay_scope(account, wire_model),
     )
     body: dict[str, Any] = {
-        "model": resolve_model(model, unsupported),
+        "model": wire_model,
         "input": items,
         "stream": True,
     }
