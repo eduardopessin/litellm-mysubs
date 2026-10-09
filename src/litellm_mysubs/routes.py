@@ -187,7 +187,11 @@ def _antigravity_tool_names(spec: RequestSpec) -> frozenset[str]:
 
 
 def _codex_reader(spec: RequestSpec, model: str, turn: _Turn) -> _CodexReader:
-    return _CodexReader(turn, wire_model=str(spec.body.get("model") or model))
+    """The reader for one Codex attempt; its finished response is kept for replay under
+    the account and wire model the request went out with (`codex.NativeTurn`)."""
+    wire_model = str(spec.body.get("model") or model)
+    scope = codex.replay_scope(spec.headers.get("chatgpt-account-id"), wire_model)
+    return _CodexReader(turn, wire_model=wire_model, replay_scope=scope)
 
 
 def _antigravity_reader(

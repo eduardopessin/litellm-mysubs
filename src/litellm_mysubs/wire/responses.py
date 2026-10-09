@@ -27,8 +27,9 @@ from typing import Any
 # list has no slot for what omp keeps:
 #
 # - `reasoning` items are not bridged. omp keeps them as a signed `thinking` block that its
-#   OpenAI providers replay; neither provider here replays reasoning from history (Codex
-#   runs `store: false` and its request builder sends no reasoning items).
+#   OpenAI providers replay; here the Codex request builder replays the reasoning of the
+#   responses it kept itself (`codex.NativeTurn`), matched by call ids or answer text, and
+#   a client's own reasoning items have nowhere to go in the canonical list.
 # - `custom_tool_call`, `computer_call` and their outputs are not bridged: the canonical
 #   tool call is a function call, and neither upstream here serves those tool kinds.
 # - `function_call.arguments` stays the JSON string it arrived as. omp parses it because

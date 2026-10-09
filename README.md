@@ -397,7 +397,7 @@ invoked — which is what keeps the rest unit-testable.
 
 ## Design decisions
 
-[`docs/DECISIONS.md`](docs/DECISIONS.md) holds ten entries. Each records what was decided,
+[`docs/DECISIONS.md`](docs/DECISIONS.md) holds twelve entries. Each records what was decided,
 **the measurement that supports it**, and what would reopen the question. Without the
 measurement it is not a decision, it is a preference.
 
